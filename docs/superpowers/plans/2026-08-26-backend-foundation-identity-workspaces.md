@@ -84,7 +84,7 @@ describe('health routes', () => {
     "dev:web": "bun --cwd web dev",
     "dev:api": "bun --cwd server dev:api",
     "dev:worker": "bun --cwd server dev:worker",
-    "test:server": "bun --cwd server test"
+    "test:server": "bun --cwd server run test"
   }
 }
 ```
@@ -137,7 +137,7 @@ Add `/api` proxying to `http://127.0.0.1:4000` in `web/vite.config.ts`, add `@in
 User runs:
 
 ```bash
-bun --cwd server test test/health.test.ts test/errors.test.ts test/idempotency.test.ts
+bun --cwd server run test -- test/health.test.ts test/errors.test.ts test/idempotency.test.ts
 ```
 
 Expected: one passing liveness test and no network listener opened by the test.
@@ -255,7 +255,7 @@ it('executes a readiness query against PostgreSQL', async () => {
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/config.test.ts test/database/connection.test.ts
+bun --cwd server run test -- test/config.test.ts test/database/connection.test.ts
 ```
 
 Expected: configuration unit tests and PostgreSQL container integration test pass.
@@ -377,7 +377,7 @@ Run the Better Auth schema generator for PostgreSQL, map the generated tables to
 - [ ] **Step 6: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/identity/auth.test.ts
+bun --cwd server run test -- test/identity/auth.test.ts
 ```
 
 Expected: unauthenticated request is rejected, registration emits one verification email through the memory mailer, following that URL verifies the account, and sign-in then returns a session cookie.
@@ -445,7 +445,7 @@ Implement `GET /api/v1/workspaces`, `POST /api/v1/workspaces`, `GET /api/v1/work
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/workspaces/workspaces.test.ts
+bun --cwd server run test -- test/workspaces/workspaces.test.ts
 ```
 
 Expected: personal creation is idempotent; team creation succeeds; cross-Workspace access and personal invitations fail.

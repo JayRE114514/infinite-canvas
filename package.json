@@ -8,6 +8,6 @@
         "dev:web": "bun --cwd web dev",
         "dev:api": "bun --cwd server dev:api",
         "dev:worker": "bun --cwd server dev:worker",
-        "test:server": "bun --cwd server test"
+        "test:server": "bun --cwd server run test"
     }
 }

@@ -11,6 +11,7 @@ import {
 const harness = createAuthTestHarness();
 const openApp = harness.openApp;
 const openAuthApp = harness.openAuthApp;
+const PRODUCTION_ORIGIN = "https://canvas.example.com";
 
 beforeAll(async () => {
     await harness.start();
@@ -71,6 +72,7 @@ describe("email and password registration", () => {
 
         expect(signIn.statusCode).toBe(200);
         expect(signIn.headers["set-cookie"]).toBeDefined();
+        expect(String(signIn.headers["set-cookie"])).not.toContain("; Secure");
     }, 60_000);
 
     it("refuses sign-in until the address is verified", async () => {
@@ -128,13 +130,37 @@ describe("email and password registration", () => {
 });
 
 describe("auth route mounting", () => {
-    it("exposes only GET and POST under /api/auth", async () => {
+    it("does not expose unsupported methods on identity endpoints", async () => {
         const { app } = await openAuthApp();
 
         const deleted = await app.inject({ method: "DELETE", url: "/api/auth/sign-out", headers: { origin: APP_ORIGIN } });
 
         expect(deleted.statusCode).toBe(404);
         expect(deleted.json().error.code).toBe("not_found");
+    }, 60_000);
+
+    it.each([
+        ["POST", "/api/auth/organization/create"],
+        ["POST", "/api/auth/organization/delete"],
+        ["GET", "/api/auth/organization/list-invitations?organizationId=workspace-id"],
+        ["POST", "/api/auth/organization/invite-member"],
+        ["POST", "/api/auth/organization/update"],
+        ["POST", "/api/auth/organization/add-member"],
+        ["POST", "/api/auth/organization/remove-member"],
+        ["POST", "/api/auth/organization/update-member-role"],
+        ["POST", "/api/auth/organization/accept-invitation"],
+    ] as const)("does not mount the Organization business route %s %s", async (method, url) => {
+        const { app } = await openAuthApp();
+
+        const response = await app.inject({
+            method,
+            url,
+            headers: { origin: APP_ORIGIN },
+            ...(method === "POST" ? { payload: {} } : {}),
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json().error.code).toBe("not_found");
     }, 60_000);
 
     it("forwards Better Auth failures without leaking internals", async () => {
@@ -150,22 +176,50 @@ describe("auth route mounting", () => {
         expect(response.statusCode).toBe(401);
         expect(response.body).not.toContain("stack");
     }, 60_000);
+
+    it("sets Secure, HttpOnly, SameSite=Lax session cookies in production", async () => {
+        const { app, mailer } = await openAuthApp({ nodeEnv: "production", appOrigin: PRODUCTION_ORIGIN });
+
+        await app.inject({
+            method: "POST",
+            url: "/api/auth/sign-up/email",
+            headers: { origin: PRODUCTION_ORIGIN },
+            payload: { name: "生产用户", email: "production@example.com", password: PASSWORD },
+        });
+        const verificationUrl = new URL(mailer.messages[0]!.verificationUrl);
+        await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
+        const signIn = await app.inject({
+            method: "POST",
+            url: "/api/auth/sign-in/email",
+            headers: { origin: PRODUCTION_ORIGIN },
+            payload: { email: "production@example.com", password: PASSWORD },
+        });
+        const setCookies = Array.isArray(signIn.headers["set-cookie"])
+            ? signIn.headers["set-cookie"]
+            : [signIn.headers["set-cookie"]].filter((value): value is string => Boolean(value));
+        const sessionCookie = setCookies.find((value) => value.includes("session_token="));
+
+        expect(signIn.statusCode).toBe(200);
+        expect(sessionCookie).toContain("Secure");
+        expect(sessionCookie).toContain("HttpOnly");
+        expect(sessionCookie).toContain("SameSite=Lax");
+    }, 60_000);
 });
 
 describe("workspace mapping", () => {
-    it("stores an organization as a workspace row with application columns", async () => {
+    it("stores an application-created team as a workspace row with one owner", async () => {
         const { app, mailer, database } = await openAuthApp();
 
         const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
 
         const created = await app.inject({
             method: "POST",
-            url: "/api/auth/organization/create",
-            headers: { origin: APP_ORIGIN, cookie: owner.cookie },
+            url: "/api/v1/workspaces",
+            headers: { cookie: owner.cookie },
             payload: { name: "团队工作区", slug: "team-workspace" },
         });
 
-        expect(created.statusCode).toBe(200);
+        expect(created.statusCode).toBe(201);
 
         const workspaces = await database.pool.query(
             'select "id", "workspace_type", "status", "owner_user_id", "slug" from "workspaces"',
@@ -173,7 +227,7 @@ describe("workspace mapping", () => {
 
         expect(workspaces.rows).toHaveLength(1);
         expect(workspaces.rows[0]).toMatchObject({
-            id: created.json().id,
+            id: created.json().workspace.id,
             workspace_type: "team",
             status: "active",
             slug: "team-workspace",
@@ -186,8 +240,44 @@ describe("workspace mapping", () => {
         expect(members.rows[0]).toMatchObject({
             userId: owner.userId,
             role: "owner",
-            organizationId: created.json().id,
+            organizationId: created.json().workspace.id,
         });
+    }, 60_000);
+
+    it("disallows direct Better Auth Organization creation as defense in depth", async () => {
+        const { app, mailer } = await openAuthApp();
+        const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
+        if (!app.auth) throw new Error("Auth is not registered");
+
+        await expect(
+            app.auth.api.createOrganization({
+                headers: new Headers({ origin: APP_ORIGIN, cookie: owner.cookie }),
+                body: { name: "绕过团队", slug: "bypass-team" },
+            }),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    }, 60_000);
+
+    it("disables Better Auth Organization deletion as defense in depth", async () => {
+        const { app, mailer, database } = await openAuthApp();
+        const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
+        const created = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces",
+            headers: { cookie: owner.cookie },
+            payload: { name: "保留团队", slug: "retained-team" },
+        });
+        const workspaceId = created.json().workspace.id as string;
+        if (!app.auth) throw new Error("Auth is not registered");
+
+        await expect(
+            app.auth.api.deleteOrganization({
+                headers: new Headers({ origin: APP_ORIGIN, cookie: owner.cookie }),
+                body: { organizationId: workspaceId },
+            }),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        const stored = await database.pool.query('select "id" from "workspaces" where "id" = $1', [workspaceId]);
+
+        expect(stored.rows).toEqual([{ id: workspaceId }]);
     }, 60_000);
 
     it("allows only one personal workspace per owner", async () => {
@@ -218,21 +308,22 @@ describe("workspace invitations", () => {
         const owner = await registerVerifiedUser(app, mailer, { name: "邀请人", email: "inviter@example.com" });
         const created = await app.inject({
             method: "POST",
-            url: "/api/auth/organization/create",
-            headers: { origin: APP_ORIGIN, cookie: owner.cookie },
+            url: "/api/v1/workspaces",
+            headers: { cookie: owner.cookie },
             payload: { name: "受邀工作区", slug: "invited-workspace" },
         });
 
-        expect(created.statusCode).toBe(200);
+        expect(created.statusCode).toBe(201);
+        const workspaceId = created.json().workspace.id as string;
 
         const invited = await app.inject({
             method: "POST",
-            url: "/api/auth/organization/invite-member",
-            headers: { origin: APP_ORIGIN, cookie: owner.cookie },
-            payload: { email: "invitee@example.com", role: "member", organizationId: created.json().id },
+            url: `/api/v1/workspaces/${workspaceId}/invitations`,
+            headers: { cookie: owner.cookie },
+            payload: { email: "invitee@example.com", role: "member" },
         });
 
-        expect(invited.statusCode).toBe(200);
+        expect(invited.statusCode).toBe(201);
 
         const stored = await database.pool.query(
             'select "id", "email", "status", "expiresAt" from "workspace_invitations"',
@@ -258,15 +349,16 @@ describe("workspace invitations", () => {
         const owner = await registerVerifiedUser(app, mailer, { name: "邀请人", email: "inviter2@example.com" });
         const created = await app.inject({
             method: "POST",
-            url: "/api/auth/organization/create",
-            headers: { origin: APP_ORIGIN, cookie: owner.cookie },
+            url: "/api/v1/workspaces",
+            headers: { cookie: owner.cookie },
             payload: { name: "接受邀请工作区", slug: "accepted-workspace" },
         });
+        const workspaceId = created.json().workspace.id as string;
         await app.inject({
             method: "POST",
-            url: "/api/auth/organization/invite-member",
-            headers: { origin: APP_ORIGIN, cookie: owner.cookie },
-            payload: { email: "invitee2@example.com", role: "member", organizationId: created.json().id },
+            url: `/api/v1/workspaces/${workspaceId}/invitations`,
+            headers: { cookie: owner.cookie },
+            payload: { email: "invitee2@example.com", role: "member" },
         });
 
         expect(mailer.invitations).toHaveLength(1);
@@ -276,16 +368,16 @@ describe("workspace invitations", () => {
 
         const accepted = await app.inject({
             method: "POST",
-            url: "/api/auth/organization/accept-invitation",
-            headers: { origin: APP_ORIGIN, cookie: invitee.cookie },
-            payload: { invitationId },
+            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            headers: { cookie: invitee.cookie },
         });
 
         expect(accepted.statusCode).toBe(200);
+        expect(accepted.json()).toEqual({ workspaceId });
 
         const members = await database.pool.query(
             'select "userId", "role" from "workspace_members" where "organizationId" = $1',
-            [created.json().id],
+            [workspaceId],
         );
 
         expect(members.rows).toHaveLength(2);

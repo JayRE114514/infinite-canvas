@@ -1,11 +1,9 @@
-import { organizationClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 
 const SAFE_AUTH_CODE = /^[A-Z][A-Z0-9_]*$/;
 
 export const authClient = createAuthClient({
     baseURL: window.location.origin,
-    plugins: [organizationClient()],
 });
 
 export class AuthApiError extends Error {

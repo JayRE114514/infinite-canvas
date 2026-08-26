@@ -138,6 +138,9 @@ export const workspaceInvitations = pgTable(
             .references(() => users.id, { onDelete: "cascade" }),
     },
     (table) => [
+        uniqueIndex("workspace_invitations_pending_email_unique")
+            .on(table.organizationId, sql`lower(email)`)
+            .where(sql`status = 'pending'`),
         index("workspace_invitations_organizationId_idx").on(table.organizationId),
         index("workspace_invitations_email_idx").on(table.email),
     ],

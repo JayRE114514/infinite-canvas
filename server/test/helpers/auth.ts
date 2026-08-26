@@ -82,12 +82,12 @@ export function createAuthTestHarness() {
         return postgres.url;
     }
 
-    function config(): AppConfig {
+    function config(overrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}): AppConfig {
         return loadConfig({
-            NODE_ENV: "test",
+            NODE_ENV: overrides.nodeEnv ?? "test",
             DATABASE_URL: postgresUrl(),
             BETTER_AUTH_SECRET: "t".repeat(32),
-            APP_ORIGIN,
+            APP_ORIGIN: overrides.appOrigin ?? APP_ORIGIN,
             SMTP_HOST: "localhost",
             SMTP_FROM: "no-reply@example.com",
         });
@@ -107,13 +107,13 @@ export function createAuthTestHarness() {
 
         openApp,
 
-        async openAuthApp() {
+        async openAuthApp(configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}) {
             const mailer = new MemoryMailer();
             const database = createDatabase({ url: postgresUrl(), poolMax: 8 });
             openHandles.push(database);
             await database.pool.query("drop schema public cascade; create schema public");
             await database.pool.query(migrationSql);
-            const app = await openApp({ logger: false, config: config(), database, mailer });
+            const app = await openApp({ logger: false, config: config(configOverrides), database, mailer });
             return { app, mailer, database };
         },
 

@@ -38,11 +38,18 @@ async function handle(auth: Auth, request: FastifyRequest, reply: FastifyReply):
     reply.send(await response.text());
 }
 
-/** 只挂载 GET / POST，且不暴露原始错误。 */
+const PUBLIC_IDENTITY_ROUTES = [
+    { method: "POST", url: "/api/auth/sign-up/email" },
+    { method: "POST", url: "/api/auth/sign-in/email" },
+    { method: "GET", url: "/api/auth/get-session" },
+    { method: "POST", url: "/api/auth/sign-out" },
+    { method: "GET", url: "/api/auth/verify-email" },
+    { method: "POST", url: "/api/auth/send-verification-email" },
+] as const;
+
+/** 只挂载前端身份会话所需的精确端点，Organization 业务面保持不可达。 */
 export async function registerAuthRoutes(app: FastifyInstance, auth: Auth): Promise<void> {
-    app.route({
-        method: ["GET", "POST"],
-        url: "/api/auth/*",
-        handler: (request, reply) => handle(auth, request, reply),
-    });
+    for (const route of PUBLIC_IDENTITY_ROUTES) {
+        app.route({ ...route, handler: (request, reply) => handle(auth, request, reply) });
+    }
 }

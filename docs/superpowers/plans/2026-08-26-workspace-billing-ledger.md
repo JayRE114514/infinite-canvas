@@ -67,7 +67,7 @@ All API responses expose `availableAmount`, `heldAmount`, `estimatedAmount`, and
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/billing/schema.test.ts
+bun --cwd server run test -- test/billing/schema.test.ts
 ```
 
 Expected: negative projections, over-captured Hold, mutable history, and unbalanced postings are rejected by PostgreSQL.
@@ -136,7 +136,7 @@ Positive grant posts `workspace_available +amount` and `system_issuance -amount`
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/billing/ledger.test.ts
+bun --cwd server run test -- test/billing/ledger.test.ts
 ```
 
 Expected: replay is idempotent, request-hash mismatch returns conflict, balanced totals remain zero, and concurrent debits cannot create a negative Wallet.
@@ -192,7 +192,7 @@ Lock the same rows, decrement held by original, restore original to available, a
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/billing/orders.test.ts
+bun --cwd server run test -- test/billing/orders.test.ts
 ```
 
 Expected: separate Holds never interfere, insufficient points fail before order creation, and concurrent terminalization emits one financial effect.
@@ -251,7 +251,7 @@ Adjustment accepts signed decimal-string amount, reason, and `Idempotency-Key`. 
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/billing/grants.test.ts test/admin/billing.test.ts
+bun --cwd server run test -- test/billing/grants.test.ts test/admin/billing.test.ts
 ```
 
 Expected: unverified accounts receive nothing, duplicate verification grants once, non-admin calls return 403, and failed audit insertion rolls back the adjustment.
@@ -302,7 +302,7 @@ Report negative Wallets, unbalanced transactions, Wallet held projection differi
 - [ ] **Step 4: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/billing/routes.test.ts test/billing/invariants.test.ts
+bun --cwd server run test -- test/billing/routes.test.ts test/billing/invariants.test.ts
 ```
 
 Expected: roles are enforced, pagination is stable, and seeded corruption is detected by each invariant query.

@@ -41,6 +41,7 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
         secret: config.betterAuthSecret,
         baseURL: config.appOrigin,
         trustedOrigins: [config.appOrigin],
+        advanced: { useSecureCookies: config.nodeEnv === "production" },
         // 表名已通过 modelName 显式指定，usePlural 会再次追加 s，必须保持关闭。
         database: drizzleAdapter(db, { provider: "pg", schema: authSchema, usePlural: false }),
         emailAndPassword: { enabled: true, requireEmailVerification: true },
@@ -56,6 +57,8 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
         verification: { modelName: "verifications" },
         plugins: [
             organization({
+                allowUserToCreateOrganization: false,
+                disableOrganizationDeletion: true,
                 requireEmailVerificationOnInvitation: true,
                 // Better Auth 不生成邀请链接，接受页地址由应用拼装（Task 5 负责该前端路由）。
                 sendInvitationEmail: async (data) => {
@@ -91,11 +94,14 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
                     invitation: { modelName: "workspace_invitations" },
                 },
                 organizationHooks: {
-                    // 应用自有列不接受客户端输入，统一在创建前落库。
-                    beforeCreateOrganization: async ({ organization: input, user }) => ({
-                        data: { ...input, workspaceType: "team", status: "active", ownerUserId: user.id },
-                    }),
-                    // v1 路由委托 Better Auth；这些钩子同时封住 /api/auth 下的直接组织写入入口。
+                    // Workspace 创建必须走应用事务；即使服务端误调 Better Auth 也拒绝绕过。
+                    beforeCreateOrganization: async () => {
+                        throw new APIError("FORBIDDEN", {
+                            code: "WORKSPACE_CREATION_REQUIRES_APPLICATION_ROUTE",
+                            message: "Workspace creation requires the application route",
+                        });
+                    },
+                    // 业务路由可安全复用其余内部 API；钩子继续保护成员不变量。
                     beforeAddMember: async ({ member, organization }) => {
                         rejectPersonalMemberMutation(organization);
                         const role = parseSingleWorkspaceRole(member.role);

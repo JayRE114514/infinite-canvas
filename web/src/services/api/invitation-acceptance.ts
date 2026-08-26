@@ -1,7 +1,7 @@
-import type { WorkspaceSummary } from "@infinite-canvas/contracts";
+import type { AcceptWorkspaceInvitationResponse, WorkspaceSummary } from "@infinite-canvas/contracts";
 import type { QueryClient } from "@tanstack/react-query";
 
-import { authClient, unwrapAuthResponse } from "@/lib/auth-client";
+import { platformRequest } from "@/services/api/platform-client";
 import { workspaceKeys, workspacesQueryOptions } from "@/services/api/workspaces";
 
 export type AcceptedInvitationRecord = {
@@ -77,14 +77,12 @@ export function acceptInvitationOnce(queryClient: QueryClient, userId: string, i
 
     const generation = lifecycleGeneration;
     const request = (async () => {
-        const response = unwrapAuthResponse(
-            await authClient.organization.acceptInvitation({
-                invitationId,
-                fetchOptions: { credentials: "include" },
-            }),
+        const response = await platformRequest<AcceptWorkspaceInvitationResponse>(
+            `/workspace-invitations/${encodeURIComponent(invitationId)}/accept`,
+            { method: "POST" },
         );
         assertActiveLifecycle(generation);
-        const result = { organizationId: response.invitation.organizationId, generation };
+        const result = { organizationId: response.workspaceId, generation };
         acceptedInvitations.set(key, result);
         queryClient.setQueryData(acceptedKey, result);
         return result;

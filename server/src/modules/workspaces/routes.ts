@@ -1,4 +1,6 @@
 import {
+    AcceptWorkspaceInvitationPathSchema,
+    AcceptWorkspaceInvitationResponseSchema,
     AppErrorResponseSchema,
     CreateWorkspaceBodySchema,
     CreateWorkspaceInvitationBodySchema,
@@ -6,11 +8,13 @@ import {
     UpdateWorkspaceBodySchema,
     WorkspaceInvitationPathSchema,
     WorkspaceInvitationResponseSchema,
+    WorkspaceInvitationsResponseSchema,
     WorkspaceListResponseSchema,
     WorkspaceMemberPathSchema,
     WorkspaceMembersResponseSchema,
     WorkspacePathSchema,
     WorkspaceResponseSchema,
+    type AcceptWorkspaceInvitationPath,
     type CreateWorkspaceBody,
     type CreateWorkspaceInvitationBody,
     type UpdateWorkspaceBody,
@@ -22,7 +26,7 @@ import {
 } from "@infinite-canvas/contracts";
 import { APIError } from "better-auth/api";
 import { fromNodeHeaders } from "better-auth/node";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 
 import { AppError } from "../../errors.js";
@@ -38,9 +42,12 @@ import {
     type WorkspaceAccess,
 } from "./authorization.js";
 import {
+    acceptWorkspaceInvitation,
+    createTeamWorkspace,
     ensurePersonalWorkspace,
     isPostgresUniqueViolation,
     toWorkspaceSummary,
+    WORKSPACE_INVITATION_PENDING_UNIQUE_INDEX,
     WORKSPACE_SLUG_UNIQUE_INDEX,
     type WorkspaceRow,
 } from "./service.js";
@@ -65,7 +72,7 @@ type BetterAuthInvitation = {
     id: string;
     organizationId: string;
     email: string;
-    role: string;
+    role: string | null;
     status: string;
     inviterId: string;
     expiresAt: Date;
@@ -92,11 +99,15 @@ function toWorkspaceInvitation(invitation: BetterAuthInvitation): WorkspaceInvit
         throw new Error(`Unsupported invitation status: ${invitation.status}`);
     }
 
+    if (invitation.role !== "owner" && invitation.role !== "admin" && invitation.role !== "member") {
+        throw new Error(`Unsupported invitation role: ${invitation.role}`);
+    }
+
     return {
         id: invitation.id,
         workspaceId: invitation.organizationId,
         email: invitation.email,
-        role: parseWorkspaceRole(invitation.role),
+        role: invitation.role,
         status: invitation.status as WorkspaceInvitation["status"],
         inviterId: invitation.inviterId,
         expiresAt: invitation.expiresAt.toISOString(),
@@ -112,6 +123,9 @@ function rethrowWorkspaceOperation(error: unknown): never {
     if (error instanceof AppError) throw error;
     if (isPostgresUniqueViolation(error, WORKSPACE_SLUG_UNIQUE_INDEX)) {
         throw new AppError("workspace_slug_taken", 409, "空间标识已被使用");
+    }
+    if (isPostgresUniqueViolation(error, WORKSPACE_INVITATION_PENDING_UNIQUE_INDEX)) {
+        throw new AppError("workspace_invitation_conflict", 409, "该用户已加入或已收到邀请");
     }
     if (!(error instanceof APIError)) throw error;
 
@@ -151,7 +165,7 @@ async function requireVerifiedUser(request: FastifyRequest) {
     const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
 
     if (!user?.emailVerified) throw new AppError("email_verification_required", 403, "请先验证邮箱");
-    return { id: user.id, name: user.name };
+    return { id: user.id, name: user.name, email: user.email };
 }
 
 async function loadWorkspace(db: AppDatabase, workspaceId: string): Promise<WorkspaceRow> {
@@ -205,16 +219,12 @@ export function registerWorkspaceRoutes(app: FastifyInstance, auth: Auth): void 
             },
         },
         async (request, reply) => {
-            await requireVerifiedUser(request);
+            const user = await requireVerifiedUser(request);
             const { db } = requireDatabase(request.server);
 
             try {
-                const created = await auth.api.createOrganization({
-                    headers: fromNodeHeaders(request.headers),
-                    body: request.body,
-                });
-                const workspace = await loadWorkspace(db, created.id);
-                return reply.status(201).send({ workspace: toWorkspaceSummary(workspace, "owner") });
+                const workspace = await createTeamWorkspace(db, user, request.body);
+                return reply.status(201).send({ workspace });
             } catch (error) {
                 rethrowWorkspaceOperation(error);
             }
@@ -323,6 +333,34 @@ export function registerWorkspaceRoutes(app: FastifyInstance, auth: Auth): void 
         },
     );
 
+    app.get<{ Params: WorkspacePath }>(
+        "/api/v1/workspaces/:workspaceId/invitations",
+        {
+            schema: {
+                params: WorkspacePathSchema,
+                response: { 200: WorkspaceInvitationsResponseSchema, ...errorResponses },
+            },
+        },
+        async (request) => {
+            const { access, workspace, db } = await requireWorkspace(request, request.params.workspaceId);
+            requireTeamWorkspace(workspace);
+            requireWorkspaceManager(access);
+
+            const invitations = await db
+                .select()
+                .from(workspaceInvitations)
+                .where(
+                    and(
+                        eq(workspaceInvitations.organizationId, request.params.workspaceId),
+                        eq(workspaceInvitations.status, "pending"),
+                    ),
+                )
+                .orderBy(asc(workspaceInvitations.createdAt), asc(workspaceInvitations.id));
+
+            return { invitations: invitations.map(toWorkspaceInvitation) };
+        },
+    );
+
     app.post<{ Params: WorkspacePath; Body: CreateWorkspaceInvitationBody }>(
         "/api/v1/workspaces/:workspaceId/invitations",
         {
@@ -333,11 +371,22 @@ export function registerWorkspaceRoutes(app: FastifyInstance, auth: Auth): void 
             },
         },
         async (request, reply) => {
-            const { access, workspace } = await requireWorkspace(request, request.params.workspaceId);
+            const { access, workspace, db } = await requireWorkspace(request, request.params.workspaceId);
             requireTeamWorkspace(workspace);
             requireWorkspaceManager(access);
 
             try {
+                await db
+                    .update(workspaceInvitations)
+                    .set({ status: "canceled" })
+                    .where(
+                        and(
+                            eq(workspaceInvitations.organizationId, request.params.workspaceId),
+                            eq(workspaceInvitations.status, "pending"),
+                            sql`${workspaceInvitations.expiresAt} <= now()`,
+                            sql`lower(${workspaceInvitations.email}) = lower(${request.body.email})`,
+                        ),
+                    );
                 const invitation = await auth.api.createInvitation({
                     headers: fromNodeHeaders(request.headers),
                     body: { ...request.body, organizationId: request.params.workspaceId },
@@ -346,6 +395,21 @@ export function registerWorkspaceRoutes(app: FastifyInstance, auth: Auth): void 
             } catch (error) {
                 rethrowWorkspaceOperation(error);
             }
+        },
+    );
+
+    app.post<{ Params: AcceptWorkspaceInvitationPath }>(
+        "/api/v1/workspace-invitations/:invitationId/accept",
+        {
+            schema: {
+                params: AcceptWorkspaceInvitationPathSchema,
+                response: { 200: AcceptWorkspaceInvitationResponseSchema, ...errorResponses },
+            },
+        },
+        async (request) => {
+            const user = await requireVerifiedUser(request);
+            const { db } = requireDatabase(request.server);
+            return await acceptWorkspaceInvitation(db, user, request.params.invitationId);
         },
     );
 

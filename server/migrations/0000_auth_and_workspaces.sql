@@ -90,6 +90,7 @@ CREATE UNIQUE INDEX "accounts_issuer_accountId_uidx" ON "accounts" USING btree (
 CREATE INDEX "accounts_userId_idx" ON "accounts" USING btree ("userId");--> statement-breakpoint
 CREATE INDEX "sessions_userId_idx" ON "sessions" USING btree ("userId");--> statement-breakpoint
 CREATE INDEX "verifications_identifier_idx" ON "verifications" USING btree ("identifier");--> statement-breakpoint
+CREATE UNIQUE INDEX "workspace_invitations_pending_email_unique" ON "workspace_invitations" USING btree ("organizationId",lower("email")) WHERE status = 'pending';--> statement-breakpoint
 CREATE INDEX "workspace_invitations_organizationId_idx" ON "workspace_invitations" USING btree ("organizationId");--> statement-breakpoint
 CREATE INDEX "workspace_invitations_email_idx" ON "workspace_invitations" USING btree ("email");--> statement-breakpoint
 CREATE UNIQUE INDEX "workspace_members_workspace_user_unique" ON "workspace_members" USING btree ("organizationId","userId");--> statement-breakpoint

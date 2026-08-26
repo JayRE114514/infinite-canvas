@@ -79,7 +79,10 @@ export function platformErrorTranslationKey(error: unknown, fallback: string) {
         platform_unauthorized: "auth.errors.sessionExpired",
         workspace_admin_required: "workspace.errors.adminRequired",
         workspace_forbidden: "workspace.errors.forbidden",
+        workspace_invitation_already_member: "auth.invitation.errors.alreadyMember",
         workspace_invitation_conflict: "workspace.errors.invitationConflict",
+        workspace_invitation_recipient_mismatch: "auth.invitation.errors.wrongRecipient",
+        workspace_invitation_unavailable: "auth.invitation.errors.notFound",
         workspace_owner_cannot_be_removed: "workspace.errors.ownerCannotBeRemoved",
         workspace_slug_taken: "workspace.errors.slugTaken",
     };

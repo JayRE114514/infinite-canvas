@@ -372,7 +372,7 @@ Configure API body limits, route timeouts, graceful shutdown, DB pool budget, Wo
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/security/ssrf.test.ts test/observability/redaction.test.ts
+bun --cwd server run test -- test/security/ssrf.test.ts test/observability/redaction.test.ts
 ```
 
 Expected: private/metadata destinations fail, credentials are absent from logs, metrics avoid high-cardinality IDs, and graceful shutdown stops new work before exiting.

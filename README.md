@@ -6,7 +6,6 @@
 
 <p align="center">
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/Linux.do-Community-2b6de8?style=flat-square" alt="Linux.do"></a>
-  <a href="https://render.com/deploy?repo=https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/badge/Render-Deploy-46e3b7?style=flat-square&logo=render&logoColor=111111" alt="Deploy to Render"></a>
   <a href="https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/github/stars/basketikun/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
   <a href="https://github.com/basketikun/infinite-canvas/tags"><img src="https://img.shields.io/github/v/tag/basketikun/infinite-canvas?style=flat-square&label=version" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f97316?style=flat-square" alt="License"></a>
@@ -77,25 +76,24 @@
 
 AI API Key、Base URL、画布、素材和生成记录默认保存在浏览器本地。
 
+> [!WARNING]
+> 当前后端架构分支已经依赖 PostgreSQL、`/api/auth` 和 `/api/v1`。仓库现有 Docker、Vercel 与 Render 配置仍只发布静态前端，不能运行本分支，也不代表已支持生产部署；后续部署计划补齐 API/反向代理后才能使用。
+
 ### 本地开发
 
+先按 `.env.example` 配置 PostgreSQL、认证与邮件环境变量，并应用 `server/migrations/` 中的迁移，再在两个终端启动 API 与 Web：
+
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
 cd infinite-canvas
-cd web
 bun install
-bun run dev
 ```
 
-### Docker 运行
+终端一运行 `bun run dev:api`，终端二运行 `bun run dev:web`。
 
-```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-docker compose up -d
-```
+### Docker / Vercel / Render
 
-运行后默认端口3000，可访问 `http://localhost:3000`。
+当前不可用于本后端分支。现有配置缺少 API 进程、PostgreSQL 迁移与同源反向代理，请不要用它们部署或验收生产环境。
 
 首次打开后进入右上角配置，填入自己的 OpenAI 兼容 `Base URL` 和 `API Key`。
 

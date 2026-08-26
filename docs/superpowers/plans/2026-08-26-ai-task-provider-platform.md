@@ -101,7 +101,7 @@ Register authenticated model-list/detail routes that return enabled platform mod
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/providers/registry.test.ts test/ai-tasks/schema.test.ts
+bun --cwd server run test -- test/providers/registry.test.ts test/ai-tasks/schema.test.ts
 ```
 
 Expected: unsupported parameters are rejected, unknown adapter keys fail closed, and database uniqueness prevents duplicate task/attempt/event identities.
@@ -177,7 +177,7 @@ Create reads `Idempotency-Key`, hashes `{ modelId, normalizedInput }` with `hash
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/ai-tasks/create-task.test.ts
+bun --cwd server run test -- test/ai-tasks/create-task.test.ts
 ```
 
 Expected: enqueue failure leaves no financial or task rows, duplicate requests return one Task/job, body mismatch returns 409, and insufficient points create nothing.
@@ -243,7 +243,7 @@ Add an idempotent catalog seed command that reads the reviewed `WAWAZZ_IMAGE_MOD
 - [ ] **Step 6: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/providers/openai-images.test.ts
+bun --cwd server run test -- test/providers/openai-images.test.ts
 ```
 
 Expected: request JSON matches the documented Wawazz OpenAI-compatible contract, URL/Base64 fixtures normalize, and HTML/timeout fixtures return sanitized classifications.
@@ -310,7 +310,7 @@ Remote output copying validates every resolved address and redirect with the sam
 - [ ] **Step 6: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/ai-tasks/worker.test.ts
+bun --cwd server run test -- test/ai-tasks/worker.test.ts
 ```
 
 Expected: duplicate jobs submit/settle once, storage retry does not regenerate, terminal failure refunds, and ambiguous timeout retains Hold.
@@ -358,7 +358,7 @@ Send comment heartbeat every 15 seconds, stop on request abort, and close all co
 - [ ] **Step 4: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/ai-tasks/sse.test.ts
+bun --cwd server run test -- test/ai-tasks/sse.test.ts
 ```
 
 Expected: replay order is stable, cross-Workspace subscription fails, heartbeat does not create Task Events, and disconnect releases resources.
@@ -414,7 +414,7 @@ Admins can list/enable/disable existing statically known Adapter routes and upda
 - [ ] **Step 5: Hand verification to the user**
 
 ```bash
-bun --cwd server test test/ai-tasks/recovery.test.ts test/admin/providers.test.ts
+bun --cwd server run test -- test/ai-tasks/recovery.test.ts test/admin/providers.test.ts
 ```
 
 Expected: stale states choose safe recovery, unknown outcomes never auto-refund/resubmit, and admin configuration cannot register executable adapters or private-network URLs.

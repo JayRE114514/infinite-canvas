@@ -3,13 +3,13 @@ import type {
     CreateWorkspaceInvitationBody,
     SuccessResponse,
     WorkspaceInvitationResponse,
+    WorkspaceInvitationsResponse,
     WorkspaceListResponse,
     WorkspaceMembersResponse,
     WorkspaceResponse,
 } from "@infinite-canvas/contracts";
 import { queryOptions } from "@tanstack/react-query";
 
-import { authClient, unwrapAuthResponse } from "@/lib/auth-client";
 import { platformRequest } from "@/services/api/platform-client";
 
 const workspaceRootKey = ["platform", "workspaces"] as const;
@@ -40,15 +40,10 @@ export function workspaceMembersQueryOptions(userId: string, workspaceId: string
 export function workspaceInvitationsQueryOptions(userId: string, workspaceId: string) {
     return queryOptions({
         queryKey: workspaceKeys.invitations(userId, workspaceId),
-        queryFn: async () => {
-            const invitations = unwrapAuthResponse(
-                await authClient.organization.listInvitations({
-                    query: { organizationId: workspaceId },
-                    fetchOptions: { credentials: "include" },
-                }),
-            );
-            return invitations.filter((invitation) => invitation.status === "pending");
-        },
+        queryFn: () =>
+            platformRequest<WorkspaceInvitationsResponse>(`/workspaces/${encodeURIComponent(workspaceId)}/invitations`).then(
+                (response) => response.invitations,
+            ),
     });
 }
 

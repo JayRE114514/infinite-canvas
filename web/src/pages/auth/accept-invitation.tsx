@@ -5,7 +5,7 @@ import { CircleCheck, CircleX } from "lucide-react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
-import { authClient, authErrorTranslationKey, createLoginPath } from "@/lib/auth-client";
+import { authClient, createLoginPath } from "@/lib/auth-client";
 import {
     acceptInvitationOnce,
     clearWorkspaceSessionMemory,
@@ -14,6 +14,7 @@ import {
     isInvitationLifecycleActive,
     synchronizeAcceptedWorkspace,
 } from "@/services/api/invitation-acceptance";
+import { platformErrorTranslationKey } from "@/services/api/platform-client";
 import { AuthPageLoading, AuthPageShell } from "@/pages/auth/auth-page-shell";
 import { useUserStore } from "@/stores/use-user-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
@@ -84,7 +85,7 @@ function InvitationAcceptanceFlow({ userId, invitationId }: InvitationAcceptance
     }
 
     if (acceptMutation.isError) {
-        const errorKey = authErrorTranslationKey(acceptMutation.error, "auth.invitation.errors.acceptFailed");
+        const errorKey = platformErrorTranslationKey(acceptMutation.error, "auth.invitation.errors.acceptFailed");
         return (
             <AuthPageShell eyebrow={t("auth.invitation.errorEyebrow")} title={t("auth.invitation.errorTitle")} description={t("auth.invitation.errorDescription")}>
                 <CircleX className="size-11 text-destructive" strokeWidth={1.5} aria-hidden />

@@ -42,15 +42,18 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         nodeEnv = nodeEnvValue;
     }
 
-    const appOrigin = required("APP_ORIGIN");
+    const appOriginInput = required("APP_ORIGIN");
     let appOriginUrl: URL;
     try {
-        appOriginUrl = new URL(appOrigin);
+        appOriginUrl = new URL(appOriginInput);
     } catch {
         throw new Error("APP_ORIGIN must be an absolute http(s) URL");
     }
     if (appOriginUrl.protocol !== "http:" && appOriginUrl.protocol !== "https:") {
         throw new Error("APP_ORIGIN must be an absolute http(s) URL");
+    }
+    if (nodeEnv === "production" && appOriginUrl.protocol !== "https:") {
+        throw new Error("APP_ORIGIN must use HTTPS in production");
     }
 
     const betterAuthSecret = required("BETTER_AUTH_SECRET");
@@ -61,7 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     return {
         nodeEnv,
         port: integerInRange("PORT", env.PORT, 4000, 1, 65535),
-        appOrigin,
+        appOrigin: appOriginUrl.origin,
         betterAuthSecret,
         database: { url: required("DATABASE_URL"), poolMax: integerInRange("DB_POOL_MAX", env.DB_POOL_MAX, 10, 1, 50) },
         smtp: {

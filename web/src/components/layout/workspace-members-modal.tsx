@@ -4,7 +4,6 @@ import { App, Alert, Avatar, Button, Empty, Form, Input, Modal, Popconfirm, Sele
 import { MailPlus, UserMinus, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { authErrorTranslationKey } from "@/lib/auth-client";
 import { platformErrorTranslationKey } from "@/services/api/platform-client";
 import {
     cancelWorkspaceInvitation,
@@ -161,7 +160,7 @@ export function WorkspaceMembersModal({ open, workspace, onClose }: WorkspaceMem
                             <Alert
                                 type="error"
                                 showIcon
-                                message={t(authErrorTranslationKey(invitationsQuery.error, "workspace.errors.invitationsLoadFailed"))}
+                                message={t(platformErrorTranslationKey(invitationsQuery.error, "workspace.errors.invitationsLoadFailed"))}
                                 action={<Button size="small" onClick={() => void invitationsQuery.refetch()}>{t("common.retry")}</Button>}
                             />
                         ) : invitationsQuery.data?.length ? (

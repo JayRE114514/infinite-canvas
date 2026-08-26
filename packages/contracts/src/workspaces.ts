@@ -10,8 +10,12 @@ export type WorkspaceRole = Static<typeof WorkspaceRoleSchema>;
 export const WorkspaceTypeSchema = Type.Union([Type.Literal("personal"), Type.Literal("team")]);
 export type WorkspaceType = Static<typeof WorkspaceTypeSchema>;
 
+/** Better Auth IDs are opaque strings; consumers must not assume UUID format. */
+export const WorkspaceIdSchema = Type.String({ minLength: 1 });
+export type WorkspaceId = Static<typeof WorkspaceIdSchema>;
+
 export const WorkspaceSummarySchema = Type.Object({
-    id: Type.String(),
+    id: WorkspaceIdSchema,
     name: Type.String(),
     slug: Type.String(),
     type: WorkspaceTypeSchema,
@@ -49,19 +53,19 @@ export const UpdateWorkspaceBodySchema = Type.Object(
 export type UpdateWorkspaceBody = Static<typeof UpdateWorkspaceBodySchema>;
 
 export const WorkspacePathSchema = Type.Object(
-    { workspaceId: Type.String({ minLength: 1 }) },
+    { workspaceId: WorkspaceIdSchema },
     { additionalProperties: false },
 );
 export type WorkspacePath = Static<typeof WorkspacePathSchema>;
 
 export const WorkspaceMemberPathSchema = Type.Object(
-    { workspaceId: Type.String({ minLength: 1 }), memberId: Type.String({ minLength: 1 }) },
+    { workspaceId: WorkspaceIdSchema, memberId: Type.String({ minLength: 1 }) },
     { additionalProperties: false },
 );
 export type WorkspaceMemberPath = Static<typeof WorkspaceMemberPathSchema>;
 
 export const WorkspaceInvitationPathSchema = Type.Object(
-    { workspaceId: Type.String({ minLength: 1 }), invitationId: Type.String({ minLength: 1 }) },
+    { workspaceId: WorkspaceIdSchema, invitationId: Type.String({ minLength: 1 }) },
     { additionalProperties: false },
 );
 export type WorkspaceInvitationPath = Static<typeof WorkspaceInvitationPathSchema>;
@@ -97,7 +101,7 @@ export type CreateWorkspaceInvitationBody = Static<typeof CreateWorkspaceInvitat
 
 export const WorkspaceInvitationSchema = Type.Object({
     id: Type.String(),
-    workspaceId: Type.String(),
+    workspaceId: WorkspaceIdSchema,
     email: Type.String(),
     role: WorkspaceRoleSchema,
     status: Type.Union([
@@ -114,6 +118,18 @@ export type WorkspaceInvitation = Static<typeof WorkspaceInvitationSchema>;
 
 export const WorkspaceInvitationResponseSchema = Type.Object({ invitation: WorkspaceInvitationSchema });
 export type WorkspaceInvitationResponse = Static<typeof WorkspaceInvitationResponseSchema>;
+
+export const WorkspaceInvitationsResponseSchema = Type.Object({ invitations: Type.Array(WorkspaceInvitationSchema) });
+export type WorkspaceInvitationsResponse = Static<typeof WorkspaceInvitationsResponseSchema>;
+
+export const AcceptWorkspaceInvitationPathSchema = Type.Object(
+    { invitationId: Type.String({ minLength: 1 }) },
+    { additionalProperties: false },
+);
+export type AcceptWorkspaceInvitationPath = Static<typeof AcceptWorkspaceInvitationPathSchema>;
+
+export const AcceptWorkspaceInvitationResponseSchema = Type.Object({ workspaceId: WorkspaceIdSchema });
+export type AcceptWorkspaceInvitationResponse = Static<typeof AcceptWorkspaceInvitationResponseSchema>;
 
 export const SuccessResponseSchema = Type.Object({ success: Type.Literal(true) });
 export type SuccessResponse = Static<typeof SuccessResponseSchema>;

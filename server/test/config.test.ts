@@ -108,6 +108,18 @@ describe("loadConfig", () => {
         expect(() => loadConfig({ ...baseEnv, APP_ORIGIN: appOrigin })).toThrow("APP_ORIGIN");
     });
 
+    it("normalizes APP_ORIGIN to its URL origin", () => {
+        const config = loadConfig({ ...baseEnv, APP_ORIGIN: "https://canvas.example.com/path?source=test#fragment" });
+
+        expect(config.appOrigin).toBe("https://canvas.example.com");
+    });
+
+    it("requires HTTPS APP_ORIGIN in production", () => {
+        expect(() => loadConfig({ ...baseEnv, NODE_ENV: "production", APP_ORIGIN: "http://canvas.example.com" })).toThrow(
+            "APP_ORIGIN must use HTTPS in production",
+        );
+    });
+
     it("keeps optional SMTP credentials as provided", () => {
         const config = loadConfig({ ...baseEnv, SMTP_USER: "mailer", SMTP_PASSWORD: "secret" });
 
