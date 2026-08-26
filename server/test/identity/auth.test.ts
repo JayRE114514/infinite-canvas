@@ -1,151 +1,43 @@
-import { readFile } from "node:fs/promises";
-
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { buildApp, type BuildAppOptions } from "../../src/app.js";
-import { loadConfig, type AppConfig } from "../../src/config.js";
-import { createDatabase } from "../../src/infrastructure/database/client.js";
-import type { DatabaseHandle } from "../../src/infrastructure/database/types.js";
-import type { Mailer } from "../../src/infrastructure/email/mailer.js";
-import { startPostgres, type StartedPostgres } from "../helpers/postgres.js";
+import {
+    APP_ORIGIN,
+    PASSWORD,
+    cookieHeader,
+    createAuthTestHarness,
+    registerVerifiedUser,
+} from "../helpers/auth.js";
 
-const APP_ORIGIN = "http://localhost:3000";
-const PASSWORD = "correct-horse-battery-staple";
-const MIGRATION_URL = new URL("../../migrations/0000_auth_and_workspaces.sql", import.meta.url);
-
-/** 测试注入的内存邮件发送器，捕获验证链接与邀请链接，不产生真实 SMTP 请求。 */
-class MemoryMailer implements Mailer {
-    readonly messages: { email: string; verificationUrl: string }[] = [];
-    readonly invitations: { email: string; invitationUrl: string }[] = [];
-
-    async sendVerification(email: string, url: string): Promise<void> {
-        this.messages.push({ email, verificationUrl: url });
-    }
-
-    async sendWorkspaceInvitation(email: string, url: string): Promise<void> {
-        this.invitations.push({ email, invitationUrl: url });
-    }
-}
-
-let postgres: StartedPostgres | undefined;
-let migrationSql = "";
-const openApps: Awaited<ReturnType<typeof buildApp>>[] = [];
-const openHandles: DatabaseHandle[] = [];
-
-function postgresUrl(): string {
-    if (!postgres) throw new Error("PostgreSQL container is not started");
-    return postgres.url;
-}
-
-function testConfig(): AppConfig {
-    return loadConfig({
-        NODE_ENV: "test",
-        DATABASE_URL: postgresUrl(),
-        BETTER_AUTH_SECRET: "t".repeat(32),
-        APP_ORIGIN: APP_ORIGIN,
-        SMTP_HOST: "localhost",
-        SMTP_FROM: "no-reply@example.com",
-    });
-}
-
-/** 先登记再返回，保证断言失败时 afterEach 仍能释放连接池。 */
-function openDatabase(): DatabaseHandle {
-    const handle = createDatabase({ url: postgresUrl(), poolMax: 4 });
-    openHandles.push(handle);
-    return handle;
-}
-
-async function openApp(options: BuildAppOptions) {
-    const app = await buildApp(options);
-    openApps.push(app);
-    return app;
-}
-
-/** 每个用例独立建库结构，避免用户与工作区数据跨用例串味。 */
-async function openAuthApp() {
-    const mailer = new MemoryMailer();
-    const database = openDatabase();
-    await database.pool.query("drop schema public cascade; create schema public");
-    await database.pool.query(migrationSql);
-    const app = await openApp({ logger: false, config: testConfig(), database, mailer });
-    return { app, mailer, database };
-}
-
-function cookieHeader(setCookie: string | string[] | undefined): string {
-    const cookies = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
-    return cookies.map((cookie) => cookie.split(";")[0]).join("; ");
-}
-
-type AuthApp = Awaited<ReturnType<typeof openApp>>;
-
-/** 注册 → 跟随捕获的验证链接 → 登录，返回会话 Cookie 与用户 id。 */
-async function registerVerifiedUser(
-    app: AuthApp,
-    mailer: MemoryMailer,
-    user: { name: string; email: string },
-): Promise<{ cookie: string; userId: string }> {
-    const before = mailer.messages.length;
-
-    const signUp = await app.inject({
-        method: "POST",
-        url: "/api/auth/sign-up/email",
-        headers: { origin: APP_ORIGIN },
-        payload: { name: user.name, email: user.email, password: PASSWORD },
-    });
-
-    expect(signUp.statusCode).toBe(200);
-    expect(mailer.messages).toHaveLength(before + 1);
-
-    const verificationUrl = new URL(mailer.messages[before]!.verificationUrl);
-    await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
-
-    const signIn = await app.inject({
-        method: "POST",
-        url: "/api/auth/sign-in/email",
-        headers: { origin: APP_ORIGIN },
-        payload: { email: user.email, password: PASSWORD },
-    });
-
-    expect(signIn.statusCode).toBe(200);
-    const cookie = cookieHeader(signIn.headers["set-cookie"]);
-    expect(cookie).not.toBe("");
-
-    return { cookie, userId: signIn.json().user.id as string };
-}
+const harness = createAuthTestHarness();
+const openApp = harness.openApp;
+const openAuthApp = harness.openAuthApp;
 
 beforeAll(async () => {
-    postgres = await startPostgres();
-    // 迁移文件是唯一的建表来源，测试直接执行它，能同时验证迁移可用。
-    migrationSql = await readFile(MIGRATION_URL, "utf8");
+    await harness.start();
 }, 180_000);
 
 afterEach(async () => {
-    for (const app of openApps.splice(0)) await app.close().catch(() => {});
-    for (const handle of openHandles.splice(0)) {
-        if (handle.pool.ending || handle.pool.ended) continue;
-        await handle.pool.end().catch(() => {});
-    }
+    await harness.cleanup();
 }, 30_000);
 
 afterAll(async () => {
-    await postgres?.stop();
-    postgres = undefined;
+    await harness.stop();
 }, 60_000);
 
 describe("session guard", () => {
-    it("returns 401 from a protected probe without a session", async () => {
+    it("returns 401 from the workspace list without a session", async () => {
         const { app } = await openAuthApp();
 
-        const response = await app.inject({ method: "GET", url: "/api/v1/session-probe" });
+        const response = await app.inject({ method: "GET", url: "/api/v1/workspaces" });
 
         expect(response.statusCode).toBe(401);
         expect(response.json().error.code).toBe("unauthenticated");
     }, 60_000);
 
-    it("keeps the probe absent from the pure app", async () => {
+    it("keeps protected workspace routes absent from the pure app", async () => {
         const app = await openApp({ logger: false });
 
-        const response = await app.inject({ method: "GET", url: "/api/v1/session-probe" });
+        const response = await app.inject({ method: "GET", url: "/api/v1/workspaces" });
 
         expect(response.statusCode).toBe(404);
         expect(app.hasDecorator("auth")).toBe(false);
@@ -204,7 +96,7 @@ describe("email and password registration", () => {
         expect(signIn.headers["set-cookie"]).toBeUndefined();
     }, 60_000);
 
-    it("accepts the session cookie on the protected probe", async () => {
+    it("accepts the session cookie on the protected workspace list", async () => {
         const { app, mailer } = await openAuthApp();
 
         await app.inject({
@@ -226,11 +118,12 @@ describe("email and password registration", () => {
 
         expect(cookie).not.toBe("");
 
-        const probe = await app.inject({ method: "GET", url: "/api/v1/session-probe", headers: { cookie } });
+        const response = await app.inject({ method: "GET", url: "/api/v1/workspaces", headers: { cookie } });
 
-        expect(probe.statusCode).toBe(200);
-        expect(probe.json().userId).toEqual(expect.any(String));
-        expect(probe.json().requestId).toEqual(expect.any(String));
+        expect(response.statusCode).toBe(200);
+        expect(response.json().workspaces).toEqual([
+            expect.objectContaining({ type: "personal", role: "owner" }),
+        ]);
     }, 60_000);
 });
 

@@ -1,9 +1,38 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { APIError } from "better-auth/api";
 import { organization } from "better-auth/plugins/organization";
+import { eq } from "drizzle-orm";
 
-import { authSchema } from "./auth-schema.js";
+import { authSchema, workspaceMembers } from "./auth-schema.js";
 import type { AuthDependencies } from "./types.js";
+
+function rejectPersonalMemberMutation(organization: Record<string, unknown>): void {
+    if (organization.workspaceType !== "personal") return;
+    throw new APIError("CONFLICT", {
+        code: "PERSONAL_WORKSPACE_SINGLE_MEMBER",
+        message: "Personal workspace can only contain its owner",
+    });
+}
+
+function rejectOwnerRoleMutation(role: string): void {
+    if (!role.split(",").map((item) => item.trim()).includes("owner")) return;
+    throw new APIError("CONFLICT", {
+        code: "WORKSPACE_OWNER_CANNOT_BE_REMOVED",
+        message: "Workspace owner role cannot be mutated",
+    });
+}
+
+function parseSingleWorkspaceRole(role: string): "owner" | "admin" | "member" {
+    const roles = role.split(",").map((item) => item.trim()).filter(Boolean);
+    if (roles.length === 1 && (roles[0] === "owner" || roles[0] === "admin" || roles[0] === "member")) {
+        return roles[0];
+    }
+    throw new APIError("BAD_REQUEST", {
+        code: "WORKSPACE_ROLE_INVALID",
+        message: "Workspace membership requires one owner, admin, or member role",
+    });
+}
 
 /** 组装 Better Auth 实例：邮箱密码需验证邮箱，Organization 映射到应用工作区表。 */
 export function createAuth({ db, config, mailer }: AuthDependencies) {
@@ -66,6 +95,37 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
                     beforeCreateOrganization: async ({ organization: input, user }) => ({
                         data: { ...input, workspaceType: "team", status: "active", ownerUserId: user.id },
                     }),
+                    // v1 路由委托 Better Auth；这些钩子同时封住 /api/auth 下的直接组织写入入口。
+                    beforeAddMember: async ({ member, organization }) => {
+                        rejectPersonalMemberMutation(organization);
+                        const role = parseSingleWorkspaceRole(member.role);
+                        const existing = await db.query.workspaceMembers.findFirst({
+                            where: eq(workspaceMembers.organizationId, member.organizationId),
+                        });
+                        if (role === "owner" && existing) rejectOwnerRoleMutation(role);
+                    },
+                    beforeCreateInvitation: async ({ invitation, organization }) => {
+                        rejectPersonalMemberMutation(organization);
+                        if (parseSingleWorkspaceRole(invitation.role) === "owner") {
+                            throw new APIError("BAD_REQUEST", {
+                                code: "WORKSPACE_ROLE_INVALID",
+                                message: "Workspace invitations support admin or member roles",
+                            });
+                        }
+                    },
+                    beforeAcceptInvitation: async ({ organization }) => {
+                        rejectPersonalMemberMutation(organization);
+                    },
+                    beforeRemoveMember: async ({ member, organization }) => {
+                        rejectPersonalMemberMutation(organization);
+                        rejectOwnerRoleMutation(member.role);
+                    },
+                    beforeUpdateMemberRole: async ({ member, newRole, organization }) => {
+                        rejectPersonalMemberMutation(organization);
+                        const role = parseSingleWorkspaceRole(newRole);
+                        rejectOwnerRoleMutation(member.role);
+                        if (role === "owner") rejectOwnerRoleMutation(role);
+                    },
                 },
             }),
         ],

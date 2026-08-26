@@ -11,7 +11,7 @@ import type { DatabaseHandle } from "./infrastructure/database/types.js";
 import { createSmtpMailer, type Mailer } from "./infrastructure/email/mailer.js";
 import { createAuth } from "./modules/identity/auth.js";
 import { registerAuthRoutes } from "./modules/identity/routes.js";
-import { requireSession } from "./modules/identity/session.js";
+import { registerWorkspaceRoutes } from "./modules/workspaces/routes.js";
 
 const DEV_WEB_ORIGIN = "http://localhost:3000";
 
@@ -61,8 +61,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
             app.decorate("auth", auth);
             await registerAuthRoutes(app, auth);
-
-            app.get("/api/v1/session-probe", async (request) => await requireSession(request));
+            registerWorkspaceRoutes(app, auth);
         }
 
         app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);
