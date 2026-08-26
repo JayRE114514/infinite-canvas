@@ -35,7 +35,8 @@ describe("cors policy", () => {
     afterEach(async () => {
         await app?.close();
         app = undefined;
-        process.env.NODE_ENV = originalNodeEnv;
+        if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = originalNodeEnv;
     });
 
     it("allows the Vite dev origin in development", async () => {
@@ -65,13 +66,24 @@ describe("cors policy", () => {
         expect(response.headers["access-control-allow-origin"]).toBeUndefined();
     });
 
-    it("honours an explicit allow-list from buildApp options", async () => {
-        app = await buildApp({ logger: false, corsOrigin: ["https://app.example"] });
+    it.each(["test", "staging", "Development", "production "])(
+        "disables cross-origin access when NODE_ENV is %s",
+        async (nodeEnv) => {
+            process.env.NODE_ENV = nodeEnv;
+            app = await buildApp({ logger: false });
 
-        const allowed = await app.inject({ method: "GET", url: "/api/v1/health/live", headers: { origin: "https://app.example" } });
-        const blocked = await app.inject({ method: "GET", url: "/api/v1/health/live", headers: { origin: "http://localhost:3000" } });
+            const response = await app.inject({ method: "GET", url: "/api/v1/health/live", headers: { origin: "http://localhost:3000" } });
 
-        expect(allowed.headers["access-control-allow-origin"]).toBe("https://app.example");
-        expect(blocked.headers["access-control-allow-origin"]).toBeUndefined();
+            expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+        },
+    );
+
+    it("disables cross-origin access when NODE_ENV is unset", async () => {
+        delete process.env.NODE_ENV;
+        app = await buildApp({ logger: false });
+
+        const response = await app.inject({ method: "GET", url: "/api/v1/health/live", headers: { origin: "http://localhost:3000" } });
+
+        expect(response.headers["access-control-allow-origin"]).toBeUndefined();
     });
 });

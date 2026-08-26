@@ -7,20 +7,17 @@ import { registerErrorHandler } from "./error-handler.js";
 
 const DEV_WEB_ORIGIN = "http://localhost:3000";
 
-export type BuildAppOptions = Pick<FastifyServerOptions, "logger"> & {
-    /** 允许的跨域来源；false 表示禁用跨域。默认生产禁用，开发只放行 Vite origin。 */
-    corsOrigin?: readonly string[] | false;
-};
+export type BuildAppOptions = Pick<FastifyServerOptions, "logger">;
 
-function resolveCorsOrigin(corsOrigin: BuildAppOptions["corsOrigin"]): readonly string[] | false {
-    if (corsOrigin !== undefined) return corsOrigin;
-    return process.env.NODE_ENV === "production" ? false : [DEV_WEB_ORIGIN];
+/** 仅 development 放行 Vite origin，其余环境（含未设置）一律禁用跨域。 */
+function resolveCorsOrigin(): string[] | false {
+    return process.env.NODE_ENV === "development" ? [DEV_WEB_ORIGIN] : false;
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
     const app = Fastify({ logger: options.logger ?? true }).withTypeProvider<TypeBoxTypeProvider>();
 
-    await app.register(cors, { origin: resolveCorsOrigin(options.corsOrigin) as string[] | false, credentials: true });
+    await app.register(cors, { origin: resolveCorsOrigin(), credentials: true });
 
     registerErrorHandler(app);
 
