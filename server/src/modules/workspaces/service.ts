@@ -163,7 +163,8 @@ export async function acceptWorkspaceInvitation(
                 .select({ workspaceType: workspaces.workspaceType })
                 .from(workspaces)
                 .where(eq(workspaces.id, invitation.organizationId))
-                .limit(1);
+                .limit(1)
+                .for("update");
             if (!workspace || workspace.workspaceType !== "team" || (invitation.role !== "admin" && invitation.role !== "member")) {
                 throw new AppError("workspace_invitation_unavailable", 409, "邀请不存在、已过期或已处理");
             }

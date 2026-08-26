@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { users } from "../../src/modules/identity/auth-schema.js";
+import { users, workspaceMembers } from "../../src/modules/identity/auth-schema.js";
 import { ensurePersonalWorkspace } from "../../src/modules/workspaces/service.js";
 import {
     createAuthTestHarness,
@@ -650,6 +650,98 @@ describe("workspace invitation acceptance", () => {
         expect(members.rows).toEqual([{ role: "member" }]);
         expect(invitation.rows).toEqual([{ status: "accepted" }]);
     }, 90_000);
+
+    it("serializes different invitation acceptances at the 100-member limit", async () => {
+        const { app, mailer, database } = await harness.openAuthApp();
+        const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
+        const workspace = await createTeam(app, owner, "容量上限团队", "member-limit-team");
+        const seededUsers = Array.from({ length: 98 }, (_, index) => ({
+            id: `capacity-user-${index}`,
+            name: `容量成员${index}`,
+            email: `capacity-user-${index}@example.com`,
+            emailVerified: true,
+        }));
+        await database.db.insert(users).values(seededUsers);
+        await database.db.insert(workspaceMembers).values(
+            seededUsers.map((user, index) => ({
+                id: `capacity-member-${index}`,
+                organizationId: workspace.id,
+                userId: user.id,
+                role: "member",
+            })),
+        );
+        const before = await database.pool.query(
+            'select count(*)::int as count from "workspace_members" where "organizationId" = $1',
+            [workspace.id],
+        );
+        const firstInvitation = await app.inject({
+            method: "POST",
+            url: `/api/v1/workspaces/${workspace.id}/invitations`,
+            headers: { cookie: owner.cookie },
+            payload: { email: "capacity-first@example.com", role: "member" },
+        });
+        const secondInvitation = await app.inject({
+            method: "POST",
+            url: `/api/v1/workspaces/${workspace.id}/invitations`,
+            headers: { cookie: owner.cookie },
+            payload: { email: "capacity-second@example.com", role: "member" },
+        });
+        const firstInvitationId = firstInvitation.json().invitation.id as string;
+        const secondInvitationId = secondInvitation.json().invitation.id as string;
+        const firstInvitee = await registerVerifiedUser(app, mailer, {
+            name: "容量候选人一",
+            email: "capacity-first@example.com",
+        });
+        const secondInvitee = await registerVerifiedUser(app, mailer, {
+            name: "容量候选人二",
+            email: "capacity-second@example.com",
+        });
+        await database.pool.query(`
+            create function delay_capacity_member_insert() returns trigger language plpgsql as $$
+            begin
+                perform pg_sleep(1);
+                return new;
+            end
+            $$;
+            create trigger delay_capacity_member_insert before insert on "workspace_members"
+            for each row execute function delay_capacity_member_insert();
+        `);
+        const accept = async (invitationId: string, cookie: string) => ({
+            invitationId,
+            response: await app.inject({
+                method: "POST",
+                url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+                headers: { cookie },
+            }),
+        });
+
+        const attempts = await Promise.all([
+            accept(firstInvitationId, firstInvitee.cookie),
+            accept(secondInvitationId, secondInvitee.cookie),
+        ]);
+        const winner = attempts.find(({ response }) => response.statusCode === 200)!;
+        const loser = attempts.find(({ response }) => response.statusCode === 409)!;
+        const after = await database.pool.query(
+            'select count(*)::int as count from "workspace_members" where "organizationId" = $1',
+            [workspace.id],
+        );
+        const invitations = await database.pool.query(
+            'select "id", "status" from "workspace_invitations" where "id" = any($1::text[])',
+            [[firstInvitationId, secondInvitationId]],
+        );
+        const invitationStatuses = Object.fromEntries(
+            invitations.rows.map((invitation: { id: string; status: string }) => [invitation.id, invitation.status]),
+        );
+
+        expect(before.rows).toEqual([{ count: 99 }]);
+        expect([firstInvitation.statusCode, secondInvitation.statusCode]).toEqual([201, 201]);
+        expect(attempts.map(({ response }) => response.statusCode).sort()).toEqual([200, 409]);
+        expect(winner.response.json()).toEqual({ workspaceId: workspace.id });
+        expect(loser.response.json().error.code).toBe("workspace_member_limit_reached");
+        expect(after.rows).toEqual([{ count: 100 }]);
+        expect(invitationStatuses[winner.invitationId]).toBe("accepted");
+        expect(invitationStatuses[loser.invitationId]).toBe("pending");
+    }, 120_000);
 
     it("keeps the invitation pending when membership insertion fails", async () => {
         const { app, mailer, database } = await harness.openAuthApp();

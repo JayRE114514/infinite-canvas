@@ -332,6 +332,8 @@ export function createAuth({ db, config }: AuthDependencies) {
     account: { modelName: 'accounts' },
     verification: { modelName: 'verifications' },
     plugins: [organization({
+      allowUserToCreateOrganization: false,
+      disableOrganizationDeletion: true,
       requireEmailVerificationOnInvitation: true,
       sendInvitationEmail: (data) => mailer.sendWorkspaceInvitation(data.email, data.invitation.id),
       schema: {
@@ -347,9 +349,12 @@ export function createAuth({ db, config }: AuthDependencies) {
         invitation: { modelName: 'workspace_invitations' },
       },
       organizationHooks: {
-        beforeCreateOrganization: async ({ organization, user }) => ({
-          data: { ...organization, workspaceType: 'team', status: 'active', ownerUserId: user.id },
-        }),
+        beforeCreateOrganization: async () => {
+          throw new APIError('FORBIDDEN', {
+            code: 'WORKSPACE_CREATION_REQUIRES_APPLICATION_ROUTE',
+            message: 'Workspace creation requires the application route',
+          })
+        },
       },
     })],
   })
@@ -358,7 +363,7 @@ export function createAuth({ db, config }: AuthDependencies) {
 
 - [ ] **Step 3: Mount the official Fetch-compatible handler**
 
-Use `fromNodeHeaders(request.headers)`, construct a standard `Request`, call `auth.handler(req)`, copy status and all response headers, and send the response text. Register only `GET` and `POST` on `/api/auth/*`.
+Use `fromNodeHeaders(request.headers)`, construct a standard `Request`, call `auth.handler(req)`, copy status and all response headers, and send the response text. Register only the exact identity routes required by the frontend: `POST /api/auth/sign-up/email`, `POST /api/auth/sign-in/email`, `GET /api/auth/get-session`, `POST /api/auth/sign-out`, `GET /api/auth/verify-email`, and `POST /api/auth/send-verification-email`. Do not mount any `/api/auth/organization/*` route.
 
 - [ ] **Step 4: Implement the stable session guard**
 
@@ -440,7 +445,7 @@ export async function requireWorkspaceMember(request: FastifyRequest, workspaceI
 
 - [ ] **Step 4: Add Workspace routes**
 
-Implement `GET /api/v1/workspaces`, `POST /api/v1/workspaces`, `GET /api/v1/workspaces/:workspaceId`, `PATCH /api/v1/workspaces/:workspaceId`, member listing/removal, and invitation create/cancel endpoints. Team creation always writes `workspaceType = 'team'`; invitation operations delegate to Better Auth server APIs after `requireWorkspaceMember` checks owner/admin. Reject invitation or member mutation when `workspaceType = 'personal'` with `409 personal_workspace_single_member`.
+Implement `GET /api/v1/workspaces`, `POST /api/v1/workspaces`, `GET /api/v1/workspaces/:workspaceId`, `PATCH /api/v1/workspaces/:workspaceId`, member listing/removal, and invitation list/create/accept/cancel endpoints. Team creation inserts the Workspace and owner membership with application-generated IDs in one Drizzle transaction and never writes `activeOrganizationId`. Invitation acceptance conditionally claims the verified recipient's nonexpired pending invitation, locks the target Workspace row, checks capacity, inserts membership, and marks accepted in one transaction. Invitation generation and other safe operations may delegate to explicit Better Auth server APIs only after application path-membership and owner/admin checks. Reject invitation or member mutation when `workspaceType = 'personal'` with `409 personal_workspace_single_member`.
 
 - [ ] **Step 5: Hand verification to the user**
 
@@ -476,7 +481,7 @@ git commit -m "feat: add personal and team workspaces"
 - Modify: `web/src/i18n/locales/zh-CN.ts`
 
 **Interfaces:**
-- Consumes: Better Auth `/api/auth/*` and `GET /api/v1/workspaces`.
+- Consumes: the exact Better Auth identity endpoints listed in Task 3 and typed Workspace business routes under `/api/v1`.
 - Produces: `useWorkspaceStore` with `activeWorkspaceId`, `setActiveWorkspaceId`, and `clearWorkspace`.
 - Produces: `platformRequest<T>(path, init): Promise<T>`.
 
