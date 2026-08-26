@@ -1,6 +1,8 @@
 import type { FastifyInstance } from "fastify";
+import type { Pool } from "pg";
 
-import type { DatabaseHandle } from "./types.js";
+import type { AppConfig } from "../../config.js";
+import type { AppDatabase, DatabaseHandle } from "./types.js";
 
 export type DatabasePluginOptions = { database: DatabaseHandle; ownsPool: boolean };
 
@@ -24,4 +26,20 @@ export async function checkDatabaseReady(database: DatabaseHandle): Promise<bool
     } catch {
         return false;
     }
+}
+
+/** 结构化入参，兼容 withTypeProvider 之后的实例类型。 */
+type RuntimeDecorations = { appConfig?: AppConfig; db?: AppDatabase; pgPool?: Pool };
+
+/** 把可选装饰器收窄成必选，缺失时立即报错，避免调用方拿到 undefined。 */
+export function requireDatabase(app: RuntimeDecorations): DatabaseHandle {
+    const { db, pgPool } = app;
+    if (!db || !pgPool) throw new Error("This app was built without a database; pass config or database to buildApp");
+    return { db, pool: pgPool };
+}
+
+export function requireAppConfig(app: RuntimeDecorations): AppConfig {
+    const { appConfig } = app;
+    if (!appConfig) throw new Error("This app was built without appConfig; pass config to buildApp");
+    return appConfig;
 }

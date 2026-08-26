@@ -33,27 +33,34 @@ function resolveDatabase(options: BuildAppOptions): { database: DatabaseHandle; 
 export async function buildApp(options: BuildAppOptions = {}) {
     const app = Fastify({ logger: options.logger ?? true }).withTypeProvider<TypeBoxTypeProvider>();
 
-    await app.register(cors, { origin: resolveCorsOrigin(), credentials: true });
-
-    registerErrorHandler(app);
-
-    if (options.config) app.decorate("appConfig", options.config);
-
     const resolved = resolveDatabase(options);
-    if (resolved) registerDatabase(app, resolved);
 
-    app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);
+    // 连接池创建之后的任何构造失败都要释放自建连接池，避免启动失败仍占用连接。
+    try {
+        await app.register(cors, { origin: resolveCorsOrigin(), credentials: true });
 
-    if (resolved) {
-        app.get(
-            "/api/v1/health/ready",
-            { schema: { response: { 200: HealthResponseSchema, 503: UnavailableResponseSchema } } },
-            async (_request, reply) => {
-                if (await checkDatabaseReady(resolved.database)) return { status: "ok" } as const;
-                return reply.status(503).send({ status: "unavailable" } as const);
-            },
-        );
+        registerErrorHandler(app);
+
+        if (options.config) app.decorate("appConfig", options.config);
+
+        if (resolved) registerDatabase(app, resolved);
+
+        app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);
+
+        if (resolved) {
+            app.get(
+                "/api/v1/health/ready",
+                { schema: { response: { 200: HealthResponseSchema, 503: UnavailableResponseSchema } } },
+                async (_request, reply) => {
+                    if (await checkDatabaseReady(resolved.database)) return { status: "ok" } as const;
+                    return reply.status(503).send({ status: "unavailable" } as const);
+                },
+            );
+        }
+
+        return app;
+    } catch (error) {
+        if (resolved?.ownsPool) await resolved.database.pool.end().catch(() => {});
+        throw error;
     }
-
-    return app;
 }

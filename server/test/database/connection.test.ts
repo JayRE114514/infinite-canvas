@@ -1,40 +1,72 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { buildApp } from "../../src/app.js";
+import { buildApp, type BuildAppOptions } from "../../src/app.js";
+import type { DatabaseConfig } from "../../src/config.js";
 import { createDatabase } from "../../src/infrastructure/database/client.js";
+import type { DatabaseHandle } from "../../src/infrastructure/database/types.js";
 import { startPostgres, type StartedPostgres } from "../helpers/postgres.js";
 
+const UNREACHABLE_URL = "postgres://test:test@127.0.0.1:1/test";
+/** 留出高于连接池 5 秒连接超时的余量，避免不可达用例先被测试框架判超时。 */
+const UNREACHABLE_TIMEOUT_MS = 20_000;
+
+let postgres: StartedPostgres | undefined;
+const openApps: Awaited<ReturnType<typeof buildApp>>[] = [];
+const openHandles: DatabaseHandle[] = [];
+
+/** 先登记再返回，保证断言失败时 afterEach 仍能释放连接池。 */
+function openDatabase(config: DatabaseConfig): DatabaseHandle {
+    const handle = createDatabase(config);
+    openHandles.push(handle);
+    return handle;
+}
+
+async function openApp(options: BuildAppOptions) {
+    const app = await buildApp(options);
+    openApps.push(app);
+    return app;
+}
+
+function postgresUrl(): string {
+    if (!postgres) throw new Error("PostgreSQL container is not started");
+    return postgres.url;
+}
+
+beforeAll(async () => {
+    postgres = await startPostgres();
+}, 180_000);
+
+/** 断言成功或失败都要释放 app 与连接池，残留句柄会让整个套件挂起。 */
+afterEach(async () => {
+    for (const app of openApps.splice(0)) await app.close().catch(() => {});
+    for (const handle of openHandles.splice(0)) {
+        if (handle.pool.ending || handle.pool.ended) continue;
+        await handle.pool.end().catch(() => {});
+    }
+}, 30_000);
+
+afterAll(async () => {
+    await postgres?.stop();
+    postgres = undefined;
+}, 60_000);
+
 describe("createDatabase", () => {
-    let postgres: StartedPostgres;
-
-    beforeAll(async () => {
-        postgres = await startPostgres();
-    }, 180_000);
-
-    afterAll(async () => {
-        await postgres?.stop();
-    }, 60_000);
-
     it("executes a readiness query against PostgreSQL", async () => {
-        const { pool } = createDatabase({ url: postgres.url, poolMax: 2 });
+        const { pool } = openDatabase({ url: postgresUrl(), poolMax: 2 });
 
         await expect(pool.query("select 1 as ready")).resolves.toMatchObject({ rows: [{ ready: 1 }] });
-
-        await pool.end();
     });
 
     it("applies the configured pool bounds", () => {
-        const { pool } = createDatabase({ url: postgres.url, poolMax: 3 });
+        const { pool } = openDatabase({ url: postgresUrl(), poolMax: 3 });
 
         expect(pool.options.max).toBe(3);
         expect(pool.options.connectionTimeoutMillis).toBe(5_000);
         expect(pool.options.idleTimeoutMillis).toBe(30_000);
-
-        return pool.end();
     });
 
     it("shares one pool between Drizzle and the raw client", async () => {
-        const { db, pool } = createDatabase({ url: postgres.url, poolMax: 1 });
+        const { db, pool } = openDatabase({ url: postgresUrl(), poolMax: 1 });
 
         expect(pool.totalCount).toBe(0);
 
@@ -45,41 +77,32 @@ describe("createDatabase", () => {
         await pool.query("select 1");
 
         expect(pool.totalCount).toBe(1);
-
-        await pool.end();
     });
 });
 
 describe("GET /api/v1/health/ready", () => {
-    let postgres: StartedPostgres;
-    let app: Awaited<ReturnType<typeof buildApp>> | undefined;
-
-    beforeAll(async () => {
-        postgres = await startPostgres();
-    }, 180_000);
-
-    afterAll(async () => {
-        await postgres?.stop();
-    }, 60_000);
-
     it("reports ready while PostgreSQL answers", async () => {
-        const database = createDatabase({ url: postgres.url, poolMax: 2 });
-        app = await buildApp({ logger: false, database });
+        const database = openDatabase({ url: postgresUrl(), poolMax: 2 });
+        const app = await openApp({ logger: false, database });
 
         const response = await app.inject({ method: "GET", url: "/api/v1/health/ready" });
 
         expect(response.statusCode).toBe(200);
         expect(response.json()).toEqual({ status: "ok" });
+    });
+
+    it("leaves an injected pool usable after the app closes", async () => {
+        const database = openDatabase({ url: postgresUrl(), poolMax: 2 });
+        const app = await openApp({ logger: false, database });
 
         await app.close();
-        app = undefined;
+
         await expect(database.pool.query("select 1")).resolves.toBeTruthy();
-        await database.pool.end();
     });
 
     it("returns a stable 503 once PostgreSQL is unavailable", async () => {
-        const database = createDatabase({ url: postgres.url, poolMax: 2 });
-        app = await buildApp({ logger: false, database });
+        const database = openDatabase({ url: postgresUrl(), poolMax: 2 });
+        const app = await openApp({ logger: false, database });
 
         await database.pool.end();
 
@@ -87,34 +110,27 @@ describe("GET /api/v1/health/ready", () => {
 
         expect(response.statusCode).toBe(503);
         expect(response.json()).toEqual({ status: "unavailable" });
-
-        await app.close();
-        app = undefined;
     });
 
-    it("returns 503 instead of throwing when the database is unreachable", async () => {
-        const database = createDatabase({ url: "postgres://test:test@127.0.0.1:1/test", poolMax: 1 });
-        app = await buildApp({ logger: false, database });
+    it(
+        "returns 503 instead of throwing when the database is unreachable",
+        async () => {
+            const database = openDatabase({ url: UNREACHABLE_URL, poolMax: 1 });
+            const app = await openApp({ logger: false, database });
 
-        const response = await app.inject({ method: "GET", url: "/api/v1/health/ready" });
+            const response = await app.inject({ method: "GET", url: "/api/v1/health/ready" });
 
-        expect(response.statusCode).toBe(503);
-        expect(response.json()).toEqual({ status: "unavailable" });
+            expect(response.statusCode).toBe(503);
+            expect(response.json()).toEqual({ status: "unavailable" });
+        },
+        UNREACHABLE_TIMEOUT_MS,
+    );
 
-        await app.close();
-        app = undefined;
-        await database.pool.end();
-    });
-
-    it("decorates the shared config, db and pool", async () => {
-        const database = createDatabase({ url: postgres.url, poolMax: 2 });
-        app = await buildApp({ logger: false, database });
+    it("decorates the shared db and pool", async () => {
+        const database = openDatabase({ url: postgresUrl(), poolMax: 2 });
+        const app = await openApp({ logger: false, database });
 
         expect(app.pgPool).toBe(database.pool);
         expect(app.db).toBe(database.db);
-
-        await app.close();
-        app = undefined;
-        await database.pool.end();
     });
 });
