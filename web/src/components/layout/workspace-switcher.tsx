@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 
 import { WorkspaceMembersModal } from "@/components/layout/workspace-members-modal";
 import { authClient, authErrorTranslationKey, unwrapAuthResponse } from "@/lib/auth-client";
+import { clearWorkspaceSessionMemory } from "@/services/api/invitation-acceptance";
 import { platformErrorTranslationKey } from "@/services/api/platform-client";
 import { createWorkspace, workspaceKeys, workspacesQueryOptions } from "@/services/api/workspaces";
 import { useUserStore } from "@/stores/use-user-store";
@@ -47,8 +48,7 @@ export function WorkspaceSwitcher() {
         setSigningOut(true);
         try {
             unwrapAuthResponse(await authClient.signOut({ fetchOptions: { credentials: "include" } }));
-            await queryClient.cancelQueries({ queryKey: workspaceKeys.all });
-            queryClient.removeQueries({ queryKey: workspaceKeys.all });
+            await clearWorkspaceSessionMemory(queryClient);
             clearUser();
             clearWorkspace();
             navigate("/login", { replace: true });

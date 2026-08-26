@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Alert, Button } from "antd";
 import { CircleCheck, CircleX } from "lucide-react";
@@ -8,58 +8,56 @@ import { useTranslation } from "react-i18next";
 import { authClient, authErrorTranslationKey, createLoginPath } from "@/lib/auth-client";
 import {
     acceptInvitationOnce,
+    clearWorkspaceSessionMemory,
     getAcceptedInvitation,
     InvitationSynchronizationError,
+    isInvitationLifecycleActive,
     synchronizeAcceptedWorkspace,
-} from "@/pages/auth/invitation-acceptance";
+} from "@/services/api/invitation-acceptance";
 import { AuthPageLoading, AuthPageShell } from "@/pages/auth/auth-page-shell";
+import { useUserStore } from "@/stores/use-user-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
 
-export default function AcceptInvitationPage() {
+type InvitationAcceptanceFlowProps = {
+    userId: string;
+    invitationId: string;
+};
+
+function InvitationAcceptanceFlow({ userId, invitationId }: InvitationAcceptanceFlowProps) {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const queryClient = useQueryClient();
-    const { invitationId = "" } = useParams();
-    const { data: session, error: sessionError, isPending, refetch } = authClient.useSession();
+    const flowActive = useRef(true);
     const setActiveWorkspaceId = useWorkspaceStore((state) => state.setActiveWorkspaceId);
-    const sessionUserId = session?.user.id ?? "";
-    const returnTo = `/accept-invitation/${encodeURIComponent(invitationId)}`;
 
     const synchronizeMutation = useMutation({
-        mutationFn: ({ userId, organizationId }: { userId: string; organizationId: string }) => synchronizeAcceptedWorkspace(queryClient, userId, organizationId),
-        onSuccess: (workspace) => setActiveWorkspaceId(workspace.id),
+        mutationFn: ({ scopedUserId, organizationId }: { scopedUserId: string; organizationId: string }) => synchronizeAcceptedWorkspace(queryClient, scopedUserId, organizationId),
+        onSuccess: ({ workspace, generation }) => {
+            if (flowActive.current && isInvitationLifecycleActive(generation)) setActiveWorkspaceId(workspace.id);
+        },
     });
     const synchronize = synchronizeMutation.mutate;
     const acceptMutation = useMutation({
-        mutationFn: ({ userId, id }: { userId: string; id: string }) => acceptInvitationOnce(queryClient, userId, id),
-        onSuccess: ({ organizationId }, { userId }) => synchronize({ userId, organizationId }),
+        mutationFn: ({ scopedUserId, scopedInvitationId }: { scopedUserId: string; scopedInvitationId: string }) => acceptInvitationOnce(queryClient, scopedUserId, scopedInvitationId),
+        onSuccess: ({ organizationId, generation }, { scopedUserId }) => {
+            if (flowActive.current && isInvitationLifecycleActive(generation)) synchronize({ scopedUserId, organizationId });
+        },
     });
     const accept = acceptMutation.mutate;
 
     useEffect(() => {
-        if (!sessionUserId || !invitationId) return;
-        const accepted = getAcceptedInvitation(queryClient, sessionUserId, invitationId);
-        if (accepted) synchronize({ userId: sessionUserId, organizationId: accepted.organizationId });
-        else accept({ userId: sessionUserId, id: invitationId });
-    }, [accept, invitationId, queryClient, sessionUserId, synchronize]);
+        flowActive.current = true;
+        const accepted = getAcceptedInvitation(userId, invitationId);
+        if (accepted) synchronize({ scopedUserId: userId, organizationId: accepted.organizationId });
+        else accept({ scopedUserId: userId, scopedInvitationId: invitationId });
+        return () => {
+            flowActive.current = false;
+        };
+    }, [accept, invitationId, synchronize, userId]);
 
-    if (isPending) return <AuthPageLoading />;
-    if (!session && !sessionError) return <Navigate to={createLoginPath(returnTo)} replace />;
-
-    if (!session) {
+    if (synchronizeMutation.isSuccess && isInvitationLifecycleActive(synchronizeMutation.data.generation)) {
         return (
-            <AuthPageShell eyebrow={t("auth.invitation.eyebrow")} title={t("auth.invitation.sessionTitle")} description={t("auth.invitation.sessionDescription")}>
-                <Alert type="error" showIcon message={t("auth.invitation.errors.sessionFailed")} />
-                <Button className="mt-6" onClick={() => void refetch()}>{t("auth.invitation.retrySession")}</Button>
-            </AuthPageShell>
-        );
-    }
-
-    if (!invitationId) return <Navigate to="/" replace />;
-
-    if (synchronizeMutation.isSuccess) {
-        return (
-            <AuthPageShell eyebrow={t("auth.invitation.successEyebrow")} title={t("auth.invitation.successTitle")} description={t("auth.invitation.successNamedDescription", { name: synchronizeMutation.data.name })}>
+            <AuthPageShell eyebrow={t("auth.invitation.successEyebrow")} title={t("auth.invitation.successTitle")} description={t("auth.invitation.successNamedDescription", { name: synchronizeMutation.data.workspace.name })}>
                 <CircleCheck className="size-11 text-foreground" strokeWidth={1.5} aria-hidden />
                 <Button type="primary" size="large" className="mt-7" onClick={() => navigate("/", { replace: true })}>
                     {t("auth.invitation.enterWorkspace")}
@@ -92,7 +90,7 @@ export default function AcceptInvitationPage() {
                 <CircleX className="size-11 text-destructive" strokeWidth={1.5} aria-hidden />
                 <Alert className="mt-5" type="error" showIcon message={t(errorKey)} />
                 <div className="mt-6 flex flex-wrap justify-center gap-2">
-                    <Button type="primary" onClick={() => accept({ userId: sessionUserId, id: invitationId })}>{t("auth.invitation.retryAccept")}</Button>
+                    <Button type="primary" onClick={() => accept({ scopedUserId: userId, scopedInvitationId: invitationId })}>{t("auth.invitation.retryAccept")}</Button>
                     <Button onClick={() => navigate("/", { replace: true })}>{t("auth.invitation.backHome")}</Button>
                 </div>
             </AuthPageShell>
@@ -111,4 +109,43 @@ export default function AcceptInvitationPage() {
             </div>
         </AuthPageShell>
     );
+}
+
+export default function AcceptInvitationPage() {
+    const { t } = useTranslation();
+    const navigate = useNavigate();
+    const queryClient = useQueryClient();
+    const { invitationId = "" } = useParams();
+    const { data: session, error: sessionError, isPending, refetch } = authClient.useSession();
+    const anonymousSessionHandled = useRef(false);
+    const clearUser = useUserStore((state) => state.clearUser);
+    const clearWorkspace = useWorkspaceStore((state) => state.clearWorkspace);
+    const userId = session?.user.id ?? "";
+    const returnTo = `/accept-invitation/${encodeURIComponent(invitationId)}`;
+    const loginPath = createLoginPath(returnTo);
+    const anonymousSession = !isPending && !session && !sessionError;
+
+    useEffect(() => {
+        if (!anonymousSession || anonymousSessionHandled.current) return;
+        anonymousSessionHandled.current = true;
+        clearUser();
+        clearWorkspace();
+        void clearWorkspaceSessionMemory(queryClient).then(() => navigate(loginPath, { replace: true }));
+    }, [anonymousSession, clearUser, clearWorkspace, loginPath, navigate, queryClient]);
+
+    if (isPending) return <AuthPageLoading />;
+    if (anonymousSession) return <AuthPageLoading />;
+
+    if (!session) {
+        return (
+            <AuthPageShell eyebrow={t("auth.invitation.eyebrow")} title={t("auth.invitation.sessionTitle")} description={t("auth.invitation.sessionDescription")}>
+                <Alert type="error" showIcon message={t("auth.invitation.errors.sessionFailed")} />
+                <Button className="mt-6" onClick={() => void refetch()}>{t("auth.invitation.retrySession")}</Button>
+            </AuthPageShell>
+        );
+    }
+
+    if (!invitationId) return <Navigate to="/" replace />;
+
+    return <InvitationAcceptanceFlow key={JSON.stringify([userId, invitationId])} userId={userId} invitationId={invitationId} />;
 }

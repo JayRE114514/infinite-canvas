@@ -6,7 +6,20 @@ import { workspaceKeys, workspacesQueryOptions } from "@/services/api/workspaces
 
 export type AcceptedInvitationRecord = {
     organizationId: string;
+    generation: number;
 };
+
+type SynchronizedWorkspace = {
+    workspace: WorkspaceSummary;
+    generation: number;
+};
+
+class InvitationLifecycleCancelledError extends Error {
+    constructor() {
+        super("Invitation lifecycle changed");
+        this.name = "InvitationLifecycleCancelledError";
+    }
+}
 
 export class InvitationSynchronizationError extends Error {
     constructor() {
@@ -16,7 +29,9 @@ export class InvitationSynchronizationError extends Error {
 }
 
 const acceptanceRequests = new Map<string, Promise<AcceptedInvitationRecord>>();
-const synchronizationRequests = new Map<string, Promise<WorkspaceSummary>>();
+const acceptedInvitations = new Map<string, AcceptedInvitationRecord>();
+const synchronizationRequests = new Map<string, Promise<SynchronizedWorkspace>>();
+let lifecycleGeneration = 0;
 
 function requestKey(...parts: string[]) {
     return JSON.stringify(parts);
@@ -26,19 +41,41 @@ function clearSettledRequest<T>(requests: Map<string, Promise<T>>, key: string, 
     if (requests.get(key) === request) requests.delete(key);
 }
 
-export function getAcceptedInvitation(queryClient: QueryClient, userId: string, invitationId: string) {
-    return queryClient.getQueryData<AcceptedInvitationRecord>(workspaceKeys.acceptedInvitation(userId, invitationId));
+function assertActiveLifecycle(generation: number) {
+    if (generation !== lifecycleGeneration) throw new InvitationLifecycleCancelledError();
+}
+
+export function isInvitationLifecycleActive(generation: number) {
+    return generation === lifecycleGeneration;
+}
+
+export function resetInvitationAcceptanceLifecycle() {
+    lifecycleGeneration += 1;
+    acceptedInvitations.clear();
+    acceptanceRequests.clear();
+    synchronizationRequests.clear();
+}
+
+export async function clearWorkspaceSessionMemory(queryClient: QueryClient) {
+    resetInvitationAcceptanceLifecycle();
+    await queryClient.cancelQueries({ queryKey: workspaceKeys.all }).catch(() => undefined);
+    queryClient.removeQueries({ queryKey: workspaceKeys.all });
+}
+
+export function getAcceptedInvitation(userId: string, invitationId: string) {
+    return acceptedInvitations.get(requestKey(userId, invitationId));
 }
 
 export function acceptInvitationOnce(queryClient: QueryClient, userId: string, invitationId: string) {
     const acceptedKey = workspaceKeys.acceptedInvitation(userId, invitationId);
-    const accepted = queryClient.getQueryData<AcceptedInvitationRecord>(acceptedKey);
+    const key = requestKey(userId, invitationId);
+    const accepted = acceptedInvitations.get(key);
     if (accepted) return Promise.resolve(accepted);
 
-    const key = requestKey(userId, invitationId);
     const activeRequest = acceptanceRequests.get(key);
     if (activeRequest) return activeRequest;
 
+    const generation = lifecycleGeneration;
     const request = (async () => {
         const response = unwrapAuthResponse(
             await authClient.organization.acceptInvitation({
@@ -46,7 +83,9 @@ export function acceptInvitationOnce(queryClient: QueryClient, userId: string, i
                 fetchOptions: { credentials: "include" },
             }),
         );
-        const result = { organizationId: response.invitation.organizationId };
+        assertActiveLifecycle(generation);
+        const result = { organizationId: response.invitation.organizationId, generation };
+        acceptedInvitations.set(key, result);
         queryClient.setQueryData(acceptedKey, result);
         return result;
     })();
@@ -63,14 +102,18 @@ export function synchronizeAcceptedWorkspace(queryClient: QueryClient, userId: s
     const activeRequest = synchronizationRequests.get(key);
     if (activeRequest) return activeRequest;
 
+    const generation = lifecycleGeneration;
     const listKey = workspaceKeys.list(userId);
     const request = (async () => {
         await queryClient.cancelQueries({ queryKey: listKey, exact: true });
+        assertActiveLifecycle(generation);
         await queryClient.invalidateQueries({ queryKey: listKey, exact: true, refetchType: "none" });
+        assertActiveLifecycle(generation);
         const result = await queryClient.fetchQuery(workspacesQueryOptions(userId));
+        assertActiveLifecycle(generation);
         const workspace = result.workspaces.find((item) => item.id === organizationId);
         if (!workspace) throw new InvitationSynchronizationError();
-        return workspace;
+        return { workspace, generation };
     })();
     synchronizationRequests.set(key, request);
     void request.then(
