@@ -51,12 +51,16 @@ it('requires a non-negative baseRevision and a JSON snapshot', () => {
 ```ts
 export const CanvasRevisionSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })
 
+// TypeBox 默认键模式 `^.*$` 只用 `u` 标志编译，匹配不到 \n、\r、U+2028、U+2029，
+// 而不匹配的键会跳过值校验，所以显式给出覆盖全部字符的键模式。
+const JsonKeySchema = Type.String({ pattern: '^[\\s\\S]*$' })
+
 export const CanvasSnapshotSchema = Type.Cyclic({
   JsonValue: Type.Union([
     Type.Null(), Type.Boolean(), Type.Number(), Type.String(),
-    Type.Array(Type.Ref('JsonValue')), Type.Record(Type.String(), Type.Ref('JsonValue')),
+    Type.Array(Type.Ref('JsonValue')), Type.Record(JsonKeySchema, Type.Ref('JsonValue')),
   ]),
-  JsonObject: Type.Record(Type.String(), Type.Ref('JsonValue')),
+  JsonObject: Type.Record(JsonKeySchema, Type.Ref('JsonValue')),
 }, 'JsonObject')
 
 export const SaveCanvasRequestSchema = Type.Object({
@@ -82,6 +86,8 @@ export const CanvasListResponseSchema = Type.Object({ canvases: Type.Array(Canva
 Set the Fastify body limit for Canvas save routes to 10 MiB and reject larger snapshots with `413 canvas_snapshot_too_large`.
 
 Snapshot values avoid `Type.Unknown` so `bigint`, `undefined`, functions, `Symbol`, `NaN`, and `Infinity` are rejected instead of reaching JSONB. All request/response envelope objects are strict, so a summary carrying `snapshot` fails validation. Responses use the `{ canvas }` and `{ canvases }` envelopes; Task 2 and Task 3 consume that shape. `title` is optional in the save body while `snapshot` stays required, so Task 2 writes title and snapshot atomically under one `baseRevision` condition and keeps the existing rename UX. Because `revision` travels as a JSON number, it is bounded by `Number.MAX_SAFE_INTEGER` in both TypeBox and a database CHECK; Task 2 must map an attempted increment at that maximum to a deterministic error rather than wrapping or losing precision.
+
+Snapshot object keys use an explicit all-string pattern at both the root and nested levels, because TypeBox's default `^.*$` record key is compiled with only the `u` flag and therefore misses keys containing `\n`, `\r`, U+2028, or U+2029. An unmatched key skips value validation entirely, so without the explicit pattern a non-JSON value hidden under such a key would reach JSONB.
 
 - [ ] **Step 3: Create the Canvas table and indexes**
 
@@ -157,6 +163,8 @@ An optional `title` is written in the same conditional update, so renames stay r
 - [ ] **Step 3: Register Workspace-scoped routes**
 
 Implement list/create/get/save/delete routes under `/api/v1/workspaces/:workspaceId/canvases`. List returns `{ canvases }` summaries without `snapshot`; get and save return `{ canvas }` with the full snapshot. Delete is soft-delete and idempotent for the same authorized Workspace. Add wire-serialization tests confirming the strict envelopes survive Fastify response serialization.
+
+Snapshot keys are validated with an all-string pattern, so add an HTTP wire round-trip test sending snapshot keys that contain `\n`, `\r`, U+2028, and U+2029 through real request bodies on both the create and save paths, asserting that valid JSON values under those keys are stored and returned unchanged while `bigint`-like, `undefined`-like, and other non-JSON payloads are rejected. Cover both body-limit paths rather than only the service functions, since route-level validation runs through Fastify's AJV instance instead of the TypeBox `Value` checker used in Task 1. Also assert that unknown request fields are rejected with a 400 rather than silently removed, because AJV's default `removeAdditional` behavior would strip them and hide client bugs.
 
 - [ ] **Step 4: Hand verification to the user**
 

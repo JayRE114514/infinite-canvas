@@ -16,6 +16,16 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonObject = { [key: string]: JsonValue };
 
 /**
+ * TypeBox 的 Type.Record(Type.String(), ...) 默认键模式是 `^.*$`，校验时只用 `u` 标志编译正则，
+ * 因此 `.` 匹配不到 \n、\r、U+2028、U+2029；而 patternProperties 校验遇到不匹配的键会直接跳过值校验，
+ * 使换行等键名下的 bigint、undefined 等非法值被放过。这里显式传入覆盖全部字符的 pattern，
+ * 让根层与嵌套层的任意 JS/JSON 字符串键都进入值校验。
+ * FromStringKey 对带 pattern 的字符串键有专门覆盖分支，会把该 pattern 原样作为 patternProperties 键，
+ * 静态推导仍固定为 Record<string, JsonValue>，所以对外类型不变。
+ */
+const JsonKeySchema = Type.String({ pattern: "^[\\s\\S]*$" });
+
+/**
  * 快照整体存为 JSON 对象，节点与连线语义由前端负责，服务端只校验值是合法 JSON。
  * 用 Type.Cyclic 定义递归引用，避免 Type.Unknown 放过 bigint、undefined 等无法序列化的值。
  */
@@ -27,9 +37,9 @@ export const CanvasSnapshotSchema = Type.Cyclic(
             Type.Number(),
             Type.String(),
             Type.Array(Type.Ref("JsonValue")),
-            Type.Record(Type.String(), Type.Ref("JsonValue")),
+            Type.Record(JsonKeySchema, Type.Ref("JsonValue")),
         ]),
-        JsonObject: Type.Record(Type.String(), Type.Ref("JsonValue")),
+        JsonObject: Type.Record(JsonKeySchema, Type.Ref("JsonValue")),
     },
     "JsonObject",
 );

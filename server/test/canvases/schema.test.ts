@@ -67,6 +67,29 @@ describe("canvas snapshot json contract", () => {
         expect(Value.Check(CanvasSnapshotSchema, { nodes: [[{ deep: undefined }]] })).toBe(false);
         expect(Value.Check(CanvasSnapshotSchema, [])).toBe(false);
     });
+
+    // TypeBox 默认键模式 `^.*$` 只用 `u` 标志编译，`.` 匹配不到这些行分隔符，
+    // 而不匹配的键会跳过值校验，所以每个分隔符都要单独覆盖合法与非法两侧。
+    const lineBreakKeys = ["a\nb", "a\rb", "a\u2028b", "a\u2029b", "\n", "\u2028"];
+
+    it("validates values under keys containing line separators", () => {
+        for (const key of lineBreakKeys) {
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: "文本" })).toBe(true);
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: { nested: [1, null, true] } })).toBe(true);
+            expect(Value.Check(CanvasSnapshotSchema, { nodes: [{ [key]: null }] })).toBe(true);
+        }
+    });
+
+    it("rejects non-JSON values under keys containing line separators", () => {
+        for (const key of lineBreakKeys) {
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: 1n })).toBe(false);
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: undefined })).toBe(false);
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: () => 1 })).toBe(false);
+            expect(Value.Check(CanvasSnapshotSchema, { [key]: Symbol("s") })).toBe(false);
+            expect(Value.Check(CanvasSnapshotSchema, { nodes: [{ [key]: 1n }] })).toBe(false);
+            expect(Value.Check(CanvasSnapshotSchema, { outer: { [key]: { deep: undefined } } })).toBe(false);
+        }
+    });
 });
 
 describe("canvas create contract", () => {
