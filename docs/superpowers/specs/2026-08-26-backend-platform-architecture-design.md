@@ -178,7 +178,7 @@ SET snapshot_json = ?, revision = revision + 1
 WHERE id = ? AND workspace_id = ? AND revision = ?;
 ```
 
-`assets`：`id`、`workspace_id`、可空 `canvas_id`、`kind`、`object_key`、媒体元数据、`status`、`source`、创建用户和时间。
+`assets`：`id`、`workspace_id`、可空 `canvas_id`、`kind`、可空 `content_text`、可空 `object_key`、媒体元数据、`status`、`source`、创建用户和时间。文本素材直接保存文本；图片、视频、音频和文件只在数据库保存对象键与元数据。
 
 ### 6.3 钱包和账本
 
@@ -495,4 +495,3 @@ Wallet、双向账本、Hold、Billing Order、注册赠送、管理员调整/�
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
 - [pg-boss documentation](https://pgboss.io/)
 - [Better Auth Organization plugin](https://better-auth.com/docs/plugins/organization)
-

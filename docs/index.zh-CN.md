@@ -18,6 +18,7 @@
 - [本地开发](/zh-CN/docs/development/local-development)
 - [画布数据结构](/zh-CN/docs/development/canvas-data-structure)
 - [后端平台架构设计](./superpowers/specs/2026-08-26-backend-platform-architecture-design.md)
+- [后端平台实施路线图](./superpowers/plans/2026-08-26-backend-platform-roadmap.md)
 
 ## 商务合作
 
