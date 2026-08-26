@@ -46,6 +46,67 @@ describe("error envelope", () => {
         expect(response.json().error.code).toBe("invalid_request");
     });
 
+    it("rejects additional request properties instead of silently stripping them", async () => {
+        app = await buildApp({ logger: false });
+        app.post(
+            "/api/v1/test/strict",
+            {
+                schema: {
+                    body: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["name"],
+                        properties: { name: { type: "string" } },
+                    },
+                },
+            },
+            async (request) => ({ body: request.body }),
+        );
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/v1/test/strict",
+            payload: { name: "画布", unexpected: true },
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.code).toBe("invalid_request");
+    });
+
+    it("maps malformed JSON to 400 without exposing parser details", async () => {
+        app = await buildApp({ logger: false });
+        app.post("/api/v1/test/json", { schema: { body: { type: "object" } } }, async () => ({ status: "ok" }));
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/v1/test/json",
+            headers: { "content-type": "application/json" },
+            payload: '{"value":undefined}',
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.code).toBe("invalid_request");
+        expect(response.body).not.toContain("FST_ERR_CTP_INVALID_JSON_BODY");
+        expect(response.body).not.toContain("JSON body is invalid");
+    });
+
+    it("keeps the default body limit behind a stable 413 envelope", async () => {
+        app = await buildApp({ logger: false });
+        app.post("/api/v1/test/default-body-limit", async () => ({ status: "ok" }));
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/v1/test/default-body-limit",
+            headers: { "content-type": "application/json" },
+            payload: JSON.stringify({ content: "x".repeat(1024 * 1024) }),
+        });
+
+        expect(response.statusCode).toBe(413);
+        expect(response.json().error.code).toBe("request_body_too_large");
+        expect(response.body).not.toContain("FST_ERR_CTP_BODY_TOO_LARGE");
+        expect(response.body).not.toContain("Request body is too large");
+    });
+
     it("hides unknown error details behind 500 internal_error", async () => {
         app = await buildApp({ logger: false });
         app.get("/api/v1/test/unknown", async () => {

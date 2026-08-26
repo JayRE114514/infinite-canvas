@@ -9,6 +9,7 @@ import { createDatabase } from "./infrastructure/database/client.js";
 import { checkDatabaseReady, registerDatabase } from "./infrastructure/database/plugin.js";
 import type { DatabaseHandle } from "./infrastructure/database/types.js";
 import { createSmtpMailer, type Mailer } from "./infrastructure/email/mailer.js";
+import { registerCanvasRoutes } from "./modules/canvases/routes.js";
 import { createAuth } from "./modules/identity/auth.js";
 import { registerAuthRoutes } from "./modules/identity/routes.js";
 import { registerWorkspaceRoutes } from "./modules/workspaces/routes.js";
@@ -37,7 +38,10 @@ function resolveDatabase(options: BuildAppOptions): { database: DatabaseHandle; 
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
-    const app = Fastify({ logger: options.logger ?? true }).withTypeProvider<TypeBoxTypeProvider>();
+    const app = Fastify({
+        logger: options.logger ?? true,
+        ajv: { customOptions: { removeAdditional: false } },
+    }).withTypeProvider<TypeBoxTypeProvider>();
 
     const resolved = resolveDatabase(options);
 
@@ -62,6 +66,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
             app.decorate("auth", auth);
             await registerAuthRoutes(app, auth);
             registerWorkspaceRoutes(app, auth);
+            registerCanvasRoutes(app);
         }
 
         app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);

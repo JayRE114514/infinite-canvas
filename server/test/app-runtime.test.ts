@@ -48,6 +48,20 @@ describe("pure app construction", () => {
             await app.close();
         }
     });
+
+    it("keeps Fastify's default one MiB body limit globally", async () => {
+        const app = await buildApp({ logger: false });
+        app.post("/api/v1/test/body-limit", async (request) => ({ bodyLimit: request.routeOptions.bodyLimit }));
+
+        try {
+            const response = await app.inject({ method: "POST", url: "/api/v1/test/body-limit", payload: {} });
+
+            expect(response.statusCode).toBe(200);
+            expect(response.json()).toEqual({ bodyLimit: 1_048_576 });
+        } finally {
+            await app.close();
+        }
+    });
 });
 
 describe("config-driven app construction", () => {
