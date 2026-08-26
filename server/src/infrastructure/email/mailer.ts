@@ -5,7 +5,8 @@ import type { AppConfig } from "../../config.js";
 /** 身份模块只依赖这个接口，生产用 SMTP，测试注入内存实现。 */
 export type Mailer = {
     sendVerification(email: string, url: string): Promise<void>;
-    sendWorkspaceInvitation(email: string, invitationId: string): Promise<void>;
+    /** url 是完整的同源邀请接受地址，收件人可直接打开。 */
+    sendWorkspaceInvitation(email: string, url: string): Promise<void>;
 };
 
 /** 使用已校验的 SMTP 配置，不在此处读取环境变量。 */
@@ -23,7 +24,7 @@ export function createSmtpMailer(config: AppConfig): Mailer {
 
     return {
         sendVerification: (email, url) => send(email, "验证你的邮箱", `请点击以下链接完成邮箱验证：\n${url}`),
-        sendWorkspaceInvitation: (email, invitationId) =>
-            send(email, "工作区邀请", `你收到一个工作区邀请，邀请编号：${invitationId}`),
+        sendWorkspaceInvitation: (email, url) =>
+            send(email, "工作区邀请", `你收到一个工作区邀请，请点击以下链接接受：\n${url}`),
     };
 }

@@ -28,30 +28,31 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
         plugins: [
             organization({
                 requireEmailVerificationOnInvitation: true,
+                // Better Auth 不生成邀请链接，接受页地址由应用拼装（Task 5 负责该前端路由）。
                 sendInvitationEmail: async (data) => {
-                    await mailer.sendWorkspaceInvitation(data.email, data.invitation.id);
+                    const url = new URL(`/accept-invitation/${data.invitation.id}`, config.appOrigin);
+                    await mailer.sendWorkspaceInvitation(data.email, url.toString());
                 },
                 schema: {
                     organization: {
                         modelName: "workspaces",
+                        // 适配器按对象键取 Drizzle 列（drizzle-adapter getSchema/checkMissingFields），
+                        // 这里不能写 fieldName，否则会去找 workspace_type 这类不存在的键。
                         additionalFields: {
                             workspaceType: {
                                 type: "string",
-                                fieldName: "workspace_type",
                                 input: false,
                                 required: true,
                                 defaultValue: "team",
                             },
                             status: {
                                 type: "string",
-                                fieldName: "status",
                                 input: false,
                                 required: true,
                                 defaultValue: "active",
                             },
                             ownerUserId: {
                                 type: "string",
-                                fieldName: "owner_user_id",
                                 input: false,
                                 required: true,
                             },

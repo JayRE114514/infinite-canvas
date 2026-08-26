@@ -76,8 +76,7 @@ CREATE TABLE "workspaces" (
 	"metadata" text,
 	"workspace_type" text DEFAULT 'team' NOT NULL,
 	"status" text DEFAULT 'active' NOT NULL,
-	"owner_user_id" text NOT NULL,
-	CONSTRAINT "workspaces_slug_unique" UNIQUE("slug")
+	"owner_user_id" text NOT NULL
 );
 --> statement-breakpoint
 ALTER TABLE "accounts" ADD CONSTRAINT "accounts_userId_users_id_fk" FOREIGN KEY ("userId") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
@@ -87,7 +86,15 @@ ALTER TABLE "workspace_invitations" ADD CONSTRAINT "workspace_invitations_invite
 ALTER TABLE "workspace_members" ADD CONSTRAINT "workspace_members_organizationId_workspaces_id_fk" FOREIGN KEY ("organizationId") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "workspace_members" ADD CONSTRAINT "workspace_members_userId_users_id_fk" FOREIGN KEY ("userId") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "workspaces" ADD CONSTRAINT "workspaces_owner_user_id_users_id_fk" FOREIGN KEY ("owner_user_id") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX "workspace_invitations_workspace_email_idx" ON "workspace_invitations" USING btree ("organizationId","email");--> statement-breakpoint
+CREATE UNIQUE INDEX "accounts_issuer_accountId_uidx" ON "accounts" USING btree ("issuer","accountId");--> statement-breakpoint
+CREATE INDEX "accounts_userId_idx" ON "accounts" USING btree ("userId");--> statement-breakpoint
+CREATE INDEX "sessions_userId_idx" ON "sessions" USING btree ("userId");--> statement-breakpoint
+CREATE INDEX "verifications_identifier_idx" ON "verifications" USING btree ("identifier");--> statement-breakpoint
+CREATE INDEX "workspace_invitations_organizationId_idx" ON "workspace_invitations" USING btree ("organizationId");--> statement-breakpoint
+CREATE INDEX "workspace_invitations_email_idx" ON "workspace_invitations" USING btree ("email");--> statement-breakpoint
 CREATE UNIQUE INDEX "workspace_members_workspace_user_unique" ON "workspace_members" USING btree ("organizationId","userId");--> statement-breakpoint
+CREATE INDEX "workspace_members_organizationId_idx" ON "workspace_members" USING btree ("organizationId");--> statement-breakpoint
+CREATE INDEX "workspace_members_userId_idx" ON "workspace_members" USING btree ("userId");--> statement-breakpoint
+CREATE UNIQUE INDEX "workspaces_slug_uidx" ON "workspaces" USING btree ("slug");--> statement-breakpoint
 CREATE UNIQUE INDEX "workspaces_owner_personal_unique" ON "workspaces" USING btree ("owner_user_id") WHERE workspace_type = 'personal';--> statement-breakpoint
 CREATE INDEX "workspaces_owner_user_id_idx" ON "workspaces" USING btree ("owner_user_id");
