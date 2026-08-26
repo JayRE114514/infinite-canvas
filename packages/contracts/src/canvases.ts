@@ -9,40 +9,76 @@ export type CanvasId = Static<typeof CanvasIdSchema>;
 export const CanvasTitleSchema = Type.String({ minLength: 1, maxLength: 200 });
 export type CanvasTitle = Static<typeof CanvasTitleSchema>;
 
-/** 快照整体存为 JSON 对象，节点与连线语义由前端负责，服务端不做结构校验。 */
-export const CanvasSnapshotSchema = Type.Record(Type.String(), Type.Unknown());
-export type CanvasSnapshot = Static<typeof CanvasSnapshotSchema>;
+/** JSON 值递归定义：只允许 null、布尔、有限数字、字符串、数组和 JSON 对象，拒绝 bigint、undefined、函数、Symbol 和 NaN/Infinity。 */
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export const CanvasRevisionSchema = Type.Integer({ minimum: 0 });
+/** JSON 对象即快照顶层结构，键为字符串，值递归复用 JsonValue。 */
+export type JsonObject = { [key: string]: JsonValue };
+
+/**
+ * 快照整体存为 JSON 对象，节点与连线语义由前端负责，服务端只校验值是合法 JSON。
+ * 用 Type.Cyclic 定义递归引用，避免 Type.Unknown 放过 bigint、undefined 等无法序列化的值。
+ */
+export const CanvasSnapshotSchema = Type.Cyclic(
+    {
+        JsonValue: Type.Union([
+            Type.Null(),
+            Type.Boolean(),
+            Type.Number(),
+            Type.String(),
+            Type.Array(Type.Ref("JsonValue")),
+            Type.Record(Type.String(), Type.Ref("JsonValue")),
+        ]),
+        JsonObject: Type.Record(Type.String(), Type.Ref("JsonValue")),
+    },
+    "JsonObject",
+);
+export type CanvasSnapshot = JsonObject;
+
+/**
+ * revision 用 JSON 数字表示，因此上界收敛到 Number.MAX_SAFE_INTEGER，数据库 CHECK 用同一上界兜底。
+ * Task 2 需要在 revision 已达上界时按确定规则拒绝自增，不能静默回绕或溢出成不精确浮点。
+ */
+export const CanvasRevisionSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 export type CanvasRevision = Static<typeof CanvasRevisionSchema>;
 
-/** 列表只返回摘要，不含快照，避免一次请求传输全部画布内容。 */
-export const CanvasSummarySchema = Type.Object({
-    id: CanvasIdSchema,
-    workspaceId: WorkspaceIdSchema,
-    title: CanvasTitleSchema,
-    revision: CanvasRevisionSchema,
-    createdAt: Type.String({ format: "date-time" }),
-    updatedAt: Type.String({ format: "date-time" }),
-});
+/** 列表只返回摘要，不含快照，避免一次请求传输全部画布内容；strict 保证摘要里混入 snapshot 会被判定为非法。 */
+export const CanvasSummarySchema = Type.Object(
+    {
+        id: CanvasIdSchema,
+        workspaceId: WorkspaceIdSchema,
+        title: CanvasTitleSchema,
+        revision: CanvasRevisionSchema,
+        createdAt: Type.String({ format: "date-time" }),
+        updatedAt: Type.String({ format: "date-time" }),
+    },
+    { additionalProperties: false },
+);
 export type CanvasSummary = Static<typeof CanvasSummarySchema>;
 
-/** 单个画布响应写成扁平对象，避免 allOf 影响 Fastify 响应序列化。 */
-export const CanvasSchema = Type.Object({
-    id: CanvasIdSchema,
-    workspaceId: WorkspaceIdSchema,
-    title: CanvasTitleSchema,
-    snapshot: CanvasSnapshotSchema,
-    revision: CanvasRevisionSchema,
-    createdAt: Type.String({ format: "date-time" }),
-    updatedAt: Type.String({ format: "date-time" }),
-});
+/** 画布完整结构不用 allOf 组合摘要，避免 allOf 影响 Fastify 响应序列化；strict 保证多余字段被判定为非法。 */
+export const CanvasSchema = Type.Object(
+    {
+        id: CanvasIdSchema,
+        workspaceId: WorkspaceIdSchema,
+        title: CanvasTitleSchema,
+        snapshot: CanvasSnapshotSchema,
+        revision: CanvasRevisionSchema,
+        createdAt: Type.String({ format: "date-time" }),
+        updatedAt: Type.String({ format: "date-time" }),
+    },
+    { additionalProperties: false },
+);
 export type Canvas = Static<typeof CanvasSchema>;
 
-export const CanvasResponseSchema = Type.Object({ canvas: CanvasSchema });
+/** 响应统一用 { canvas } / { canvases } 信封，后续 Task 2、Task 3 按该结构收发。 */
+export const CanvasResponseSchema = Type.Object({ canvas: CanvasSchema }, { additionalProperties: false });
 export type CanvasResponse = Static<typeof CanvasResponseSchema>;
 
-export const CanvasListResponseSchema = Type.Object({ canvases: Type.Array(CanvasSummarySchema) });
+export const CanvasListResponseSchema = Type.Object(
+    { canvases: Type.Array(CanvasSummarySchema) },
+    { additionalProperties: false },
+);
 export type CanvasListResponse = Static<typeof CanvasListResponseSchema>;
 
 export const CreateCanvasBodySchema = Type.Object(
@@ -54,10 +90,14 @@ export const CreateCanvasBodySchema = Type.Object(
 );
 export type CreateCanvasBody = Static<typeof CreateCanvasBodySchema>;
 
-/** 保存必须带 baseRevision，服务端据此条件更新，冲突返回 409 revision_conflict。 */
+/**
+ * 保存必须带 baseRevision，服务端据此条件更新，冲突返回 409 revision_conflict。
+ * title 可选用于保留重命名能力，Task 2 在同一次 baseRevision 条件更新里原子写入标题和快照。
+ */
 export const SaveCanvasRequestSchema = Type.Object(
     {
         baseRevision: CanvasRevisionSchema,
+        title: Type.Optional(CanvasTitleSchema),
         snapshot: CanvasSnapshotSchema,
     },
     { additionalProperties: false },

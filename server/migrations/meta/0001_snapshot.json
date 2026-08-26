@@ -194,13 +194,13 @@
           "name": "created_by",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "updated_by": {
           "name": "updated_by",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "created_at": {
           "name": "created_at",
@@ -257,7 +257,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "restrict",
           "onUpdate": "no action"
         },
         "canvases_created_by_users_id_fk": {
@@ -270,7 +270,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "set null",
           "onUpdate": "no action"
         },
         "canvases_updated_by_users_id_fk": {
@@ -283,14 +283,23 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "set null",
           "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "canvases_revision_non_negative": {
+          "name": "canvases_revision_non_negative",
+          "value": "revision >= 0"
+        },
+        "canvases_revision_max_safe": {
+          "name": "canvases_revision_max_safe",
+          "value": "revision <= 9007199254740991"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.sessions": {
