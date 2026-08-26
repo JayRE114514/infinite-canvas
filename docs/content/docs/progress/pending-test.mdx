@@ -7,6 +7,14 @@ description: Implemented changes that still need manual verification
 
 The current release needs manual verification in these areas:
 
+- Frontend authentication and Workspace shell:
+  1. Register with email/password, open the verification email, and complete verification; confirm the registration page shows the sent-email state without exposing a server response.
+  2. Sign in, reload the page, and confirm the cookie restores the session while `/login` and `/register` redirect back to the requested safe same-origin product route.
+  3. Confirm the first verified Workspace load creates exactly one personal Workspace and selects it whenever the tab has no valid saved selection.
+  4. Create a team Workspace, invite a verified second account as `admin` or `member`, list the pending invitation, and cancel a pending invitation. Open a fresh invitation link while signed out and confirm login returns to the same `/accept-invitation/:invitationId` route; after signing in as the invited account, acceptance should refresh Workspaces, select the accepted team, and offer safe navigation into the product. Wrong-account, expired, missing, and already-handled links must show stable localized errors without leaking raw responses.
+  5. Open member management as an owner/admin, confirm members and roles, remove a non-owner member, and confirm a normal member cannot see management actions. A personal Workspace must explain that it is single-member and expose no invitation/removal controls.
+  6. Open two tabs, select different Workspaces, reload both, and confirm each tab preserves its own `sessionStorage` selection without changing the other tab.
+  7. Sign out and confirm user state, active Workspace, and Workspace query data are cleared; every current product route should redirect to `/login` with a safe `returnTo`, while login, registration, and invitation pages must not mount the Agent panel.
 - Backend Workspaces: listing a verified account should create exactly one personal Workspace even under concurrent requests; team create/update, member listing/removal, and invitation create/cancel should preserve Better Auth roles; every path Workspace must recheck PostgreSQL membership; personal member mutations, cross-Workspace access, member-level management, and owner removal must return their stable errors.
 - Canvas Agent generation-flow references: when a generation prompt contains only `@[node:...]` references already passed through `referenceNodeIds`, the existing text, image, video, audio, or group nodes should connect directly to the generated config node without creating a duplicate prompt text node; prompts containing ordinary prose should continue creating their own prompt text node.
 - Video frame capture: right-clicking a video node with content should show Capture first frame, Capture last frame, and Capture current frame. Each action should create and select a proportional image node to the right, connect the video to the image, use the player's visible position for the current frame, and leave the original playback position unchanged.
@@ -40,5 +48,3 @@ The current release needs manual verification in these areas:
 - Workbench history image cleanup: after generating content in the image or video workbench, deleting an asset, canvas image node, canvas content, or canvas project must not remove thumbnails, results, or references from generation history; deleting a generation record should still remove its dedicated local files.
 - Settings import/export and WebDAV-related configuration.
 - Local storage settings: the Settings page should provide a Local storage tab that reads only the `infinite-canvas` database and shows IndexedDB usage, total site usage, browser quota, quota percentage, and per-object-store record counts and content size; refreshing after local data changes should update the figures without blocking the rest of the page.
-
-The Chinese version contains the complete item-by-item acceptance checklist.
