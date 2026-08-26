@@ -1,17 +1,33 @@
 import cors from "@fastify/cors";
 import type { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
-import { HealthResponseSchema } from "@infinite-canvas/contracts";
+import { HealthResponseSchema, UnavailableResponseSchema } from "@infinite-canvas/contracts";
 import Fastify, { type FastifyServerOptions } from "fastify";
 
+import type { AppConfig } from "./config.js";
 import { registerErrorHandler } from "./error-handler.js";
+import { createDatabase } from "./infrastructure/database/client.js";
+import { checkDatabaseReady, registerDatabase } from "./infrastructure/database/plugin.js";
+import type { DatabaseHandle } from "./infrastructure/database/types.js";
 
 const DEV_WEB_ORIGIN = "http://localhost:3000";
 
-export type BuildAppOptions = Pick<FastifyServerOptions, "logger">;
+export type BuildAppOptions = Pick<FastifyServerOptions, "logger"> & {
+    /** 传入则挂载 appConfig；省略时保持纯应用构造，不读取环境变量。 */
+    config?: AppConfig;
+    /** 由测试注入的连接句柄，生命周期归调用方，应用关闭时不释放。 */
+    database?: DatabaseHandle;
+};
 
 /** 仅 development 放行 Vite origin，其余环境（含未设置）一律禁用跨域。 */
 function resolveCorsOrigin(): string[] | false {
     return process.env.NODE_ENV === "development" ? [DEV_WEB_ORIGIN] : false;
+}
+
+/** 注入优先；仅有 config 时由应用自建并持有连接池；两者都没有则完全不连接数据库。 */
+function resolveDatabase(options: BuildAppOptions): { database: DatabaseHandle; ownsPool: boolean } | undefined {
+    if (options.database) return { database: options.database, ownsPool: false };
+    if (options.config) return { database: createDatabase(options.config.database), ownsPool: true };
+    return undefined;
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
@@ -21,7 +37,23 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
     registerErrorHandler(app);
 
+    if (options.config) app.decorate("appConfig", options.config);
+
+    const resolved = resolveDatabase(options);
+    if (resolved) registerDatabase(app, resolved);
+
     app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);
+
+    if (resolved) {
+        app.get(
+            "/api/v1/health/ready",
+            { schema: { response: { 200: HealthResponseSchema, 503: UnavailableResponseSchema } } },
+            async (_request, reply) => {
+                if (await checkDatabaseReady(resolved.database)) return { status: "ok" } as const;
+                return reply.status(503).send({ status: "unavailable" } as const);
+            },
+        );
+    }
 
     return app;
 }
