@@ -69,3 +69,46 @@ describe("error envelope", () => {
         expect(response.json().error.code).toBe("not_found");
     });
 });
+
+describe("unknown error logging", () => {
+    let app: Awaited<ReturnType<typeof buildApp>> | undefined;
+
+    afterEach(async () => {
+        await app?.close();
+        app = undefined;
+    });
+
+    it("logs only the request id and safe metadata", async () => {
+        const lines: string[] = [];
+        app = await buildApp({
+            logger: {
+                level: "error",
+                stream: {
+                    write(line: string) {
+                        lines.push(line);
+                    },
+                },
+            },
+        });
+        app.get("/api/v1/test/logged", async () => {
+            throw new Error("connect ECONNREFUSED 127.0.0.1:5432 password=secret");
+        });
+
+        await app.inject({
+            method: "GET",
+            url: "/api/v1/test/logged?token=leaked",
+            headers: { authorization: "Bearer leaked-token", cookie: "session=leaked" },
+        });
+
+        const logged = lines.join("\n");
+
+        expect(logged).toContain("unhandled request error");
+        expect(logged).not.toContain("password=secret");
+        expect(logged).not.toContain("ECONNREFUSED");
+        expect(logged).not.toContain("leaked-token");
+        expect(logged).not.toContain("session=leaked");
+        expect(logged).not.toContain("token=leaked");
+        expect(logged).not.toContain("at Object");
+        expect(logged).not.toContain("stack");
+    });
+});

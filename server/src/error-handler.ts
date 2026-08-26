@@ -22,7 +22,7 @@ export function registerErrorHandler(app: FastifyInstance): void {
             return;
         }
 
-        request.log.error({ err: error }, "unhandled request error");
+        request.log.error({ requestId: request.id, kind: "unhandled_error" }, "unhandled request error");
         reply.status(500).send(envelope("internal_error", "服务内部错误，请稍后重试", true, request.id));
     });
 }
