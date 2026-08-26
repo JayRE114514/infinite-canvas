@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Button, Spin } from "antd";
-import { Navigate, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { authClient, createLoginPath } from "@/lib/auth-client";
@@ -17,6 +17,11 @@ type ShellStateProps = {
     actionLabel?: string;
     onAction?: () => void;
 };
+
+async function clearWorkspaceQueryMemory(queryClient: QueryClient) {
+    await queryClient.cancelQueries({ queryKey: workspaceKeys.all }).catch(() => undefined);
+    queryClient.removeQueries({ queryKey: workspaceKeys.all });
+}
 
 function ShellState({ title, description, busy = false, actionLabel, onAction }: ShellStateProps) {
     return (
@@ -42,6 +47,7 @@ export function AuthenticatedShell() {
     const clearWorkspace = useWorkspaceStore((state) => state.clearWorkspace);
     const setUser = useUserStore((state) => state.setUser);
     const clearUser = useUserStore((state) => state.clearUser);
+    const anonymousSessionHandled = useRef(false);
     const staleSessionHandled = useRef(false);
     const userId = session?.user.id ?? "";
     const userName = session?.user.name ?? "";
@@ -54,17 +60,24 @@ export function AuthenticatedShell() {
     const selectedWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
     const fallbackWorkspace = workspaces.find((workspace) => workspace.type === "personal") ?? workspaces[0];
     const resolvedWorkspaceId = selectedWorkspace?.id ?? fallbackWorkspace?.id ?? "";
+    const hasSessionError = Boolean(sessionError);
+    const anonymousSession = !sessionPending && !userId && !hasSessionError;
     const staleSession = workspaceQuery.error instanceof PlatformApiError && workspaceQuery.error.status === 401;
 
     useEffect(() => {
-        if (sessionPending) return;
-        if (!userId) {
-            clearUser();
-            clearWorkspace();
-            return;
-        }
+        if (!userId) return;
         setUser({ id: userId, name: userName, email: userEmail, image: userImage });
-    }, [clearUser, clearWorkspace, sessionPending, setUser, userEmail, userId, userImage, userName]);
+    }, [setUser, userEmail, userId, userImage, userName]);
+
+    useEffect(() => {
+        if (!anonymousSession || anonymousSessionHandled.current) return;
+        anonymousSessionHandled.current = true;
+        clearUser();
+        clearWorkspace();
+        void clearWorkspaceQueryMemory(queryClient).then(() => {
+            navigate(loginPath, { replace: true });
+        });
+    }, [anonymousSession, clearUser, clearWorkspace, loginPath, navigate, queryClient]);
 
     useEffect(() => {
         if (!workspaceQuery.isSuccess || activeWorkspaceId === resolvedWorkspaceId) return;
@@ -77,15 +90,16 @@ export function AuthenticatedShell() {
         staleSessionHandled.current = true;
         clearUser();
         clearWorkspace();
-        queryClient.removeQueries({ queryKey: workspaceKeys.all });
-        void authClient.signOut({ fetchOptions: { credentials: "include" } }).catch(() => undefined).finally(() => navigate(loginPath, { replace: true }));
+        void clearWorkspaceQueryMemory(queryClient).then(() => {
+            return authClient.signOut({ fetchOptions: { credentials: "include" } }).catch(() => undefined);
+        }).finally(() => navigate(loginPath, { replace: true }));
     }, [clearUser, clearWorkspace, loginPath, navigate, queryClient, staleSession]);
 
     if (sessionPending) return <ShellState busy title={t("auth.checkingSession")} />;
-    if (!session && sessionError) {
+    if (!session && hasSessionError) {
         return <ShellState title={t("auth.sessionLoadFailed")} description={t("auth.sessionLoadFailedDescription")} actionLabel={t("common.retry")} onAction={() => void refetchSession()} />;
     }
-    if (!session) return <Navigate to={loginPath} replace />;
+    if (!session) return <ShellState busy title={t("auth.sessionExpiredRedirect")} />;
     if (staleSession) return <ShellState busy title={t("auth.sessionExpiredRedirect")} />;
     if (workspaceQuery.isPending) return <ShellState busy title={t("workspace.loading")} />;
     if (workspaceQuery.error) {
