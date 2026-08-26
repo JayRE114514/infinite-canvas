@@ -42,6 +42,10 @@ function canvasNotFound(): AppError {
     return new AppError("canvas_not_found", 404, "画布不存在");
 }
 
+function revisionConflict(): AppError {
+    return new AppError("revision_conflict", 409, "画布已在其他位置更新");
+}
+
 async function findActiveCanvas(db: AppDatabase, access: WorkspaceAccess, canvasId: string): Promise<CanvasRow> {
     const row = await db.query.canvases.findFirst({
         where: and(
@@ -101,7 +105,9 @@ export async function saveCanvas(
     input: SaveCanvasRequest,
 ): Promise<Canvas> {
     if (input.baseRevision === Number.MAX_SAFE_INTEGER) {
-        await findActiveCanvas(db, access, canvasId);
+        // 上限只能由“已存到上限的活跃画布”触发；base 是上限但存储不是，仍属过期写入。
+        const current = await findActiveCanvas(db, access, canvasId);
+        if (current.revision !== Number.MAX_SAFE_INTEGER) throw revisionConflict();
         throw new AppError("canvas_revision_limit_reached", 409, "画布版本已达到上限");
     }
 
@@ -127,7 +133,7 @@ export async function saveCanvas(
     if (saved) return toCanvas(saved);
 
     await findActiveCanvas(db, access, canvasId);
-    throw new AppError("revision_conflict", 409, "画布已在其他位置更新");
+    throw revisionConflict();
 }
 
 export async function softDeleteCanvas(db: AppDatabase, access: WorkspaceAccess, canvasId: string): Promise<void> {
