@@ -1,0 +1,13 @@
+{
+    "name": "infinite-canvas-platform",
+    "version": "0.0.0",
+    "private": true,
+    "packageManager": "bun@1.3.13",
+    "workspaces": ["web", "server", "packages/*"],
+    "scripts": {
+        "dev:web": "bun --cwd web dev",
+        "dev:api": "bun --cwd server dev:api",
+        "dev:worker": "bun --cwd server dev:worker",
+        "test:server": "bun --cwd server test"
+    }
+}
