@@ -1,2 +1,2 @@
-// Task 2 只建立连接基础设施，业务表在后续任务按模块补充。
-export {};
+// 应用表按模块定义，这里统一导出给 Drizzle 客户端与迁移生成器。
+export * from "../../modules/identity/auth-schema.js";

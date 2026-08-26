@@ -6,6 +6,6 @@ if (!url) throw new Error("Missing required environment variable: DATABASE_URL")
 export default defineConfig({
     dialect: "postgresql",
     schema: "./src/infrastructure/database/schema.ts",
-    out: "./drizzle",
+    out: "./migrations",
     dbCredentials: { url },
 });

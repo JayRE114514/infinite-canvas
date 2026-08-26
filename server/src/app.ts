@@ -8,6 +8,10 @@ import { registerErrorHandler } from "./error-handler.js";
 import { createDatabase } from "./infrastructure/database/client.js";
 import { checkDatabaseReady, registerDatabase } from "./infrastructure/database/plugin.js";
 import type { DatabaseHandle } from "./infrastructure/database/types.js";
+import { createSmtpMailer, type Mailer } from "./infrastructure/email/mailer.js";
+import { createAuth } from "./modules/identity/auth.js";
+import { registerAuthRoutes } from "./modules/identity/routes.js";
+import { requireSession } from "./modules/identity/session.js";
 
 const DEV_WEB_ORIGIN = "http://localhost:3000";
 
@@ -16,6 +20,8 @@ export type BuildAppOptions = Pick<FastifyServerOptions, "logger"> & {
     config?: AppConfig;
     /** 由测试注入的连接句柄，生命周期归调用方，应用关闭时不释放。 */
     database?: DatabaseHandle;
+    /** 由测试注入的内存邮件发送器；省略且有 config 时使用 SMTP 实现。 */
+    mailer?: Mailer;
 };
 
 /** 仅 development 放行 Vite origin，其余环境（含未设置）一律禁用跨域。 */
@@ -44,6 +50,20 @@ export async function buildApp(options: BuildAppOptions = {}) {
         if (options.config) app.decorate("appConfig", options.config);
 
         if (resolved) registerDatabase(app, resolved);
+
+        // 认证需要配置与数据库同时存在；纯应用构造保持无数据库、无认证。
+        if (options.config && resolved) {
+            const auth = createAuth({
+                db: resolved.database.db,
+                config: options.config,
+                mailer: options.mailer ?? createSmtpMailer(options.config),
+            });
+
+            app.decorate("auth", auth);
+            await registerAuthRoutes(app, auth);
+
+            app.get("/api/v1/session-probe", async (request) => await requireSession(request));
+        }
 
         app.get("/api/v1/health/live", { schema: { response: { 200: HealthResponseSchema } } }, async () => ({ status: "ok" }) as const);
 
