@@ -41,7 +41,7 @@ import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/a
 import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
-import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -69,6 +69,7 @@ import {
 import { getNodeDefinition, isBuiltinNodeType as isBuiltinType, useNodeRegistryVersion } from "@/lib/canvas/node-registry";
 import { registerBuiltinNodes } from "@/components/canvas/nodes/builtin-nodes";
 import { CanvasPluginManagerModal } from "@/components/canvas/canvas-plugin-manager-modal";
+import { CanvasConflictBar } from "@/components/canvas/canvas-conflict-bar";
 import { CanvasRefreshShell } from "@/components/canvas/canvas-refresh-shell";
 import { CanvasTopBar } from "@/components/canvas/canvas-top-bar";
 import { ConnectionCreateMenu, NodeCreateMenu, type PendingConnectionCreate } from "@/components/canvas/canvas-create-menus";
@@ -189,13 +190,16 @@ function InfiniteCanvasPage() {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const cleanupAssetImages = useAssetStore((state) => state.cleanupImages);
-    const hydrated = useCanvasStore((state) => state.hydrated);
     const createProject = useCanvasStore((state) => state.createProject);
     const openProject = useCanvasStore((state) => state.openProject);
     const updateProject = useCanvasStore((state) => state.updateProject);
+    const flushProject = useCanvasStore((state) => state.flushProject);
     const renameProject = useCanvasStore((state) => state.renameProject);
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
-    const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
+    const scope = useCanvasStore((state) => state.scope);
+    const loadProjectsForExport = useCanvasStore((state) => state.loadProjectsForExport);
+    const resolveConflictWithServer = useCanvasStore((state) => state.resolveConflictWithServer);
+    const currentProject = useCanvasStore((state) => (state.active?.project.id === projectId ? state.active.project : undefined));
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [connections, setConnections] = useState<CanvasConnection[]>([]);
@@ -267,9 +271,13 @@ function InfiniteCanvasPage() {
         [activeChatId, backgroundMode, chatSessions, showImageInfo],
     );
 
+    /**
+     * retained 是仍然要保留引用的数据，released 是本次明确不再需要的节点/会话。
+     * 只有出现在 released 且不在任何保留集合（当前画布、撤销历史、资产库）里的媒体键才会被删除。
+     */
     const cleanupCanvasFiles = useCallback(
-        (extra?: unknown) => {
-            cleanupAssetImages({ extra, history: historyRef.current, lastHistory: lastHistoryRef.current });
+        (retained: unknown, released: unknown) => {
+            cleanupAssetImages({ extra: retained, history: historyRef.current, lastHistory: lastHistoryRef.current }, released);
         },
         [cleanupAssetImages],
     );
@@ -329,43 +337,74 @@ function InfiniteCanvasPage() {
         [modal, stopGenerationByRunningId, t],
     );
 
-    useEffect(() => {
-        if (!hydrated) return;
-        setProjectLoaded(false);
-        const project = openProject(projectId);
-        if (!project) {
-            navigate("/canvas", { replace: true });
-            return;
+    /**
+     * 把服务端权威快照渲染进画布：补水图片与助手消息，并重置撤销历史，避免跨画布/跨版本的历史串味。
+     * isCancelled 用于在切换画布或切换作用域后丢弃迟到的结果。
+     */
+    const applyProjectToCanvas = useCallback(async (project: CanvasProject, isCancelled: () => boolean) => {
+        const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
+        const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
+        if (isCancelled()) return;
+        historyPausedRef.current = true;
+        setNodes(restoredNodes);
+        setConnections(project.connections);
+        setChatSessions(restoredSessions);
+        setActiveChatId(project.activeChatId || null);
+        setBackgroundMode(project.backgroundMode);
+        setShowImageInfo(project.showImageInfo || false);
+        setViewport(project.viewport);
+        historyRef.current = { past: [], future: [] };
+        if (historyCommitTimerRef.current) {
+            clearTimeout(historyCommitTimerRef.current);
+            historyCommitTimerRef.current = null;
         }
+        lastHistoryRef.current = {
+            nodes: restoredNodes,
+            connections: project.connections,
+            chatSessions: restoredSessions,
+            activeChatId: project.activeChatId || null,
+            backgroundMode: project.backgroundMode,
+            showImageInfo: project.showImageInfo || false,
+        };
+        setHistoryState({ canUndo: false, canRedo: false });
+        historyPausedRef.current = false;
+        setProjectLoaded(true);
+    }, []);
 
+    useEffect(() => {
+        if (!scope) return;
+        let cancelled = false;
+        const isCancelled = () => cancelled;
+        setProjectLoaded(false);
+
+        /** 打开画布现在是异步的：先取服务端权威快照（必要时叠加同 revision 的本地草稿），再做图片/助手补水。 */
         const restore = async () => {
-            const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
-            const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
-            setNodes(restoredNodes);
-            setConnections(project.connections);
-            setChatSessions(restoredSessions);
-            setActiveChatId(project.activeChatId || null);
-            setBackgroundMode(project.backgroundMode);
-            setShowImageInfo(project.showImageInfo || false);
-            setViewport(project.viewport);
-            historyRef.current = { past: [], future: [] };
-            if (historyCommitTimerRef.current) {
-                clearTimeout(historyCommitTimerRef.current);
-                historyCommitTimerRef.current = null;
+            let project: CanvasProject | null = null;
+            try {
+                project = await openProject(projectId);
+            } catch {
+                project = null;
             }
-            lastHistoryRef.current = {
-                nodes: restoredNodes,
-                connections: project.connections,
-                chatSessions: restoredSessions,
-                activeChatId: project.activeChatId || null,
-                backgroundMode: project.backgroundMode,
-                showImageInfo: project.showImageInfo || false,
-            };
-            setHistoryState({ canUndo: false, canRedo: false });
-            setProjectLoaded(true);
+            /** 期间用户可能已切换工作区或跳到别的画布，此时不能把上一个作用域的内容渲染出来。 */
+            if (cancelled) return;
+            if (!project) {
+                navigate("/canvas", { replace: true });
+                return;
+            }
+            await applyProjectToCanvas(project, isCancelled);
         };
         void restore();
-    }, [hydrated, navigate, openProject, projectId]);
+        return () => {
+            cancelled = true;
+        };
+    }, [applyProjectToCanvas, navigate, openProject, projectId, scope]);
+
+    /** 冲突后用户显式选择「重新载入服务端版本」：丢弃内存中的本地编辑，改用服务端最新快照重开。 */
+    const reloadServerCopy = useCallback(async () => {
+        const project = await resolveConflictWithServer(projectId);
+        if (!project) throw new Error("canvas_reload_failed");
+        await applyProjectToCanvas(project, () => false);
+    }, [applyProjectToCanvas, projectId, resolveConflictWithServer]);
 
     useEffect(() => {
         if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;
@@ -414,6 +453,17 @@ function InfiniteCanvasPage() {
     useEffect(() => {
         if (!dialogNodeId) setNodeImageSettingsOpen(false);
     }, [dialogNodeId]);
+
+    /** 离开画布或页面隐藏时把仍在防抖窗口内的编辑立刻提交，避免最后一次改动丢失。 */
+    useEffect(() => {
+        if (!projectLoaded) return;
+        const flush = () => void flushProject(projectId);
+        window.addEventListener("pagehide", flush);
+        return () => {
+            window.removeEventListener("pagehide", flush);
+            flush();
+        };
+    }, [flushProject, projectId, projectLoaded]);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -751,7 +801,7 @@ function InfiniteCanvasPage() {
             setReferencePickerNodeId((current) => (current && allIds.has(current) ? null : current));
             setExpandedBatchNodeIds((current) => new Set([...current].filter((nodeId) => !allIds.has(nodeId))));
             setContextMenu((current) => (current?.type === "node" && allIds.has(current.nodeId) ? null : current));
-            cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions });
+            cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions }, { nodes: nodesRef.current.filter((node) => allIds.has(node.id)) });
         },
         [chatSessions, cleanupCanvasFiles, projectId],
     );
@@ -811,6 +861,7 @@ function InfiniteCanvasPage() {
     }, [cancelPendingConnectionCreate]);
 
     const clearCanvas = useCallback(() => {
+        const released = nodesRef.current;
         setNodes([]);
         setConnections([]);
         setInfoNodeId(null);
@@ -821,7 +872,7 @@ function InfiniteCanvasPage() {
         setRunningNodeId(null);
         deselectCanvas();
         setClearConfirmOpen(false);
-        cleanupCanvasFiles({ projectId, nodes: [], chatSessions: [] });
+        cleanupCanvasFiles({ projectId, nodes: [], chatSessions: [] }, { nodes: released });
     }, [cleanupCanvasFiles, deselectCanvas, projectId]);
 
     const duplicateNode = useCallback((nodeId: string) => {
@@ -1010,19 +1061,26 @@ function InfiniteCanvasPage() {
         applyHistory(next);
     }, [applyHistory]);
 
-    const createAndOpenProject = useCallback(() => {
-        const id = createProject(t("canvas.defaultTitle", { count: useCanvasStore.getState().projects.length + 1 }));
-        navigate(`/canvas/${id}`);
-    }, [createProject, navigate, t]);
+    const createAndOpenProject = useCallback(async () => {
+        try {
+            const id = await createProject(t("canvas.defaultTitle", { count: useCanvasStore.getState().summaries.length + 1 }));
+            navigate(`/canvas/${id}`);
+        } catch {
+            message.error(t("canvas.createFailed"));
+        }
+    }, [createProject, message, navigate, t]);
 
-    const deleteCurrentProject = useCallback(() => {
-        deleteProjects([projectId]);
-        cleanupAssetImages();
-        navigate("/canvas");
-    }, [cleanupAssetImages, deleteProjects, navigate, projectId]);
+    const deleteCurrentProject = useCallback(async () => {
+        try {
+            await deleteProjects([projectId]);
+            navigate("/canvas");
+        } catch {
+            message.error(t("canvas.deleteFailed"));
+        }
+    }, [deleteProjects, message, navigate, projectId, t]);
 
     const exportCurrentProject = useCallback(async () => {
-        const project = useCanvasStore.getState().projects.find((item) => item.id === projectId);
+        const [project] = await loadProjectsForExport([projectId]);
         if (!project) return message.error(t("canvas.projectPage.notFound"));
         const hide = message.loading(t("canvas.projectPage.exporting"), 0);
         try {
@@ -1034,7 +1092,7 @@ function InfiniteCanvasPage() {
         } finally {
             hide();
         }
-    }, [message, projectId, t]);
+    }, [loadProjectsForExport, message, projectId, t]);
 
     const handleCanvasMouseDown = useCallback(
         (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -2098,9 +2156,9 @@ function InfiniteCanvasPage() {
 
     const finishTitleEditing = useCallback(() => {
         const nextTitle = titleDraft.trim();
-        if (nextTitle) renameProject(projectId, nextTitle);
+        if (nextTitle) void renameProject(projectId, nextTitle).catch(() => message.error(t("canvas.renameFailed")));
         setTitleEditing(false);
-    }, [projectId, renameProject, titleDraft]);
+    }, [message, projectId, renameProject, t, titleDraft]);
 
     const preventCanvasContextMenu = useCallback((event: ReactMouseEvent) => {
         if ((event.target as HTMLElement).closest("[data-node-id]")) return;
@@ -2927,8 +2985,8 @@ function InfiniteCanvasPage() {
                     canRedo={historyState.canRedo}
                     onHome={() => navigate("/")}
                     onProjects={() => navigate("/canvas")}
-                    onCreateProject={createAndOpenProject}
-                    onDeleteProject={deleteCurrentProject}
+                    onCreateProject={() => void createAndOpenProject()}
+                    onDeleteProject={() => void deleteCurrentProject()}
                     onExportProject={exportCurrentProject}
                     onImportImage={() => handleUploadRequest()}
                     onOpenPlugins={() => setPluginManagerOpen(true)}
@@ -2938,6 +2996,8 @@ function InfiniteCanvasPage() {
                     compactAgentStatus={{ connected: localAgentConnected, enabled: localAgentEnabled, activity: localAgentActivity }}
                     onToggleAgent={toggleAgentPanel}
                 />
+
+                <CanvasConflictBar projectId={projectId} onReloadServerCopy={reloadServerCopy} />
 
                 <InfiniteCanvas
                     containerRef={containerRef}

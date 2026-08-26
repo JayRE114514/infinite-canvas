@@ -8,6 +8,7 @@ import { authClient, createLoginPath } from "@/lib/auth-client";
 import { clearWorkspaceSessionMemory } from "@/services/api/invitation-acceptance";
 import { PlatformApiError, platformErrorTranslationKey } from "@/services/api/platform-client";
 import { workspaceKeys, workspacesQueryOptions } from "@/services/api/workspaces";
+import { useCanvasScopeSync } from "@/hooks/use-canvas-scope-sync";
 import { useUserStore } from "@/stores/use-user-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
 
@@ -59,6 +60,8 @@ export function AuthenticatedShell() {
     const hasSessionError = Boolean(sessionError);
     const anonymousSession = !sessionPending && !userId && !hasSessionError;
     const staleSession = workspaceQuery.error instanceof PlatformApiError && workspaceQuery.error.status === 401;
+
+    useCanvasScopeSync();
 
     useEffect(() => {
         if (!userId) return;

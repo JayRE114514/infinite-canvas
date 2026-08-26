@@ -3,8 +3,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
-import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
+import { collectImageStorageKeys, deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { collectMediaStorageKeys, deleteStoredMedia, resolveMediaUrl } from "@/services/file-storage";
 
 export type AssetKind = "text" | "image" | "video";
 export type TextAsset = AssetBase<"text"> & { data: { content: string } };
@@ -32,7 +32,8 @@ type AssetStore = {
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
     removeAsset: (id: string) => void;
     replaceAssets: (assets: Asset[]) => void;
-    cleanupImages: (extra?: unknown) => void;
+    /** releaseData 只清理「明确不再被引用」的媒体键，绝不按全库扫描删除未出现的键。 */
+    cleanupImages: (extra?: unknown, releaseData?: unknown) => void;
 };
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
@@ -81,15 +82,28 @@ export const useAssetStore = create<AssetStore>()(
             removeAsset: (id) =>
                 set((state) => {
                     const assets = state.assets.filter((asset) => asset.id !== id);
-                    get().cleanupImages({ assets });
+                    const removed = state.assets.find((asset) => asset.id === id);
+                    get().cleanupImages({ assets }, removed ? { removed } : undefined);
                     return { assets };
                 }),
             replaceAssets: (assets) => set({ assets }),
-            cleanupImages: (extra) => {
+            /**
+             * 画布已经改为服务端权威存储，前端无法枚举全部画布内容，
+             * 因此不能再用「本库里没被引用的键就删掉」的方式回收媒体，否则会删掉其他画布仍在引用的图片和视频。
+             * 这里只删除 releaseData 中明确要释放、且当前资产库与当前画布都不再引用的键。
+             */
+            cleanupImages: (extra, releaseData) => {
+                if (!releaseData) return;
                 window.setTimeout(async () => {
                     const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                    await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                    const activeProject = useCanvasStore.getState().active?.project;
+                    const retained = { assets: get().assets, extra, activeProject };
+                    const retainedImages = collectImageStorageKeys(retained);
+                    const retainedMedia = collectMediaStorageKeys(retained);
+                    const releaseImages = [...collectImageStorageKeys(releaseData)].filter((key) => !retainedImages.has(key));
+                    const releaseMedia = [...collectMediaStorageKeys(releaseData)].filter((key) => !retainedMedia.has(key));
+                    await deleteStoredImages(releaseImages);
+                    await deleteStoredMedia(releaseMedia);
                 }, 0);
             },
         }),
