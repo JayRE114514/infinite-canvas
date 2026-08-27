@@ -132,7 +132,9 @@ function compactPrompt(prompt: unknown) {
 async function listCanvasProjects(input: SiteToolInput) {
     const store = useCanvasStore.getState();
     if (!store.scope) throw new Error(siteText("canvasLoading"));
-    if (store.listStatus !== "ready") await store.refreshList();
+    /** 已经有一次刷新在飞就等它，不要再发一次重复请求。 */
+    if (store.listStatus === "loading") await waitForCanvasList();
+    else if (store.listStatus !== "ready") await store.refreshList();
     const { summaries, listStatus, listError } = useCanvasStore.getState();
     if (listStatus !== "ready") throw new Error(listError || siteText("canvasLoading"));
     const keyword = String(input.keyword || "").trim().toLowerCase();
@@ -148,6 +150,16 @@ async function listCanvasProjects(input: SiteToolInput) {
         connectionCount: summary.connectionCount ?? undefined,
     }));
     return { total: filtered.length, page, pageSize, items, hint: siteText("canvasHint") };
+}
+
+function waitForCanvasList() {
+    return new Promise<void>((resolve) => {
+        const unsubscribe = useCanvasStore.subscribe((state) => {
+            if (state.listStatus === "loading") return;
+            unsubscribe();
+            resolve();
+        });
+    });
 }
 
 function getImageConfig() {

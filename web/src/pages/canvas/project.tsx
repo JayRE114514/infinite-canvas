@@ -201,6 +201,8 @@ function InfiniteCanvasPage() {
      */
     const syncedContentRef = useRef<CanvasHistoryEntry | null>(null);
     const syncedViewportRef = useRef<ViewportTransform | null>(null);
+    /** 冲突重载的运行序号：切画布、切作用域或再次点重载都会让上一次重载作废。 */
+    const reloadRunRef = useRef(0);
     const didInitialCenterRef = useRef(false);
     const rafRef = useRef<number | null>(null);
     const nodeDraggingRef = useRef(false);
@@ -232,7 +234,8 @@ function InfiniteCanvasPage() {
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
     const scope = useCanvasStore((state) => state.scope);
     const loadProjectsForExport = useCanvasStore((state) => state.loadProjectsForExport);
-    const resolveConflictWithServer = useCanvasStore((state) => state.resolveConflictWithServer);
+    const fetchServerCopy = useCanvasStore((state) => state.fetchServerCopy);
+    const commitServerCopy = useCanvasStore((state) => state.commitServerCopy);
     const currentProject = useCanvasStore((state) =>
         state.active?.project.id === projectId && state.scope && state.active.scope.userId === state.scope.userId && state.active.scope.workspaceId === state.scope.workspaceId ? state.active.project : undefined,
     );
@@ -376,15 +379,18 @@ function InfiniteCanvasPage() {
     /**
      * 把服务端权威快照渲染进画布：补水图片与助手消息，并重置撤销历史，避免跨画布/跨版本的历史串味。
      * isCancelled 用于在切换画布或切换作用域后丢弃迟到的结果。
+     * commit 在补水完成之后、写入 React 状态之前执行：store 的 lineage 与画布内容必须在同一次提交里换掉，
+     * 否则中间那段窗口里画布还显示旧内容却已经挂在新 lineage 上，一次拖动就会把旧内容保存回服务端。
      */
-    const applyProjectToCanvas = useCallback(async (project: CanvasProject, isCancelled: () => boolean) => {
+    const applyProjectToCanvas = useCallback(async (project: CanvasProject, isCancelled: () => boolean, commit?: () => boolean) => {
         const serverNodes = resetInterruptedGeneration(project.nodes);
         const serverSessions = project.chatSessions || [];
         const [restoredNodes, restoredSessions] = await Promise.all([
             hydrateWithFallback(hydrateCanvasImages(serverNodes), serverNodes),
             hydrateWithFallback(hydrateAssistantImages(serverSessions), serverSessions),
         ]);
-        if (isCancelled()) return;
+        if (isCancelled()) return false;
+        if (commit && !commit()) return false;
         historyPausedRef.current = true;
         setNodes(restoredNodes);
         setConnections(project.connections);
@@ -411,12 +417,15 @@ function InfiniteCanvasPage() {
         setHistoryState({ canUndo: false, canRedo: false });
         historyPausedRef.current = false;
         setProjectLoaded(true);
+        return true;
     }, []);
 
     useEffect(() => {
         if (!scope) return;
         let cancelled = false;
         const isCancelled = () => cancelled;
+        /** 打开新画布时让仍在进行的冲突重载作废，避免它稍后把旧画布内容应用到当前页面。 */
+        reloadRunRef.current += 1;
         setProjectLoaded(false);
 
         /** 打开画布现在是异步的：先取服务端权威快照（必要时叠加同 revision 的本地草稿），再做图片/助手补水。 */
@@ -441,22 +450,28 @@ function InfiniteCanvasPage() {
         };
     }, [applyProjectToCanvas, navigate, openProject, projectId, scope]);
 
-    /** 冲突后用户显式选择「重新载入服务端版本」：丢弃内存中的本地编辑，改用服务端最新快照重开。 */
+    /**
+     * 冲突后用户显式选择「重新载入服务端版本」。
+     * 全程先关掉 projectLoaded：渲染闸门会切到 CanvasRefreshShell，内容与视口 effect 也都会提前返回，
+     * 所以在服务端内容真正应用之前，旧内容既不可编辑也不会 schedule 任何保存。
+     */
     const reloadServerCopy = useCallback(async () => {
-        const requestedScope = scope;
-        const project = await resolveConflictWithServer(projectId);
-        if (!project) throw new Error("canvas_reload_failed");
-        await applyProjectToCanvas(project, () => {
-            const state = useCanvasStore.getState();
-            return (
-                state.active?.project.id !== projectId ||
-                !requestedScope ||
-                !state.scope ||
-                state.scope.userId !== requestedScope.userId ||
-                state.scope.workspaceId !== requestedScope.workspaceId
-            );
-        });
-    }, [applyProjectToCanvas, projectId, resolveConflictWithServer, scope]);
+        const run = ++reloadRunRef.current;
+        const superseded = () => run !== reloadRunRef.current;
+        setProjectLoaded(false);
+        try {
+            const handle = await fetchServerCopy(projectId);
+            if (superseded()) return;
+            if (!handle) throw new Error("canvas_reload_failed");
+            if (!(await applyProjectToCanvas(handle.project, superseded, () => commitServerCopy(handle)))) throw new Error("canvas_reload_failed");
+        } catch (error) {
+            /** 已被切画布或再次重载取代时保持安静：界面归新的打开流程负责，不该再弹一次失败提示。 */
+            if (superseded()) return;
+            /** 失败时 store 完全没被改过，把旧的冲突界面恢复出来，不能停在 RefreshShell 上。 */
+            if (useCanvasStore.getState().active?.project.id === projectId) setProjectLoaded(true);
+            throw error;
+        }
+    }, [applyProjectToCanvas, commitServerCopy, fetchServerCopy, projectId]);
 
     useEffect(() => {
         if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;

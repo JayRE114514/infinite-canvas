@@ -4,6 +4,7 @@ import { Button, Dropdown, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { UserStatusActions } from "@/components/layout/user-status-actions";
+import { CanvasSaveStatus } from "@/components/canvas/canvas-save-status";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { CANVAS_TITLE_MAX_LENGTH } from "@/lib/canvas/canvas-snapshot";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
@@ -138,6 +139,7 @@ export function CanvasTopBar({
                         )}
                     </div>
                     <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} />
+                    <CanvasSaveStatus />
                 </div>
 
                 <div className="pointer-events-auto flex items-center gap-1.5">
