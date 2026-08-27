@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 
 import { UserStatusActions } from "@/components/layout/user-status-actions";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { CANVAS_TITLE_MAX_LENGTH } from "@/lib/canvas/canvas-snapshot";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { DOCS_URL } from "@/constant/env";
@@ -114,6 +115,7 @@ export function CanvasTopBar({
                         {isTitleEditing ? (
                             <input
                                 autoFocus
+                                maxLength={CANVAS_TITLE_MAX_LENGTH}
                                 value={titleDraft}
                                 onChange={(event) => onTitleDraftChange(event.target.value)}
                                 onBlur={onFinishTitleEditing}

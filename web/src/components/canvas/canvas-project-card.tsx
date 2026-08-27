@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { App, Button, Input } from "antd";
 import { useTranslation } from "react-i18next";
 
-import type { CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
+import { CANVAS_TITLE_MAX_LENGTH, type CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
@@ -62,7 +62,7 @@ export function CanvasProjectCard({ summary }: { summary: CanvasProjectSummary }
                     aria-label={t("canvas.project.select", { name: summary.title })}
                 />
                 {editing ? (
-                    <Input className="min-w-0" value={editingTitle} onClick={(event) => event.stopPropagation()} onChange={(event) => setEditingTitle(event.target.value)} onKeyDown={(event) => event.key === "Enter" && void saveTitle()} autoFocus />
+                    <Input className="min-w-0" maxLength={CANVAS_TITLE_MAX_LENGTH} value={editingTitle} onClick={(event) => event.stopPropagation()} onChange={(event) => setEditingTitle(event.target.value)} onKeyDown={(event) => event.key === "Enter" && void saveTitle()} autoFocus />
                 ) : (
                     <button
                         type="button"

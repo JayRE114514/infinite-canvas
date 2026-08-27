@@ -7,17 +7,8 @@ import type {
     SaveCanvasRequest,
     SuccessResponse,
 } from "@infinite-canvas/contracts";
-import { queryOptions } from "@tanstack/react-query";
 
 import { platformRequest } from "@/services/api/platform-client";
-
-const canvasRootKey = ["platform", "canvases"] as const;
-
-export const canvasKeys = {
-    all: canvasRootKey,
-    list: (userId: string, workspaceId: string) => [...canvasRootKey, "list", userId, workspaceId] as const,
-    detail: (userId: string, workspaceId: string, canvasId: string) => [...canvasRootKey, "detail", userId, workspaceId, canvasId] as const,
-};
 
 function canvasCollectionPath(workspaceId: string) {
     return `/workspaces/${encodeURIComponent(workspaceId)}/canvases`;
@@ -25,13 +16,6 @@ function canvasCollectionPath(workspaceId: string) {
 
 function canvasPath(workspaceId: string, canvasId: string) {
     return `${canvasCollectionPath(workspaceId)}/${encodeURIComponent(canvasId)}`;
-}
-
-export function canvasListQueryOptions(userId: string, workspaceId: string) {
-    return queryOptions({
-        queryKey: canvasKeys.list(userId, workspaceId),
-        queryFn: () => fetchCanvasList(workspaceId),
-    });
 }
 
 export async function fetchCanvasList(workspaceId: string): Promise<CanvasSummary[]> {

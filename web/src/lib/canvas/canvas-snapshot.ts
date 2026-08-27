@@ -2,10 +2,17 @@ import type { Canvas, CanvasSnapshot, CanvasSummary } from "@infinite-canvas/con
 
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
-import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
+import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, CanvasNodeMetadata, ViewportTransform } from "@/types/canvas";
 
 /** 服务端只保证快照是合法 JSON，节点与连线语义仍由前端维护，这里集中做一次结构归一。 */
 export const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
+
+/** 与服务端 CanvasTitleSchema 的 maxLength 对齐：本地就截断，避免把服务端永远拒绝的标题留在内存或草稿里。 */
+export const CANVAS_TITLE_MAX_LENGTH = 200;
+
+export function clampCanvasTitle(title: string, fallback = "") {
+    return title.trim().slice(0, CANVAS_TITLE_MAX_LENGTH).trimEnd() || fallback;
+}
 
 export type CanvasProjectSummary = Pick<CanvasProject, "id" | "title" | "createdAt" | "updatedAt"> & {
     revision: number;
@@ -35,12 +42,58 @@ function asBackgroundMode(value: unknown): CanvasBackgroundMode {
     return value === "lines" || value === "dots" || value === "blank" ? value : "lines";
 }
 
-/** 快照只保存画布语义字段，id/时间戳/revision 一律以服务端返回为准，避免本地值覆盖权威数据。 */
+/**
+ * 补水时 resolveImageUrl / resolveMediaUrl 会生成 blob: 临时地址，它只在当前页面会话内有效。
+ * 快照里必须换成稳定的 storageKey：补水逻辑本来就以 storageKey 为准，且 storageKey 也是一个非空字符串，
+ * 能让「有内容」的判断继续成立；完全没有稳定键的临时地址只能丢弃，它在别的会话里无法还原。
+ */
+function isTransientUrl(value?: string) {
+    return Boolean(value?.startsWith("blob:"));
+}
+
+function sanitizeNode(node: CanvasNodeData): CanvasNodeData {
+    const metadata = node.metadata;
+    if (!metadata) return node;
+    const next: CanvasNodeMetadata = { ...metadata };
+    if (isTransientUrl(next.content)) {
+        if (next.storageKey) next.content = next.storageKey;
+        else delete next.content;
+    }
+    if (next.images) next.images = next.images.map((image) => (isTransientUrl(image.content) ? { ...image, content: image.storageKey } : image));
+    /** 生成参数里的参考项已经是「storageKey 或稳定外链」，临时地址换会话就失效，只能丢弃。 */
+    if (next.references?.some(isTransientUrl)) next.references = next.references.filter((url) => !isTransientUrl(url));
+    return { ...node, metadata: next };
+}
+
+function sanitizeSession(session: CanvasAssistantSession): CanvasAssistantSession {
+    return {
+        ...session,
+        messages: session.messages.map((message) => {
+            if (!message.references?.length) return message;
+            return {
+                ...message,
+                references: message.references.map((item) => {
+                    if (!isTransientUrl(item.dataUrl)) return item;
+                    const next = { ...item };
+                    /** storageKey 已保留稳定语义；没有稳定键时也不能把本会话的 object URL 写入草稿或服务端。 */
+                    delete next.dataUrl;
+                    return next;
+                }),
+            };
+        }),
+    };
+}
+
+/**
+ * 快照只保存画布语义字段，id/时间戳/revision 一律以服务端返回为准，避免本地值覆盖权威数据。
+ * 同时剥掉补水产生的 blob: 临时地址：有 storageKey 的只留键，没有稳定键的临时地址直接丢弃，
+ * 否则下次在别的会话打开画布会拿到一个已经失效的地址。
+ */
 export function projectToSnapshot(project: CanvasProject): CanvasSnapshot {
     return {
-        nodes: project.nodes,
+        nodes: project.nodes.map(sanitizeNode),
         connections: project.connections,
-        chatSessions: project.chatSessions,
+        chatSessions: project.chatSessions.map(sanitizeSession),
         activeChatId: project.activeChatId,
         backgroundMode: project.backgroundMode,
         showImageInfo: project.showImageInfo,
@@ -113,7 +166,7 @@ export function summaryToProjectSummary(summary: CanvasSummary): CanvasProjectSu
 export function projectToImportBody(source: Partial<CanvasProject>, fallbackTitle: string) {
     const project: CanvasProject = {
         id: "",
-        title: source.title?.trim() || fallbackTitle,
+        title: clampCanvasTitle(source.title || "", clampCanvasTitle(fallbackTitle)),
         createdAt: source.createdAt || "",
         updatedAt: source.updatedAt || "",
         nodes: source.nodes || [],

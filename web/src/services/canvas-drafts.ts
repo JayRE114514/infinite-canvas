@@ -7,7 +7,7 @@ import type { CanvasSnapshot } from "@infinite-canvas/contracts";
  * 这样切换账号、切换 Workspace 或服务端 revision 前进后，旧草稿都不会被误当成当前画布的待保存内容。
  */
 const draftStore = localforage.createInstance({ name: "infinite-canvas", storeName: "canvas_drafts" });
-const DRAFT_PREFIX = "draft";
+const DRAFT_PREFIX = "canvas-draft";
 
 export type CanvasDraftScope = {
     userId: string;

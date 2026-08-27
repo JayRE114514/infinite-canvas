@@ -41,7 +41,7 @@ import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/a
 import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
-import { useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
+import { isScopeChangedError, useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -167,6 +167,13 @@ function InfiniteCanvasPage() {
     const viewportSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const applyingHistoryRef = useRef(false);
     const historyPausedRef = useRef(false);
+    /**
+     * 服务端快照（或同 revision 的本地草稿）刚应用到画布时的内容引用。
+     * 保存前用引用相等判断内容是否真的被用户改过：只是打开或补水画布不算脏数据，
+     * 不能因此触发一次保存并把 revision 推进，否则两个标签页互相打开就会假冲突。
+     */
+    const syncedContentRef = useRef<CanvasHistoryEntry | null>(null);
+    const syncedViewportRef = useRef<ViewportTransform | null>(null);
     const didInitialCenterRef = useRef(false);
     const rafRef = useRef<number | null>(null);
     const nodeDraggingRef = useRef(false);
@@ -366,6 +373,8 @@ function InfiniteCanvasPage() {
             backgroundMode: project.backgroundMode,
             showImageInfo: project.showImageInfo || false,
         };
+        syncedContentRef.current = lastHistoryRef.current;
+        syncedViewportRef.current = project.viewport;
         setHistoryState({ canUndo: false, canRedo: false });
         historyPausedRef.current = false;
         setProjectLoaded(true);
@@ -447,6 +456,19 @@ function InfiniteCanvasPage() {
 
     useEffect(() => {
         if (!projectLoaded || historyPausedRef.current) return;
+        const synced = syncedContentRef.current;
+        /** 内容与刚应用的快照完全同一引用，说明用户还没编辑过，直接跳过保存。 */
+        if (
+            synced &&
+            synced.nodes === nodes &&
+            synced.connections === connections &&
+            synced.chatSessions === chatSessions &&
+            synced.activeChatId === activeChatId &&
+            synced.backgroundMode === backgroundMode &&
+            synced.showImageInfo === showImageInfo
+        )
+            return;
+        syncedContentRef.current = null;
         updateProject(projectId, { nodes, connections, chatSessions, activeChatId, backgroundMode, showImageInfo });
     }, [activeChatId, backgroundMode, chatSessions, connections, nodes, projectId, projectLoaded, showImageInfo, updateProject]);
 
@@ -454,21 +476,34 @@ function InfiniteCanvasPage() {
         if (!dialogNodeId) setNodeImageSettingsOpen(false);
     }, [dialogNodeId]);
 
+    const flushProjectChanges = useCallback(() => {
+        /** 视口自己还有一层 500ms 防抖，先把它并入已捕获候选，再整体提交。 */
+        if (viewportSaveTimerRef.current) {
+            clearTimeout(viewportSaveTimerRef.current);
+            viewportSaveTimerRef.current = null;
+            updateProject(projectId, { viewport: viewportRef.current });
+        }
+        return flushProject(projectId);
+    }, [flushProject, projectId, updateProject]);
+
     /** 离开画布或页面隐藏时把仍在防抖窗口内的编辑立刻提交，避免最后一次改动丢失。 */
     useEffect(() => {
         if (!projectLoaded) return;
-        const flush = () => void flushProject(projectId);
+        const flush = () => void flushProjectChanges();
         window.addEventListener("pagehide", flush);
         return () => {
             window.removeEventListener("pagehide", flush);
             flush();
         };
-    }, [flushProject, projectId, projectLoaded]);
+    }, [flushProjectChanges, projectLoaded]);
 
     useEffect(() => {
         if (!projectLoaded) return;
+        /** 视口同样要区分「刚应用服务端视口」和「用户真的平移缩放过」。 */
+        if (syncedViewportRef.current === viewport) return;
         if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
         viewportSaveTimerRef.current = setTimeout(() => {
+            syncedViewportRef.current = null;
             updateProject(projectId, { viewport: viewportRef.current });
             viewportSaveTimerRef.current = null;
         }, 500);
@@ -1063,16 +1098,21 @@ function InfiniteCanvasPage() {
 
     const createAndOpenProject = useCallback(async () => {
         try {
+            /** 新建会立刻替换 active，必须先捕获并提交当前画布（包括仍在视口防抖中的值）。 */
+            await flushProjectChanges();
             const id = await createProject(t("canvas.defaultTitle", { count: useCanvasStore.getState().summaries.length + 1 }));
             navigate(`/canvas/${id}`);
-        } catch {
+        } catch (error) {
+            /** 账号或 Workspace 已经切换时这条结果属于旧作用域，既不导航也不提示失败。 */
+            if (isScopeChangedError(error)) return;
             message.error(t("canvas.createFailed"));
         }
-    }, [createProject, message, navigate, t]);
+    }, [createProject, flushProjectChanges, message, navigate, t]);
 
     const deleteCurrentProject = useCallback(async () => {
         try {
-            await deleteProjects([projectId]);
+            const { failed } = await deleteProjects([projectId]);
+            if (failed.length) return message.error(t("canvas.deleteFailed"));
             navigate("/canvas");
         } catch {
             message.error(t("canvas.deleteFailed"));
@@ -1080,7 +1120,12 @@ function InfiniteCanvasPage() {
     }, [deleteProjects, message, navigate, projectId, t]);
 
     const exportCurrentProject = useCallback(async () => {
-        const [project] = await loadProjectsForExport([projectId]);
+        let project: CanvasProject | undefined;
+        try {
+            [project] = await loadProjectsForExport([projectId]);
+        } catch {
+            return message.error(t("canvas.sidePanel.exportFailed"));
+        }
         if (!project) return message.error(t("canvas.projectPage.notFound"));
         const hide = message.loading(t("canvas.projectPage.exporting"), 0);
         try {
