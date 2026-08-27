@@ -64,7 +64,6 @@ Tasks 1-4 are one database-security implementation unit and one deployable commi
 - Modify: `server/src/infrastructure/database/types.ts`
 - Modify: `server/src/infrastructure/database/plugin.ts`
 - Modify: `server/src/app.ts`
-- Modify: `packages/contracts/src/workspaces.ts`
 - Modify: `server/src/api.ts`
 - Modify: `server/src/worker.ts`
 - Modify: `server/drizzle.config.ts`
@@ -143,7 +142,7 @@ ALTER ROLE app_maintenance NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPAS
 
 After the first RED is observed, `startPostgres` executes this bootstrap as the ephemeral container administrator before returning. `startRoleDatabase` builds on it and uses fixed, test-only `ALTER ROLE app_api PASSWORD 'test-app-api'` statements for the four static role names; it does not attempt to bind a password parameter into utility SQL. The helper grants database `CONNECT`, transfers the `public` schema to `schema_owner`, and grants that role `CREATE`. Thus the original compile-valid test becomes green through the real bootstrap rather than by changing its assertion.
 
-`adopt-ownership.sql` is an explicit deployment-administrator action for the pre-release database. It revokes `PUBLIC CREATE` on `public`, changes the schema owner, and enumerates existing application relations, sequences, and routines in `public`, executing catalog-derived, identifier-quoted `ALTER ... OWNER TO schema_owner`; it excludes extension-owned objects. The upgrade-path test creates `legacy_owner`, applies the real immutable `0000/0001` journal entries as that role, and runs adoption as the container administrator. Task 1 proves every current application object transferred and extension objects did not; Task 2 extends the same fixture to run `0002+` as `schema_owner`, assert the latest journal tag, and execute final application queries. A separate fresh-install path runs every available migration as `schema_owner`. The helper keeps known hashes for `0000/0001` so the upgrade fixture cannot silently follow rewritten historical SQL.
+`adopt-ownership.sql` is an explicit deployment-administrator action for the pre-release database. It revokes `PUBLIC CREATE` on both `public` and the migrator's `drizzle` schema when present, changes both schema owners, and enumerates existing relations, sequences, and routines in those schemas, executing catalog-derived, identifier-quoted `ALTER ... OWNER TO schema_owner`; it excludes extension-owned objects. The upgrade-path test creates `legacy_owner`, applies the real immutable `0000/0001` journal entries as that role, snapshots every `drizzle.__drizzle_migrations` hash/timestamp row, and runs adoption as the container administrator. Task 1 proves every current application object plus the migration metadata table/sequence transferred, the history rows remained byte-for-byte unchanged, and extension objects did not transfer; Task 2 extends the same fixture to run `0002+` as `schema_owner`, assert the latest journal tag, and execute final application queries. A separate fresh-install path runs every available migration as `schema_owner`. The helper keeps known hashes for `0000/0001` so the upgrade fixture cannot silently follow rewritten historical SQL.
 
 - [ ] **Step 4: Split process configuration by credential**
 
@@ -164,21 +163,23 @@ export function loadDatabaseConfig(
 
 `drizzle.config.ts` reads only `DATABASE_URL_SCHEMA_OWNER`. `.env.example` lists four separate URLs and explicitly says role creation/password assignment is a deployment bootstrap action.
 
-- [ ] **Step 5: Write the second failing test for role-aware readiness**
+- [ ] **Step 5: Write the second compile-valid failing test through current readiness behavior**
 
-After the role bootstrap test is green, add the imports and assertions for `startRoleDatabase` and `inspectDatabaseRole`:
+After the role bootstrap test is green, exercise the existing `checkDatabaseReady` export rather than importing a future inspector. Attach the expected-role marker structurally to the current handle; current readiness ignores it and incorrectly accepts the superuser:
 
 ```ts
-it("rejects readiness when the configured role and effective login differ", async () => {
-    const databases = await startRoleDatabase();
-    await expect(inspectDatabaseRole(databases.api.pool, "app_worker"))
-        .resolves.toMatchObject({ ok: false, violations: [expect.stringContaining("app_worker")] });
+it("rejects a superuser handle marked for app_api readiness", async () => {
+    const postgres = await startPostgres();
+    const superuser = Object.assign(createDatabase({ url: postgres.url, poolMax: 1 }), {
+        expectedRole: "app_api" as const,
+    });
+    await expect(checkDatabaseReady(superuser)).resolves.toBe(false);
 });
 ```
 
-Run: `bun --cwd server run test -- test/database/roles.test.ts -t "rejects readiness"`
+Run: `bun --cwd server run test -- test/database/roles.test.ts -t "rejects a superuser"`
 
-Expected: FAIL because the existing readiness implementation checks only `select 1` and accepts the wrong effective login.
+Expected: FAIL at `toBe(false)` because the existing readiness implementation checks only `select 1` and returns true; all imports and setup succeed.
 
 - [ ] **Step 6: Add role-aware pools and readiness inspection**
 
@@ -230,6 +231,7 @@ Record focused role/bootstrap evidence in the SDD ledger. Do not commit or hand 
 - Modify: `server/test/database/migration-upgrade.test.ts`
 - Modify: `server/migrations/meta/_journal.json`
 - Generate: `server/migrations/meta/0002_snapshot.json`
+- Modify: `packages/contracts/src/workspaces.ts`
 
 **Interfaces:**
 - Produces: `users` as the Identity module's public database reference from `modules/identity/schema.ts`; `workspaces`, `workspaceMembers`, `workspaceInvitations` only from `modules/workspaces/schema.ts`. Canvas imports Workspace only through that public schema entry.
@@ -237,11 +239,12 @@ Record focused role/bootstrap evidence in the SDD ledger. Do not commit or hand 
 - Produces direct services: `listWorkspaces`, `createTeamWorkspace`, `updateWorkspace`, `listWorkspaceMembers`, `removeWorkspaceMember`, `createWorkspaceInvitation`, `cancelWorkspaceInvitation`, and `acceptWorkspaceInvitation`.
 - Produces: `checkModuleBoundaries(rootDir): Promise<BoundaryViolation[]>` using the TypeScript parser; it rejects `better-auth*` outside Identity and rejects cross-module imports of private schema implementations such as `identity/auth-schema`.
 - Removes: all Better Auth Organization API calls, Organization plugin hooks, Organization DTO aliases, and `sessions.activeOrganizationId`.
+- Replaces contracts: remove `AcceptWorkspaceInvitationPathSchema`/path DTO, add `WorkspaceStatusSchema`, `WorkspaceInvitationRoleSchema`, strict `AcceptWorkspaceInvitationBodySchema = { token }`, and use invitation role—not `WorkspaceRoleSchema`—in invitation responses.
 - Consumes: Task 1 schema-owner migration path and role test harness.
 
 - [ ] **Step 1: Write compile-valid boundary and database-invariant tests**
 
-The first boundary RED uses the TypeScript parser directly inside the test to scan the existing `server/src` tree and expects no `better-auth*` import outside Identity. It compiles against the current tree and fails by reporting the actual Workspaces violations rather than a missing future module. After that observed RED, extract the already-tested parser into `check-module-boundaries.ts`, import it from the test, and add a temporary source fixture proving the executable checker catches a real import:
+The first boundary RED uses the TypeScript parser directly inside the test to scan the existing `server/src` tree and expects both no `better-auth*` import outside Identity and no cross-module import of `identity/auth-schema`. It compiles against the current tree and fails by reporting the actual Workspace route and Canvas schema violations rather than a missing future module. After that observed RED, extract the already-tested parser into `check-module-boundaries.ts`, import it from the test, and add temporary source fixtures proving the executable checker catches each rule:
 
 ```ts
 it("rejects better-auth imports outside Identity", async () => {
@@ -343,10 +346,12 @@ ALTER TABLE public.workspace_invitations
 UPDATE public.workspace_invitations
 SET token_digest = md5(id || ':legacy:1') || md5(id || ':legacy:2')
 WHERE token_digest IS NULL;
-ALTER TABLE public.workspace_invitations ALTER COLUMN token_digest SET NOT NULL;
+ALTER TABLE public.workspace_invitations
+    ALTER COLUMN token_digest SET NOT NULL,
+    ADD CONSTRAINT workspace_invitations_token_digest_unique UNIQUE (token_digest);
 ```
 
-Before making invitation role non-null, backfill null roles to `member`; normalize email with `lower(trim(email))`; mark all pre-release pending invitations `canceled`; and give those non-redeemable legacy rows a 64-character placeholder digest before the NOT NULL constraint. New invitations always persist a real application-computed SHA-256 digest, and no compatibility redemption path remains.
+Before making invitation role non-null, backfill null roles to `member`; normalize email with `lower(trim(email))`; mark all pre-release pending invitations `canceled`; and give those non-redeemable legacy rows a 64-character placeholder digest before the NOT NULL constraint. `token_digest` is unique so one raw token can identify at most one invitation. New invitations always persist a real application-computed SHA-256 digest, and no compatibility redemption path remains.
 
 The same migration drops and recreates affected foreign keys as `ON DELETE RESTRICT`, adds CHECK constraints for Workspace type/status/deleted-at coherence, member role/status, normalized invitation email, 64-character token digest, and invitation role/status, rebuilds every renamed index, preserves `workspaces_owner_personal_unique` with predicate `type = 'personal'`, adds one-owner partial uniqueness, and adds DEFERRABLE INITIALLY DEFERRED constraint triggers on both `workspaces` and `workspace_members`. The trigger raises SQLSTATE `23514` unless every active Workspace has exactly one active owner member whose `user_id` equals `owner_user_id`.
 
@@ -358,11 +363,11 @@ Implement each direct service and `requireWorkspaceAccess` against a passed `App
 
 Invitation creation generates `randomBytes(32).toString("base64url")`, persists `sha256(token)` only, and sends a URL containing the raw token. Replace the old invitation-ID acceptance path with `POST /api/v1/workspace-invitations/accept` and strict body `{ token: string }`; acceptance hashes that raw token and conditionally claims the matching `pending`, unexpired invitation for the current user's verified email. An invitation ID cannot substitute for the token. Raw tokens never enter responses, logs, or the database, and duplicate/concurrent claims have exactly one winner.
 
-Member removal uses a conditional delete that excludes `role = 'owner'`. Workspace updates accept only name/slug. `WorkspaceStatusSchema` is the closed union `active | suspended | deactivated`, never an arbitrary response string. Direct services convert unique violations to existing stable application errors without Better Auth error-code mapping.
+Member removal uses a conditional delete that excludes `role = 'owner'`. Workspace updates accept only name/slug. `WorkspaceStatusSchema` is the closed union `active | suspended | deactivated`, never an arbitrary response string; `WorkspaceMemberSchema.joinedAt` replaces the old `createdAt`; invitation responses use `WorkspaceInvitationRoleSchema = admin | member` and can never return owner. Direct services convert unique violations to existing stable application errors without Better Auth error-code mapping.
 
 - [ ] **Step 6: Add the executable boundary command**
 
-Add `"check:boundaries": "tsx scripts/check-module-boundaries.ts src"` to `server/package.json`. The script parses `ImportDeclaration`, `ExportDeclaration`, and dynamic `import()` string literals with the TypeScript compiler API; it exits non-zero when a module beginning `better-auth` originates outside `src/modules/identity/`.
+Add `"check:boundaries": "tsx scripts/check-module-boundaries.ts src"` to `server/package.json`. The script parses `ImportDeclaration`, `ExportDeclaration`, and dynamic `import()` string literals with the TypeScript compiler API; it exits non-zero when a module beginning `better-auth` originates outside `src/modules/identity/`, when any module imports `modules/identity/auth-schema`, or when a cross-module import targets an implementation file not listed as that module's public entry (`identity/schema`, `workspaces/schema`, and the documented service interfaces). Fixture tests cover every rule.
 
 - [ ] **Step 7: Run schema/boundary checkpoints; keep the full application RED inside the atomic unit**
 
@@ -405,9 +410,11 @@ Do not register or expose an interim route implementation and do not grant broad
 - Produces: immutable `admin_operations`, `global_audit_logs`, `workspace_audit_logs`, and `workspace_provisioning_audits`; only narrow transaction-bound functions or Task 4 policies can append them.
 - Consumes later: Task 4 routes and services.
 
-- [ ] **Step 1: Write transaction-context tests**
+- [ ] **Step 1: Write compile-valid transaction-context RED tests after minimal signatures exist**
 
-Use the `app_api` login and prove transaction-local isolation. The leak test uses a dedicated pool with `max: 1`, so the post-transaction query is guaranteed to reuse the same physical connection after the helper releases it; it accepts PostgreSQL's missing value as `NULL` or empty text but rejects either old ID:
+First create `transactions.ts` and `context.ts` with the final exported TypeScript signatures and explicit `throw new Error("not_implemented")` bodies; this is interface scaffolding, not production behavior. The tests therefore compile and fail at the behavioral assertion rather than module resolution.
+
+Use the `app_api` login and prove transaction-local isolation only after Task 4 final grants/RLS are installed. The leak test uses a dedicated pool with `max: 1`, so the post-transaction query is guaranteed to reuse the same physical connection after the helper releases it; it accepts PostgreSQL's missing value as `NULL` or empty text but rejects either old ID:
 
 ```ts
 it("does not leak user or workspace context through a reused pool connection", async () => {
@@ -421,8 +428,9 @@ it("does not leak user or workspace context through a reused pool connection", a
 });
 
 it("rejects adopting a workspace not resolved as the current user's owned workspace", async () => {
+    const forged = userBWorkspace.id as ResolvedOwnedWorkspaceId; // test bypasses the compile-time brand intentionally
     await expect(withUserTransaction(apiDb, userA.id, (tx) =>
-        adoptOwnedWorkspaceContext(tx, userA.id, userBWorkspace.id),
+        adoptOwnedWorkspaceContext(tx, userA.id, forged),
     )).rejects.toMatchObject({ code: "workspace_context_adoption_forbidden" });
 });
 ```
@@ -462,13 +470,13 @@ export async function withTenantTransaction<T>(
 
 - [ ] **Step 4: Generate admin/audit tables and add SECURITY DEFINER functions**
 
-Update the Drizzle schema first, then run `bun --cwd server run db:generate -- --name transaction-context` to create the journaled `0003` migration and snapshot. The migration creates `platform_admins`, immutable `admin_operations`, immutable platform-target `global_audit_logs`, Workspace-scoped immutable `workspace_audit_logs`, and global immutable `workspace_provisioning_audits`. `admin_operations.transaction_xid` and audit transaction references use PostgreSQL `xid8`. Audit tables have no UPDATE/DELETE path; schema-owner triggers reject mutation after insert. `workspace_provisioning_audits` has a unique `(user_id, source)` event key and can be appended only by a narrow SECURITY DEFINER function that records the current user, source `email_verification | explicit_repair`, resolved Workspace, a server-derived request ID, and current transaction ID.
+Update the Drizzle schema first, then run `bun --cwd server run db:generate -- --name transaction-context` to create the journaled `0003` migration and snapshot. The migration creates `platform_admins`, immutable `admin_operations`, immutable platform-target `global_audit_logs`, Workspace-scoped immutable `workspace_audit_logs`, and global immutable `workspace_provisioning_audits`. `admin_operations.transaction_xid` and audit transaction references use PostgreSQL `xid8`. Audit tables have no UPDATE/DELETE path; schema-owner triggers reject mutation after insert. `workspace_provisioning_audits` has a unique `(user_id, source)` event key and can be appended only by a narrow SECURITY DEFINER function that records the current user, source `email_verification | explicit_repair`, resolved Workspace, a server-derived request ID, and current transaction ID. The function uses `INSERT ... ON CONFLICT (user_id, source) DO NOTHING RETURNING`; on replay it reads the existing row under definer ownership, returns success only when Workspace/source/request identity matches, and raises an invariant error on mismatch instead of leaking `23505` or silently accepting divergent history.
 
 `begin_admin_operation` validates current active admin status and this exact architecture-level purpose set: platform targets accept `user_read | model_read | model_write | provider_route_read | provider_route_write`; Workspace targets accept `workspace_read | workspace_suspend | workspace_deactivate | workspace_restore | wallet_adjust | wallet_status_write | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export`. Gate 0 implements only Workspace read/suspend/deactivate/restore. The remaining names are fixed protocol vocabulary only: no Gate 0 policy or service consumes them, and they grant no business access. The function writes `pg_current_xact_id()` and sets `app.admin_operation_id` with `is_local = true`. `is_current_admin_operation` checks operation ID, current transaction xid, current `app.user_id`, target, purpose, row Workspace, and current admin status.
 
 All control functions use `SECURITY DEFINER SET search_path = pg_catalog, public`, fully qualified names, no dynamic SQL, `REVOKE ALL ... FROM PUBLIC`, and signature-specific `GRANT EXECUTE TO app_api`. `app_api`, `app_worker`, and `app_maintenance` receive no direct table privileges on `platform_admins`, `admin_operations`, or `workspace_provisioning_audits`.
 
-Create the minimal non-recursive `is_active_workspace_member(workspace_id, user_id)` and `is_workspace_manager(...)` helpers under the same ownership rules. They read only `workspaces` and `workspace_members`.
+Create the minimal non-recursive `is_active_workspace_member(workspace_id text, user_id text)`, `is_workspace_manager(workspace_id text, user_id text)`, `is_current_verified_email(candidate_email text, user_id text)`, and `has_accepted_workspace_invitation(workspace_id text, user_id text, role text)` helpers under the same ownership rules. Membership helpers read only `workspaces`/`workspace_members`; invitation helpers read only `users`/`workspace_invitations`. No helper reads a leaf resource.
 
 Task 2's deferred owner-invariant trigger functions are also `SECURITY DEFINER`, owned by `schema_owner`, fixed to `search_path = pg_catalog, public`, fully qualified, and read only the two authorization roots. This ensures a non-owner invitation acceptance sees the real owner at commit even after root-table RLS is enabled. Add a real `app_api` acceptance commit test plus an invalid-owner commit test.
 
@@ -476,11 +484,11 @@ Task 2's deferred owner-invariant trigger functions are also `SECURITY DEFINER`,
 
 Only private repository functions brand an ID after a team/personal insert returns it or after the current user's lifetime-unique personal row is selected. `adoptOwnedWorkspaceContext` accepts that brand, locks the target Workspace, and still verifies at runtime that `owner_user_id = userId`, the active owner member matches, and transaction-local `app.user_id = userId`. The brand constructor and adoption function are not exported to routes and never accept a route/body Workspace ID. Only then does adoption set `app.workspace_id` transaction-locally.
 
-- [ ] **Step 6: Run the focused tests to verify GREEN**
+- [ ] **Step 6: Keep tenant/adoption behavior RED until Task 4; verify only grant-independent control primitives**
 
-Run: `bun --cwd server run test -- test/database/transactions.test.ts`
+Run: `bun --cwd server run test -- test/database/transactions.test.ts -t "admin operation|transaction-local GUC"`
 
-Expected: PASS; pool reuse is clean, arbitrary context adoption fails, mandatory Worker verification runs, and admin operation replay across transaction/target/purpose fails.
+Expected: only grant-independent GUC cleanup and admin-operation binding tests PASS. Mark tenant authorization, owned adoption, and Worker verification cases as `it.todo` with final bodies already written in helper functions; do not mark them skipped or green. Task 4 removes `todo` and runs them after installing final grants/RLS, proving pool cleanup, arbitrary adoption rejection, and mandatory Worker verification without an unsafe pre-RLS grant window.
 
 - [ ] **Step 7: Keep the atomic unit uncommitted and continue to Task 4**
 
@@ -494,6 +502,7 @@ Record focused transaction/control-function evidence, but do not commit or hand 
 - Create: `server/test/database/tenant-isolation.test.ts`
 - Create: `server/migrations/0004_tenant_rls.sql`
 - Modify: `server/migrations/meta/_journal.json`
+- Generate: `server/migrations/meta/0004_snapshot.json`
 - Create: `server/src/modules/platform-admin/service.ts`
 - Create: `server/src/modules/platform-admin/routes.ts`
 - Modify: `server/src/modules/workspaces/authorization.ts`
@@ -538,7 +547,7 @@ Also test all of the following as distinct observations:
 - Maintenance can select only `id` and `status` from Workspace, sees its full global candidate set through explicit `USING (true)`, cannot read any Canvas column, and cannot write;
 - `app_worker` has no business table privilege in Gate 0, and pool reuse does not leak context.
 
-`workspace-lifecycle.test.ts` exercises the complete Gate 0 state matrix: an owner can deactivate an active team Workspace and gets one immutable audit row; an owner cannot deactivate a personal Workspace; normal members cannot mutate suspended/deactivated Workspaces; an active platform admin can read any status with `workspace_read`, transition `active -> suspended` only with `workspace_suspend`, transition `active|suspended -> deactivated` only with `workspace_deactivate`, and restore `suspended|deactivated -> active` only with `workspace_restore`. Wrong purpose, wrong target, inactive admin, forged GUC, reused operation ID, and operation from another transaction all deny access and create no audit row. Fault injection proves an audit insert failure leaves status unchanged and a final conditional-update failure rolls the earlier audit back.
+`workspace-lifecycle.test.ts` exercises the complete Gate 0 state matrix: an owner can deactivate an active team Workspace and gets one immutable audit row; an owner cannot deactivate a personal Workspace; normal members cannot mutate suspended/deactivated Workspaces; an active platform admin can read any status with `workspace_read`, transition `active -> suspended` only with `workspace_suspend`, transition `active|suspended -> deactivated` only with `workspace_deactivate`, and restore `suspended|deactivated -> active` only with `workspace_restore`. Every successful admin read or transition adds exactly one audit tied to its operation ID; every wrong purpose, wrong target, inactive admin, forged GUC, reused operation ID, or cross-transaction attempt adds zero. Fault injection proves an audit insert failure leaves status unchanged and a final conditional-update failure rolls the earlier audit back.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
@@ -548,7 +557,7 @@ Expected: FAIL because tables do not have RLS and runtime roles lack final comma
 
 - [ ] **Step 3: Enable and FORCE RLS in dependency order**
 
-Create the journal entry with `bun --cwd server run db:generate -- --custom --name tenant-rls`; this is a policy-only migration, so it does not fabricate a schema snapshot. The test migrator must discover it through `_journal.json`. In `0004_tenant_rls.sql`:
+Create the journal entry with `bun --cwd server run db:generate -- --custom --name tenant-rls`; pinned Drizzle Kit 0.31.10 still writes `0004_snapshot.json`, so retain that generated snapshot even though the SQL is policy-only. The test migrator must discover it through `_journal.json`. In `0004_tenant_rls.sql`:
 
 ```sql
 ALTER TABLE public.workspaces ENABLE ROW LEVEL SECURITY;
@@ -563,7 +572,22 @@ ALTER TABLE public.workspace_audit_logs FORCE ROW LEVEL SECURITY;
 
 Authorization roots `workspaces` and `workspace_members` are ENABLE but not FORCE so tightly scoped schema-owner helpers can read them without recursive policies. Leaf tables are FORCE. Every policy is command-specific and role-specific; no policy is left with the implicit `PUBLIC` target.
 
-Before policies, explicitly revoke business privileges from `PUBLIC` and all runtime roles, then enumerate only the commands each role needs. `app_api` receives the exact Workspace/member/invitation/Canvas/audit SELECT/INSERT/UPDATE/DELETE subset exercised by services; unused hard DELETE grants are omitted. `app_worker` receives none. Gate 0 `app_maintenance` receives only column-level `SELECT (id, status)` on Workspaces plus explicit `TO app_maintenance USING (true)` Workspace SELECT policy; it receives no Canvas privilege, table-level SELECT, or DML. Task/Attempt/Hold/Wallet/Ledger/Asset columns are granted only when those real resources and consumers exist in later gates. Tests must distinguish a missing grant (`42501`) from an RLS denial (successful query with no rows).
+Before policies, explicitly revoke business privileges from `PUBLIC` and all runtime roles, then install this closed matrix; anything absent is denied:
+
+| Principal | Object | Allowed privilege |
+|---|---|---|
+| `app_api`, `app_worker`, `app_maintenance` | schema `public` | `USAGE` only; no `CREATE` |
+| `app_api` | `workspaces` | `SELECT, INSERT, UPDATE` |
+| `app_api` | `workspace_members` | `SELECT, INSERT, DELETE` |
+| `app_api` | `workspace_invitations` | `SELECT, INSERT, UPDATE` |
+| `app_api` | `canvases` | `SELECT, INSERT, UPDATE` |
+| `app_api` | `workspace_audit_logs` | `INSERT` |
+| `app_api` | `is_active_workspace_member(text,text)`, `is_workspace_manager(text,text)`, `is_current_verified_email(text,text)`, `has_accepted_workspace_invitation(text,text,text)`, `begin_admin_operation(...)`, `is_current_admin_operation(...)`, `record_workspace_provisioning(text,text,text)` | signature-specific `EXECUTE` |
+| `app_worker` | all Gate 0 business tables/functions | none |
+| `app_maintenance` | `workspaces` | column-level `SELECT (id, status)` only |
+| every runtime role | `platform_admins`, `admin_operations`, `global_audit_logs`, `workspace_provisioning_audits` | no direct table privilege |
+
+Task 2 separately grants `app_api` `SELECT, INSERT, UPDATE, DELETE` on the four Better Auth identity tables because the pinned adapter exercises their full lifecycle; no other runtime role receives Identity access. No runtime role is a member of `schema_owner` or another runtime role, and `PUBLIC` has no application schema/table/function privilege beyond PostgreSQL defaults explicitly retained. Task/Attempt/Hold/Wallet/Ledger/Asset columns are granted only when real resources and consumers exist in later gates. Catalog tests assert every allowed cell, every denied command, all function ACLs, and `pg_auth_members`; they distinguish a missing grant (`42501`) from an RLS denial (successful query with no rows).
 
 `app_api` Canvas policies require both `workspace_id = current_setting('app.workspace_id', true)` and `is_active_workspace_member(workspace_id, current_setting('app.user_id', true))`. The Canvas SELECT policy does not use `deleted_at` as an RLS predicate: services hide deleted rows from normal GET/LIST, while Task 6's authorized DELETE can lock an already-deleted row and return its durable receipt. The `workspaces` SELECT policy is deliberately user-dimensional: under `withUserTransaction` it allows rows having an active member for `current_setting('app.user_id', true)` without requiring `app.workspace_id`, which makes the read-only list route functional. Tenant mutation policies additionally require the exact Workspace context. Platform-admin Workspace SELECT/UPDATE policies call `is_current_admin_operation` with the row target and exact lifecycle purpose. Workspace audit INSERT permits only the active owner lifecycle path or a currently bound admin operation with the matching purpose and row Workspace.
 
@@ -585,13 +609,15 @@ return withTenantTransaction(
 
 Delete the two-stage `requireWorkspaceMember(request, workspaceId)` API. Its replacement `requireWorkspaceAccess(tx, input)` accepts only an `AppTransaction`. Services do not call `transaction()` internally.
 
-Add the team-owner deactivation route through `withTenantTransaction` and platform-admin read/status routes through `withPlatformAdminTransaction`. Each status service locks the Workspace, checks the exact allowed source/target state, appends `workspace_audit_logs`, then performs the conditional status update as the final business statement in the same transaction; this ordering keeps the tenant audit writable before `active -> deactivated` closes normal-member policies. Platform-admin routes map each requested transition to one fixed purpose server-side; clients cannot submit a purpose string. Personal Workspace owner deactivation is a stable 409 error. No hard-delete Workspace route is introduced.
+Add the team-owner deactivation route through `withTenantTransaction` and platform-admin read/status routes through `withPlatformAdminTransaction`. The admin read service selects its operation-bound Workspace and appends one `workspace_read` audit before returning, in the same transaction. Each status service locks the Workspace, checks the exact allowed source/target state, appends `workspace_audit_logs`, then performs the conditional status update as the final business statement in the same transaction; this ordering keeps the tenant audit writable before `active -> deactivated` closes normal-member policies. Platform-admin routes map each requested transition to one fixed purpose server-side; clients cannot submit a purpose string. Personal Workspace owner deactivation is a stable 409 error. No hard-delete Workspace route is introduced.
 
 - [ ] **Step 5: Extend startup assertions to privileges**
 
-`role-assertions.ts` now rejects runtime ownership, `rolbypassrls`, table DML not on the role allowlist, any Gate 0 business privilege on `app_worker`, and maintenance access to non-allowlisted columns. A production process with any violation fails readiness rather than logging and continuing.
+`role-assertions.ts` now rejects runtime ownership, `rolbypassrls`, role membership/inheritance, schema `CREATE`, access to the `drizzle` schema, missing or extra function EXECUTE/table command grants, any Gate 0 business privilege on `app_worker`, and Maintenance access to non-allowlisted columns. A production process with any violation fails readiness rather than logging and continuing.
 
 - [ ] **Step 6: Run isolation and route regressions to verify GREEN**
+
+Remove the temporary `it.todo` markers from Task 3 now that final grants and policies exist; no todo/skip remains in the security suite.
 
 Run:
 
@@ -630,7 +656,7 @@ git commit -m "feat: establish transaction-scoped PostgreSQL tenant security"
 - Removes: personal Workspace creation from `GET /api/v1/workspaces`.
 - Defers: Wallet and signup-grant creation to the Gate 3 ledger plan; the adoption callback remains inside the same transaction so Gate 3 can append those writes without changing Identity.
 
-- [ ] **Step 1: Write provisioning tests**
+- [ ] **Step 1: Write public-behavior provisioning RED tests without future imports**
 
 ```ts
 it("verification provisions one personal Workspace before the workspace list is read", async () => {
@@ -649,11 +675,13 @@ it("GET workspaces is read-only and never repairs a missing personal Workspace",
 
 Add a concurrent test calling `provisionPersonalWorkspace` twice and asserting identical returned Workspace IDs, one Workspace, and one owner member; separately invoke the `Promise<void>` verification callback concurrently and assert the same final database state. Inject a failure after Workspace insert but before owner insert and assert the transaction leaves neither row. Add a post-commit callback failure case through the real Better Auth verification endpoint: email verification remains complete, the automatic provisioning callback fails, then `POST /api/v1/workspaces/personal/repair` creates the missing Workspace; replay returns the same Workspace, leaves one owner member, and leaves exactly one immutable provisioning audit. An unverified user fails closed. The endpoint does not claim the generic `Idempotency-Key` protocol reserved by the architecture for later AI/ledger operations.
 
+Stage these tests. The first RED file uses only existing HTTP routes and test-local SQL helpers: verification is expected to provision before any GET, GET is expected not to mutate, and POST repair is expected to return 200 rather than the current 404. After adding the final `provisionPersonalWorkspace` signature with an explicit `not_implemented` body, add the direct concurrency/fault tests and observe that stable error before implementing logic. No RED may fail from a missing module import.
+
 - [ ] **Step 2: Run the provisioning tests and verify RED**
 
 Run: `bun --cwd server run test -- test/workspaces/workspaces.test.ts -t "personal Workspace provisioning"`
 
-Expected: FAIL because current provisioning occurs as a GET side effect, has no explicit repair path, and does not use the owned-context transaction.
+Expected: FAIL at public response/state assertions because current provisioning occurs as a GET side effect and POST repair is 404; all imports, route registration, and fixtures succeed.
 
 - [ ] **Step 3: Inject Better Auth's verified-email callback**
 
@@ -675,7 +703,7 @@ Identity does not import Workspaces. `app.ts` composes `createAuth` with a callb
 
 - [ ] **Step 4: Implement idempotent provisioning**
 
-Inside `withUserTransaction`: lock the current user row `FOR UPDATE`; verify the persisted `emailVerified` state; select the lifetime-unique personal Workspace; insert when absent with `ON CONFLICT` on `owner_user_id WHERE type = 'personal'`; insert the owner member; resolve the committed row; call `adoptOwnedWorkspaceContext`; append `workspace_provisioning_audits` through its narrow function with a server-derived unique `(user_id, source)` event key; return the existing or created summary. Automatic verification and explicit repair converge on this same function, and replay is naturally idempotent through the lifetime-unique Workspace plus audit event constraints. The GET list route only selects active memberships and cannot mutate.
+Inside `withUserTransaction`: lock the current user row `FOR UPDATE`; verify the persisted `emailVerified` state; select the lifetime-unique personal Workspace; insert when absent with `ON CONFLICT` on `owner_user_id WHERE type = 'personal'`; insert the owner member; resolve the committed row; call `adoptOwnedWorkspaceContext`; append `workspace_provisioning_audits` through its replay-validating `ON CONFLICT` function with a server-derived unique `(user_id, source)` event key; return the existing or created summary. Automatic verification and explicit repair converge on this same function. Tests cover concurrent callbacks, repair replay, and a deliberately divergent existing audit that must fail and roll back. The GET list route only selects active memberships and cannot mutate.
 
 - [ ] **Step 5: Run provisioning and identity regressions to verify GREEN**
 
@@ -713,6 +741,7 @@ git commit -m "feat: provision personal Workspaces on verification"
 **Interfaces:**
 - Produces: `type CanvasDocumentMode = "snapshot" | "collaborative"` and read-only `documentMode` in Canvas/summary responses.
 - Produces: `CanvasDeletionReceipt = { canvasId, deletionReceipt, deletedAt }`; first soft-delete and authorized idempotent replay return the same durable receipt.
+- Produces: internal `CanvasSaveInvariantError` carrying Canvas ID, Workspace ID, and expected revision for route-level structured logging; it is never serialized verbatim.
 - Produces: `canvas_document_mode_mismatch` with HTTP 409.
 - Preserves: `canvas_not_found` before mode checks and `revision_conflict` after mode checks.
 - Consumes: Task 4 `AppTransaction` service boundary and Canvas RLS.
@@ -721,23 +750,21 @@ git commit -m "feat: provision personal Workspaces on verification"
 
 ```ts
 it("returns read-only snapshot mode and rejects client mode input", async () => {
-    const created = await createCanvasAsOwner();
-    expect(created.documentMode).toBe("snapshot");
+    const created = await createCanvasAsOwnerRaw();
+    expect(created.json().canvas.documentMode).toBe("snapshot");
     const response = await rawCreate({ title: "x", snapshot: {}, documentMode: "collaborative" });
     expect(response.statusCode).toBe(400);
 });
 
-it("checks visibility, mode, then revision under one row lock", async () => {
-    await setModeAsContainerAdmin(canvasId, "collaborative");
-    await expect(save({ canvasId, baseRevision: 999 })).rejects.toMatchObject({ code: "canvas_document_mode_mismatch" });
-    await softDeleteAsContainerAdmin(canvasId);
-    await expect(save({ canvasId, baseRevision: 999 })).rejects.toMatchObject({ code: "canvas_not_found" });
+it("returns a durable deletion receipt instead of generic success", async () => {
+    const response = await deleteCanvasRaw(canvasId);
+    expect(response.json()).toEqual({ canvasId, deletionReceipt: expect.any(String), deletedAt: expect.any(String) });
 });
 ```
 
-Retain the existing concurrent same-base save test and require exactly one winner.
+These first tests use only existing routes and raw JSON, so they compile and reach assertion failures: `documentMode`/receipt are absent today. Retain the existing concurrent same-base save test and require exactly one winner.
 
-Add deletion tests proving the first DELETE sets `deleted_at` and `deletion_receipt_id` atomically, replay through the same active Workspace authorization returns byte-for-byte the same receipt without another state change, ordinary GET/LIST 404 responses contain no receipt, and cross-Workspace, removed-member, suspended/deactivated-Workspace, network/error fixtures never produce a receipt. Direct schema tests reject rows where only one of `deleted_at` and `deletion_receipt_id` is set and reject duplicate receipts.
+After Step 3 creates the columns, add deletion tests proving the first DELETE sets `deleted_at` and `deletion_receipt_id` atomically, replay through the same active Workspace authorization returns byte-for-byte the same receipt without another state change, ordinary GET/LIST 404 responses contain no receipt, and cross-Workspace, removed-member, suspended/deactivated-Workspace, network/error fixtures never produce a receipt. Direct schema tests reject rows where only one of `deleted_at` and `deletion_receipt_id` is set and reject duplicate receipts.
 
 Because Canvas is `FORCE ROW LEVEL SECURITY` and `schema_owner` has no bypass, arrangement-only mode/deletion fixtures use the isolated Testcontainers administrator and assert the affected row count. Every behavior assertion still runs through production-equivalent `app_api`; no schema-owner policy, BYPASSRLS attribute, or persistent `NO FORCE` escape is added.
 
@@ -745,7 +772,7 @@ Because Canvas is `FORCE ROW LEVEL SECURITY` and `schema_owner` has no bypass, a
 
 Run: `bun --cwd server run test -- test/canvases/schema.test.ts test/canvases/routes.test.ts`
 
-Expected: FAIL because the column and response field do not exist and saves do not check mode.
+Expected: FAIL at the public JSON assertions because response fields do not exist; no SQL setup references future columns.
 
 - [ ] **Step 3: Add the column and read-only contract**
 
@@ -754,7 +781,23 @@ Migration:
 ```sql
 ALTER TABLE public.canvases
     ADD COLUMN document_mode text NOT NULL DEFAULT 'snapshot',
-    ADD COLUMN deletion_receipt_id uuid,
+    ADD COLUMN deletion_receipt_id uuid;
+
+ALTER TABLE public.canvases NO FORCE ROW LEVEL SECURITY;
+DO $backfill$
+DECLARE expected_count bigint; affected_count bigint;
+BEGIN
+    SELECT count(*) INTO expected_count
+    FROM public.canvases WHERE deleted_at IS NOT NULL AND deletion_receipt_id IS NULL;
+    UPDATE public.canvases SET deletion_receipt_id = gen_random_uuid()
+    WHERE deleted_at IS NOT NULL AND deletion_receipt_id IS NULL;
+    GET DIAGNOSTICS affected_count = ROW_COUNT;
+    IF affected_count <> expected_count THEN RAISE EXCEPTION 'canvas receipt backfill count mismatch'; END IF;
+END
+$backfill$;
+ALTER TABLE public.canvases FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE public.canvases
     ADD CONSTRAINT canvases_document_mode_check
         CHECK (document_mode IN ('snapshot', 'collaborative')),
     ADD CONSTRAINT canvases_deletion_state_check
@@ -766,7 +809,20 @@ Update the Drizzle schema and run `bun --cwd server run db:generate -- --name ca
 
 Maintenance receives no Canvas privilege in Gate 0, so `document_mode` does not expand its allowlist. Contracts include `documentMode` in `CanvasSchema` and `CanvasSummarySchema`, but neither `CreateCanvasBodySchema` nor `SaveCanvasRequestSchema` contains it; `additionalProperties: false` rejects attempts to mutate it. The DELETE response alone exposes `deletionReceipt`; normal Canvas summaries/details never do.
 
-- [ ] **Step 4: Lock and validate save state in the fixed order**
+- [ ] **Step 4: Write post-migration ordering RED tests, then lock and validate save state**
+
+With columns now present, write and run the behavior test before changing save/delete services:
+
+```ts
+it("checks visibility, mode, then revision under one row lock", async () => {
+    await setModeAsContainerAdmin(canvasId, "collaborative");
+    await expect(save({ canvasId, baseRevision: 999 })).rejects.toMatchObject({ code: "canvas_document_mode_mismatch" });
+    await softDeleteAsContainerAdmin(canvasId);
+    await expect(save({ canvasId, baseRevision: 999 })).rejects.toMatchObject({ code: "canvas_not_found" });
+});
+```
+
+Expected RED: current save returns the wrong application error after all fixture SQL succeeds. Then implement the fixed order below.
 
 `saveCanvas(tx, access, canvasId, input)` first selects the visible row with `workspace_id`, `deleted_at`, `document_mode`, and `revision` `FOR UPDATE`. It throws:
 
@@ -775,7 +831,7 @@ Maintenance receives no Canvas privilege in Gate 0, so `document_mode` does not 
 3. `409 revision_conflict` when `revision !== baseRevision`, including input `Number.MAX_SAFE_INTEGER` against a lower stored revision;
 4. `409 canvas_revision_limit_reached` only when stored revision and `baseRevision` are both `Number.MAX_SAFE_INTEGER`.
 
-Only then update with an explicit `WHERE id = ? AND workspace_id = ? AND document_mode = 'snapshot' AND revision = ? AND deleted_at IS NULL`, increment revision, and return the row. If that update returns zero rows after the locked checks succeeded, throw `canvas_save_invariant_failed` as a 500, roll back, and emit a structured error containing request ID, Canvas ID, Workspace ID, and expected revision; never re-query and guess a user-facing 409. Create always writes `document_mode = 'snapshot'` explicitly.
+Only then update with an explicit `WHERE id = ? AND workspace_id = ? AND document_mode = 'snapshot' AND revision = ? AND deleted_at IS NULL`, increment revision, and return the row. If that update returns zero rows after the locked checks succeeded, throw internal `CanvasSaveInvariantError` carrying Canvas/Workspace/revision diagnostics. The route catches that type, calls `request.log.error({ requestId: request.id, canvasId, workspaceId, expectedRevision, err }, "canvas save invariant failed")`, and rethrows the stable `canvas_save_invariant_failed` 500 so the transaction rolls back; it never re-queries and guesses a user-facing 409. A logger-spy route test forces the zero-row condition and asserts every structured field plus the sanitized HTTP response. Create always writes `document_mode = 'snapshot'` explicitly.
 
 `deleteCanvas` runs under the same tenant authorization, locks by `id + workspace_id` even when already soft-deleted, and maps an invisible row to ordinary `canvas_not_found`. For an active row it generates one UUID and writes `deleted_at` plus `deletion_receipt_id` in one conditional update; for an already deleted row it returns the stored values. A zero-row update after the lock is an internal invariant failure, not a guessed 404. No GET/LIST path can serialize `deletionReceipt`.
 
@@ -807,6 +863,7 @@ git commit -m "feat: lock Canvas snapshot mode and deletion receipt"
 - Modify: `docs/content/docs/progress/pending-test.mdx`
 - Modify: `docs/content/docs/progress/pending-test.zh-CN.mdx`
 - Create: `docs/content/docs/progress/gate-0-backend-verification.mdx`
+- Create: `docs/content/docs/progress/gate-0-backend-verification.zh-CN.mdx`
 - Modify: `docs/content/docs/progress/meta.json`
 - Modify: `docs/content/docs/progress/meta.zh-CN.json`
 - Modify: `docs/index.md`
@@ -820,7 +877,7 @@ git commit -m "feat: lock Canvas snapshot mode and deletion receipt"
 Add one `Unreleased` entry:
 
 ```md
-- [调整] 后端改为独立数据库角色、业务自有 Workspace 与事务级 RLS 隔离，并固定画布 snapshot 文档模式。
++ [调整] 后端改为独立数据库角色、业务自有 Workspace 与事务级 RLS 隔离，并固定画布 snapshot 文档模式。
 ```
 
 - [ ] **Step 2: Move only completed backend items to pending-test**
@@ -829,7 +886,7 @@ The pending-test documents must list exact checks: registration verification and
 
 - [ ] **Step 3: Create the verification record**
 
-`gate-0-backend-verification.mdx` records exact focused commands, commit ranges, role names, command/column grants, policy tables, lifecycle matrix, repair evidence, deletion-receipt evidence, and whether each automated result passed. Add the page to both progress metadata files and `docs/index.md` so it is navigable. It explicitly states: `Gate 0 尚未关闭：原生 IndexedDB CAS、Chrome/Firefox/Safari 矩阵和用户 typecheck 证据仍待完成。`
+The English and Chinese `gate-0-backend-verification` pages record exact focused commands, commit ranges, role names, command/column grants, policy tables, lifecycle matrix, repair evidence, deletion-receipt evidence, and whether each automated result passed. Add both locale pages to their matching progress metadata and `docs/index.md` so navigation never relies on a locale fallback. The Chinese page explicitly states: `Gate 0 尚未关闭：原生 IndexedDB CAS、Chrome/Firefox/Safari 矩阵和用户 typecheck 证据仍待完成。`
 
 - [ ] **Step 4: Run the complete backend suite**
 
@@ -840,7 +897,7 @@ Expected: PASS with no warning/noise; tests use runtime roles for RLS evidence. 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add CHANGELOG.md docs/content/docs/progress
+git add CHANGELOG.md docs/index.md docs/content/docs/progress
 git commit -m "docs: record Gate 0 backend verification"
 ```
 
@@ -849,9 +906,9 @@ git commit -m "docs: record Gate 0 backend verification"
 ## Plan Self-Review Record
 
 - **Spec coverage:** Gate 0 backend ordering is fully mapped: role credentials/test connections and existing-object ownership adoption (Task 1); Organization removal, complete snake_case Workspace conversion, final constraints, and same-transaction service signatures (Task 2); transaction context, immutable audit/control tables, and admin binding (Task 3); explicit grants, RLS, user-only Workspace listing, and the owner/admin lifecycle matrix (Task 4); read-only GET plus audited explicit provisioning repair (Task 5); and `document_mode`, exact safe-integer ordering, and durable deletion receipts (Task 6). Native IndexedDB CAS is intentionally excluded into its own spec/plan; Billing, Assets, AI Tasks, and collaboration remain later gates.
-- **Placeholder scan:** the plan contains no unresolved marker, generic error-handling step, or unnamed test. Every task names files, interfaces, focused commands, expected failures, and expected passing behavior.
+- **Scaffolding scan:** every interface-only `not_implemented` body and Task 3 `it.todo` is an explicitly named RED-stage artifact inside the uncommitted atomic unit; Task 4 requires removing all of them before its green checkpoint and commit. No scaffold, skip, todo, generic error step, or unnamed test may survive a deployable commit.
 - **Type consistency:** `DatabaseLoginRole`, `DatabaseConfig`, `DatabaseHandle.role`, `AppTransaction`, `WorkspaceAccess`, and the four transaction entrypoints are introduced before consumers. Workspace schema exports move once in Task 2; Tasks 3-6 consume only that final location.
-- **Migration consistency:** fixed filenames `0002`, `0003`, `0004`, and `0005` are journaled in order and no later task edits an already-reviewed migration. Schema-changing `0002`, `0003`, and `0005` are generated from the final Drizzle schema and retain snapshots; policy-only `0004` is registered with `drizzle-kit generate --custom` and intentionally has no fabricated snapshot. All tests execute the journaled Drizzle migrator as `schema_owner`; no lexical SQL loader remains. Task 1 establishes roles before any migration references them; Task 2 removes Organization before renamed columns are consumed; Task 3 creates helpers before Task 4 policies call them; Task 6 changes Canvas without expanding the Gate 0 Maintenance allowlist.
+- **Migration consistency:** fixed filenames `0002`, `0003`, `0004`, and `0005` are journaled in order and no later task edits an already-reviewed migration. Schema-changing `0002`, `0003`, and `0005` are generated from the final Drizzle schema and retain snapshots; policy-only `0004` is registered with `drizzle-kit generate --custom`, whose pinned implementation also emits and retains `0004_snapshot.json`. All tests execute the journaled Drizzle migrator as `schema_owner`; no lexical SQL loader remains. Ownership adoption includes both `public` application objects and `drizzle` metadata objects/history. Task 1 establishes roles before any migration references them; Task 2 removes Organization before renamed columns are consumed; Task 3 creates helpers before Task 4 policies call them; Task 6 changes Canvas without expanding the Gate 0 Maintenance allowlist.
 - **Failure-path consistency:** missing grants (`42501`) are tested separately from successful empty RLS results; `set_config` is never asserted to be authorization; verification callback failure converges through an explicit verified-user repair path; ordinary Canvas 404 responses never become deletion proof; status audits are written before the final deactivation update.
 - **Deployability consistency:** Tasks 1-4 have one implementer, one review boundary, and one commit only after final routes, grants, policies, and module boundaries are green. No intermediate broad-grant, missing-grant, moved-schema/old-route, or two-connection authorization state is published.
 - **Upgrade consistency:** the real immutable `0000/0001` history is applied as a legacy owner, adopted by a deployment administrator, and continued as `schema_owner`; fresh install and upgrade are independent test paths, and FORCE-RLS fixture mutations use only the isolated container administrator.
