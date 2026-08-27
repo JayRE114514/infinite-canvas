@@ -10,7 +10,7 @@ import { setImageBlob } from "@/services/image-storage";
 import { CanvasDeleteProjectsDialog } from "@/components/canvas/canvas-delete-projects-dialog";
 import { CanvasProjectCard } from "@/components/canvas/canvas-project-card";
 import type { CanvasExportFile } from "@/types/canvas-export";
-import { isScopeChangedError, useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { hasAgentUrlBootstrap } from "@/lib/agent/agent-url-bootstrap";
@@ -44,14 +44,14 @@ export default function CanvasPage() {
     };
     /** 新建必须由用户显式触发，服务端返回 id 后才导航，避免拿到本地临时 id 后再对不上服务端画布。 */
     const createAndEnter = async () => {
-        try {
-            enterProject(await createProject(t("canvas.defaultTitle", { count: summaries.length + 1 })));
+        const result = await createProject(t("canvas.defaultTitle", { count: summaries.length + 1 }));
+        if (result.status === "created") {
+            enterProject(result.canvasId);
             return true;
-        } catch (error) {
-            /** 账号或 Workspace 已经切换时这条结果属于旧作用域，既不导航也不提示失败。 */
-            if (!isScopeChangedError(error)) message.error(t("canvas.createFailed"));
-            return false;
         }
+        /** 账号或 Workspace 已切换：既不导航也不提示失败，新作用域会自己再发起一次。 */
+        if (result.status === "failed") message.error(t(result.messageKey));
+        return false;
     };
     const exportProjects = async (ids: string[]) => {
         try {
@@ -83,14 +83,11 @@ export default function CanvasPage() {
             let created = 0;
             let failed = 0;
             for (const item of data.projects) {
-                try {
-                    await importProject(item.project, t("canvas.project.imported"));
-                    created += 1;
-                } catch (error) {
-                    /** 切换作用域后剩下的画布不再属于当前列表，直接停止，不计为失败。 */
-                    if (isScopeChangedError(error)) break;
-                    failed += 1;
-                }
+                const result = await importProject(item.project, t("canvas.project.imported"));
+                /** 切换作用域后剩下的画布不再属于当前列表，直接停止，不计为失败。 */
+                if (result.status === "scope-changed") break;
+                if (result.status === "created") created += 1;
+                else failed += 1;
             }
             if (created) message.success(t("canvas.imported", { count: created }));
             if (failed) message.error(t("canvas.importPartialFailed", { count: failed }));

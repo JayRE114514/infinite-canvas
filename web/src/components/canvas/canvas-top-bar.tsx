@@ -33,6 +33,7 @@ export function CanvasTopBar({
     agentOpen,
     compactAgentStatus,
     onToggleAgent,
+    onReloadCanvas,
 }: {
     title: string;
     titleDraft: string;
@@ -55,6 +56,7 @@ export function CanvasTopBar({
     agentOpen: boolean;
     compactAgentStatus: { connected: boolean; enabled: boolean; activity: string };
     onToggleAgent: () => void;
+    onReloadCanvas: () => void;
 }) {
     const colorTheme = useThemeStore((state) => state.theme);
     const { t } = useTranslation();
@@ -139,7 +141,7 @@ export function CanvasTopBar({
                         )}
                     </div>
                     <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} />
-                    <CanvasSaveStatus />
+                    <CanvasSaveStatus onReloadCanvas={onReloadCanvas} />
                 </div>
 
                 <div className="pointer-events-auto flex items-center gap-1.5">

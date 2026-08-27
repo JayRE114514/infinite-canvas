@@ -30,14 +30,14 @@ export function CanvasProjectCard({ summary }: { summary: CanvasProjectSummary }
         const agentHash = hasAgentUrlBootstrap(window.location.hash) ? window.location.hash : "";
         navigate(`/canvas/${summary.id}${searchParams.toString() ? `?${searchParams.toString()}` : ""}${agentHash}`, { replace: Boolean(agentHash) });
     };
-    /** 改名要等服务端确认；冲突或失败时保留输入框内容，让用户自己决定重试。 */
     const saveTitle = async () => {
-        try {
-            await renameProject(summary.id, editingTitle);
-            stopEditing();
-        } catch {
-            message.error(t("canvas.renameFailed"));
-        }
+        const result = await renameProject(summary.id, editingTitle);
+        if (result.status === "conflict") return message.error(t("canvas.rename.conflictHint"));
+        if (result.status === "failed") return message.error(t(result.messageKey));
+        if (result.status === "local-only") message.warning(t("canvas.rename.localOnly"));
+        if (result.status === "saved") message.success(t("canvas.renamed"));
+        /** saved / scheduled / local-only / scope-changed 都结束编辑态，只有真正失败才保留输入内容。 */
+        stopEditing();
     };
     /** 列表只有摘要，导出前需要按 id 从服务端取回完整快照。 */
     const exportProject = async () => {
