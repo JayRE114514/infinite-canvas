@@ -129,6 +129,33 @@ const NODE_STATUS_IDLE = "idle" as const;
 const NODE_STATUS_LOADING = "loading" as const;
 const NODE_STATUS_SUCCESS = "success" as const;
 const NODE_STATUS_ERROR = "error" as const;
+const CANVAS_HYDRATION_TIMEOUT_MS = 5_000;
+
+function hydrateWithFallback<T>(promise: Promise<T>, fallback: T): Promise<T> {
+    return new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            resolve(fallback);
+        }, CANVAS_HYDRATION_TIMEOUT_MS);
+        promise.then(
+            (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve(value);
+            },
+            () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve(fallback);
+            },
+        );
+    });
+}
+
 export default function CanvasPage() {
     const [mounted, setMounted] = useState(false);
 
@@ -206,7 +233,9 @@ function InfiniteCanvasPage() {
     const scope = useCanvasStore((state) => state.scope);
     const loadProjectsForExport = useCanvasStore((state) => state.loadProjectsForExport);
     const resolveConflictWithServer = useCanvasStore((state) => state.resolveConflictWithServer);
-    const currentProject = useCanvasStore((state) => (state.active?.project.id === projectId ? state.active.project : undefined));
+    const currentProject = useCanvasStore((state) =>
+        state.active?.project.id === projectId && state.scope && state.active.scope.userId === state.scope.userId && state.active.scope.workspaceId === state.scope.workspaceId ? state.active.project : undefined,
+    );
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [connections, setConnections] = useState<CanvasConnection[]>([]);
@@ -349,8 +378,12 @@ function InfiniteCanvasPage() {
      * isCancelled 用于在切换画布或切换作用域后丢弃迟到的结果。
      */
     const applyProjectToCanvas = useCallback(async (project: CanvasProject, isCancelled: () => boolean) => {
-        const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
-        const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
+        const serverNodes = resetInterruptedGeneration(project.nodes);
+        const serverSessions = project.chatSessions || [];
+        const [restoredNodes, restoredSessions] = await Promise.all([
+            hydrateWithFallback(hydrateCanvasImages(serverNodes), serverNodes),
+            hydrateWithFallback(hydrateAssistantImages(serverSessions), serverSessions),
+        ]);
         if (isCancelled()) return;
         historyPausedRef.current = true;
         setNodes(restoredNodes);
@@ -410,10 +443,20 @@ function InfiniteCanvasPage() {
 
     /** 冲突后用户显式选择「重新载入服务端版本」：丢弃内存中的本地编辑，改用服务端最新快照重开。 */
     const reloadServerCopy = useCallback(async () => {
+        const requestedScope = scope;
         const project = await resolveConflictWithServer(projectId);
         if (!project) throw new Error("canvas_reload_failed");
-        await applyProjectToCanvas(project, () => false);
-    }, [applyProjectToCanvas, projectId, resolveConflictWithServer]);
+        await applyProjectToCanvas(project, () => {
+            const state = useCanvasStore.getState();
+            return (
+                state.active?.project.id !== projectId ||
+                !requestedScope ||
+                !state.scope ||
+                state.scope.userId !== requestedScope.userId ||
+                state.scope.workspaceId !== requestedScope.workspaceId
+            );
+        });
+    }, [applyProjectToCanvas, projectId, resolveConflictWithServer, scope]);
 
     useEffect(() => {
         if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;
@@ -477,7 +520,7 @@ function InfiniteCanvasPage() {
     }, [dialogNodeId]);
 
     const flushProjectChanges = useCallback(() => {
-        /** 视口自己还有一层 500ms 防抖，先把它并入已捕获候选，再整体提交。 */
+        /** 视口自己还有一层极短 UI 合并，先把它并入已捕获候选，再整体提交。 */
         if (viewportSaveTimerRef.current) {
             clearTimeout(viewportSaveTimerRef.current);
             viewportSaveTimerRef.current = null;
@@ -486,13 +529,18 @@ function InfiniteCanvasPage() {
         return flushProject(projectId);
     }, [flushProject, projectId, updateProject]);
 
-    /** 离开画布或页面隐藏时把仍在防抖窗口内的编辑立刻提交，避免最后一次改动丢失。 */
+    /** 离开或隐藏时仅发起 best-effort flush；浏览器不会保证 pagehide 后异步网络或 IndexedDB 一定完成。 */
     useEffect(() => {
         if (!projectLoaded) return;
         const flush = () => void flushProjectChanges();
+        const flushWhenHidden = () => {
+            if (document.visibilityState === "hidden") flush();
+        };
         window.addEventListener("pagehide", flush);
+        document.addEventListener("visibilitychange", flushWhenHidden);
         return () => {
             window.removeEventListener("pagehide", flush);
+            document.removeEventListener("visibilitychange", flushWhenHidden);
             flush();
         };
     }, [flushProjectChanges, projectLoaded]);
@@ -506,7 +554,7 @@ function InfiniteCanvasPage() {
             syncedViewportRef.current = null;
             updateProject(projectId, { viewport: viewportRef.current });
             viewportSaveTimerRef.current = null;
-        }, 500);
+        }, 75);
         return () => {
             if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
         };
@@ -3012,7 +3060,7 @@ function InfiniteCanvasPage() {
         [configInputsById, confirmStopGeneration, handleConfigNodeChange, handleGenerateNode, runningNodeId],
     );
 
-    if (!projectLoaded) return <CanvasRefreshShell />;
+    if (!projectLoaded || !currentProject) return <CanvasRefreshShell />;
 
     return (
         <main className="flex h-full min-h-0 overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>

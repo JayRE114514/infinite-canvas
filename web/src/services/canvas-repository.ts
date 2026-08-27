@@ -10,9 +10,10 @@ import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
  * 便于在没有 React 环境时单独调用，也避免 store 与网络层互相依赖。
  */
 export const REVISION_CONFLICT_CODE = "revision_conflict";
+const CANVAS_SAVE_TIMEOUT_MS = 20_000;
 
 export function isRevisionConflictError(error: unknown) {
-    return error instanceof PlatformApiError && (error.code === REVISION_CONFLICT_CODE || error.status === 409);
+    return error instanceof PlatformApiError && error.code === REVISION_CONFLICT_CODE;
 }
 
 export type CanvasLoadResult = { project: CanvasProject; revision: number };
@@ -39,7 +40,13 @@ export async function saveCanvasProject(
     canvasId: string,
     input: { baseRevision: number; title?: string; snapshot: CanvasSnapshot },
 ): Promise<CanvasLoadResult> {
-    return toResult(await saveCanvas(workspaceId, canvasId, input));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CANVAS_SAVE_TIMEOUT_MS);
+    try {
+        return toResult(await saveCanvas(workspaceId, canvasId, input, controller.signal));
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 export async function deleteCanvasProject(workspaceId: string, canvasId: string) {

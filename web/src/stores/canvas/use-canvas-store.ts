@@ -1,7 +1,10 @@
 import { create } from "zustand";
 
+import type { CanvasSnapshot } from "@infinite-canvas/contracts";
+
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { clampCanvasTitle, draftToProject, projectToImportBody, projectToSnapshot, projectToSummary, snapshotToProjectContent, type CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
+import { platformErrorTranslationKey } from "@/services/api/platform-client";
 import {
     createCanvasProject,
     deleteCanvasProject,
@@ -11,9 +14,19 @@ import {
     loadCanvasProject,
     saveCanvasProject,
 } from "@/services/canvas-repository";
-import { canvasDraftKey, readCanvasDraft, readCanvasDraftByKey, removeCanvasDraftsOfCanvas, writeCanvasDraft } from "@/services/canvas-drafts";
-import { platformErrorTranslationKey } from "@/services/api/platform-client";
-import type { CanvasSnapshot } from "@infinite-canvas/contracts";
+import {
+    canvasDraftKey,
+    readCanvasConflictMarker,
+    readCanvasDraft,
+    readCanvasDraftByKey,
+    removeCanvasConflictMarker,
+    removeCanvasDraftByKey,
+    removeCanvasDraftsOfCanvas,
+    writeCanvasConflictMarker,
+    writeCanvasDraft,
+    type CanvasConflictMarker,
+    type CanvasDraftRecord,
+} from "@/services/canvas-drafts";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
 export type CanvasProject = {
@@ -31,36 +44,24 @@ export type CanvasProject = {
 };
 
 export type CanvasScope = { userId: string; workspaceId: string };
-
 export type CanvasSaveState = "idle" | "saving" | "saved" | "conflict" | "error";
 
-/** baseRevision 是本地草稿所基于的版本；服务端已经前进到别的版本，因此必须由用户显式选择处理方式。 */
+/** 内存冲突只描述当前 active；跨画布、跨刷新事实由 localforage 中每画布独立的 marker 表达。 */
 export type CanvasConflictInfo = { canvasId: string; draftKey: string; baseRevision: number };
-
-/** 批量删除是部分成功语义：成功的已从列表移除，失败的仍在列表里，调用方据此决定提示与选中态。 */
 export type CanvasDeleteResult = { deleted: string[]; failed: string[] };
+
+type SavePayload = { title: string; snapshot: CanvasSnapshot };
+type SaveRevision = { current: number; blocked: boolean; latest: SavePayload | null };
 
 type ActiveCanvas = {
     project: CanvasProject;
     revision: number;
     scope: CanvasScope;
+    generation: number;
     saveRevision: SaveRevision;
 };
 
-type SavePayload = { title: string; snapshot: CanvasSnapshot };
-
-/**
- * 同一次画布打开期间的候选共享这条 revision 链。
- * 前一个候选成功后只推进自己的链，后续编辑便以新 revision 保存；重新打开或切换 scope 会创建新链，
- * 因而旧请求既不能给新画布 rebase，也不能把冲突状态串进新的编辑会话。
- */
-type SaveRevision = { current: number; blocked: boolean; latest: SavePayload | null };
-
-/**
- * 保存候选在「安排保存」的那一刻就把要写出去的内容全部固定下来。
- * 如果等到防抖计时器真正触发时才去读 active，用户在这期间新建或切换画布，
- * 就会把上一个画布的最后一次编辑丢掉，或者错写进另一个画布。
- */
+/** 候选在编辑发生时固定内容与 lineage，不能在防抖结束后再读取可变 active。 */
 type SaveCandidate = {
     canvasId: string;
     scope: CanvasScope;
@@ -70,7 +71,6 @@ type SaveCandidate = {
 };
 
 type CanvasStore = {
-    /** scope 为 null 表示尚未登录或尚未选定 Workspace，此时不允许持有任何服务端数据。 */
     scope: CanvasScope | null;
     scopeToken: number;
     listStatus: "idle" | "loading" | "ready" | "error";
@@ -85,26 +85,32 @@ type CanvasStore = {
     importProject: (project: Partial<CanvasProject>, fallbackTitle: string) => Promise<string>;
     openProject: (id: string) => Promise<CanvasProject | null>;
     renameProject: (id: string, title: string) => Promise<void>;
-    /** 逐个删除：分别返回成功与失败的 id，成功的立即从列表移除，失败的保留，调用方据此提示。 */
     deleteProjects: (ids: string[]) => Promise<CanvasDeleteResult>;
     updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport">>) => void;
     flushProject: (id: string) => Promise<void>;
-    /** 导出需要完整快照，列表只有摘要，因此按需从服务端小批量拉取。 */
     loadProjectsForExport: (ids: string[]) => Promise<CanvasProject[]>;
-    /** 冲突时导出本地草稿用：只读取冲突那一条草稿，不改动任何状态。 */
     readConflictDraft: () => Promise<CanvasProject | null>;
     resolveConflictWithServer: (id: string) => Promise<CanvasProject | null>;
     clearActive: () => void;
 };
 
-/**
- * 自动保存计时器与在途请求都放在模块作用域：它们是副作用句柄，不属于渲染状态。
- * scopeToken 在每次 setScope 时自增，任何异步回调写回 state 前都必须比对 token，
- * 保证上一个账号或上一个 Workspace 的迟到响应无法把数据写进当前 scope。
- */
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingSave: SaveCandidate | null = null;
 let saveChain: Promise<void> = Promise.resolve();
+let activeGeneration = 0;
+
+/** 每画布本地操作严格串行，避免较早的异步写在较新的写之后完成并覆盖新草稿。 */
+const draftChains = new Map<string, Promise<void>>();
+const AUTOSAVE_DEBOUNCE_MS = 400;
+const LOCAL_READ_TIMEOUT_MS = 2_000;
+const LOCAL_SAVE_HANDOFF_MS = 2_000;
+const EXPORT_BATCH_SIZE = 3;
+
+export const CANVAS_SCOPE_CHANGED_ERROR = "canvas_scope_changed";
+
+export function isScopeChangedError(error: unknown) {
+    return error instanceof Error && error.message === CANVAS_SCOPE_CHANGED_ERROR;
+}
 
 function clearSaveTimer() {
     if (saveTimer) clearTimeout(saveTimer);
@@ -112,11 +118,6 @@ function clearSaveTimer() {
     pendingSave = null;
 }
 
-/**
- * 保存必须串行，但任何一次失败都不能污染后续链路，否则队列会永久停摆。
- * 失败结果也在这里收口：链上永远保存一个已 resolve 的 Promise，
- * 既保证下一次保存照常执行，也避免调用方 void 调用时冒出未处理的 rejection。
- */
 function enqueueSave(run: () => Promise<void>) {
     saveChain = saveChain.then(run, run).catch(() => undefined);
     return saveChain;
@@ -126,93 +127,145 @@ function sameScope(a: CanvasScope | null, b: CanvasScope | null) {
     return a?.userId === b?.userId && a?.workspaceId === b?.workspaceId;
 }
 
-function activeCanvas(project: CanvasProject, revision: number, scope: CanvasScope): ActiveCanvas {
-    return { project, revision, scope, saveRevision: { current: revision, blocked: false, latest: null } };
+function localCanvasKey(scope: CanvasScope, canvasId: string) {
+    return [encodeURIComponent(scope.userId), encodeURIComponent(scope.workspaceId), encodeURIComponent(canvasId)].join(":");
 }
 
-const AUTOSAVE_DEBOUNCE_MS = 400;
-/** 导出逐个拉取服务端快照，限制并发避免一次选中很多画布时打满连接。 */
-const EXPORT_BATCH_SIZE = 3;
-/** scope 已切换时新建/导入的结果属于旧账号或旧 Workspace，调用方据此跳过导航与报错提示。 */
-export const CANVAS_SCOPE_CHANGED_ERROR = "canvas_scope_changed";
+function enqueueLocalOperation(scope: CanvasScope, canvasId: string, operation: () => Promise<void>) {
+    const key = localCanvasKey(scope, canvasId);
+    const previous = draftChains.get(key) ?? Promise.resolve();
+    const next = previous.then(operation, operation).catch(() => undefined);
+    draftChains.set(key, next);
+    void next.then(() => {
+        if (draftChains.get(key) === next) draftChains.delete(key);
+    });
+    return next;
+}
 
-export function isScopeChangedError(error: unknown) {
-    return error instanceof Error && error.message === CANVAS_SCOPE_CHANGED_ERROR;
+type BoundedResult<T> = { status: "ok"; value: T } | { status: "failed" };
+
+function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<BoundedResult<T>> {
+    return new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            resolve({ status: "failed" });
+        }, timeoutMs);
+        promise.then(
+            (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve({ status: "ok", value });
+            },
+            () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve({ status: "failed" });
+            },
+        );
+    });
+}
+
+function activeCanvas(project: CanvasProject, revision: number, scope: CanvasScope, generation: number, blocked = false): ActiveCanvas {
+    return { project, revision, scope, generation, saveRevision: { current: revision, blocked, latest: null } };
+}
+
+function toDraftRecord(candidate: SaveCandidate, baseRevision: number, payload: SavePayload): CanvasDraftRecord {
+    return {
+        userId: candidate.scope.userId,
+        workspaceId: candidate.scope.workspaceId,
+        canvasId: candidate.canvasId,
+        baseRevision,
+        title: payload.title,
+        snapshot: payload.snapshot,
+        savedAt: new Date().toISOString(),
+    };
+}
+
+function toConflictMarker(candidate: SaveCandidate, baseRevision: number): CanvasConflictMarker {
+    return {
+        userId: candidate.scope.userId,
+        workspaceId: candidate.scope.workspaceId,
+        canvasId: candidate.canvasId,
+        baseRevision,
+        draftKey: canvasDraftKey({ ...candidate.scope, canvasId: candidate.canvasId, baseRevision }),
+    };
 }
 
 export const useCanvasStore = create<CanvasStore>()((set, get) => {
-    /** 统一的 scope 守卫：token 变化或 scope 已切换时，异步结果一律丢弃。 */
-    const isStale = (token: number, scope: CanvasScope | null) => get().scopeToken !== token || !sameScope(get().scope, scope);
+    const isStaleScope = (token: number, scope: CanvasScope | null) => get().scopeToken !== token || !sameScope(get().scope, scope);
+    const isCurrentOperation = (token: number, scope: CanvasScope, generation: number) => !isStaleScope(token, scope) && activeGeneration === generation;
 
-    /** 草稿是尽力而为的本地兜底：写失败不能阻断网络保存，也不能让保存状态卡住。 */
-    const persistDraft = async (candidate: SaveCandidate, baseRevision: number, payload = candidate.payload) => {
-        try {
-            await writeCanvasDraft({
-                userId: candidate.scope.userId,
-                workspaceId: candidate.scope.workspaceId,
-                canvasId: candidate.canvasId,
-                baseRevision,
-                title: payload.title,
-                snapshot: payload.snapshot,
-                savedAt: new Date().toISOString(),
-            });
-        } catch {
-            /** 本地存储可能满或被禁用，此时只丢失离线兜底能力，服务端保存照常进行。 */
-        }
+    const queueDraftWrite = (candidate: SaveCandidate, baseRevision: number, payload: SavePayload) =>
+        enqueueLocalOperation(candidate.scope, candidate.canvasId, () => writeCanvasDraft(toDraftRecord(candidate, baseRevision, payload)));
+
+    const queueConflictWrite = (candidate: SaveCandidate, baseRevision: number, payload: SavePayload, prune = false) => {
+        const marker = toConflictMarker(candidate, baseRevision);
+        return enqueueLocalOperation(candidate.scope, candidate.canvasId, async () => {
+            await writeCanvasDraft(toDraftRecord(candidate, baseRevision, payload));
+            await writeCanvasConflictMarker(marker);
+            if (prune) await removeCanvasDraftsOfCanvas({ ...candidate.scope, canvasId: candidate.canvasId }, marker.draftKey);
+        });
     };
 
-    const dropDrafts = async (scope: CanvasScope, canvasId: string, keepKey?: string) => {
-        try {
-            await removeCanvasDraftsOfCanvas({ userId: scope.userId, workspaceId: scope.workspaceId, canvasId }, keepKey);
-        } catch {
-            /** 清理草稿失败只会留下一条孤儿草稿，不影响服务端权威内容。 */
-        }
-    };
+    const queueDraftHandoff = (candidate: SaveCandidate, oldDraftKey: string, newRevision: number, latest: SavePayload | null) =>
+        enqueueLocalOperation(candidate.scope, candidate.canvasId, async () => {
+            const nextDraft = latest ? toDraftRecord(candidate, newRevision, latest) : null;
+            if (nextDraft) await writeCanvasDraft(nextDraft);
+            if (!nextDraft || canvasDraftKey(nextDraft) !== oldDraftKey) await removeCanvasDraftByKey(oldDraftKey);
+        });
 
-    /** 只按候选内容保存：期间 active 可能已经切到别的画布，但这份内容必须原样落到它自己的画布上。 */
+    const queueCanvasCleanup = (scope: CanvasScope, canvasId: string) =>
+        enqueueLocalOperation(scope, canvasId, async () => {
+            await Promise.allSettled([removeCanvasDraftsOfCanvas({ ...scope, canvasId }), removeCanvasConflictMarker({ ...scope, canvasId })]);
+        });
+
+    const queueMarkerCleanup = (scope: CanvasScope, canvasId: string) => enqueueLocalOperation(scope, canvasId, () => removeCanvasConflictMarker({ ...scope, canvasId }));
+
+    /** 保存网络不等待普通草稿写；成功后的 revision handoff 只短暂等待，localforage 永不返回也不会冻结全局保存链。 */
     const runSave = async (candidate: SaveCandidate) => {
         const { canvasId, scope, scopeToken: token, saveRevision, payload } = candidate;
         if (saveRevision.blocked) return;
         const baseRevision = saveRevision.current;
-        const draftKey = canvasDraftKey({ userId: scope.userId, workspaceId: scope.workspaceId, canvasId, baseRevision });
+        const oldDraftKey = canvasDraftKey({ ...scope, canvasId, baseRevision });
         const isCurrent = () => {
             const active = get().active;
-            return !isStale(token, scope) && active?.project.id === canvasId && sameScope(active.scope, scope) && active.saveRevision === saveRevision;
+            return !isStaleScope(token, scope) && active?.project.id === canvasId && sameScope(active.scope, scope) && active.saveRevision === saveRevision;
         };
         if (isCurrent()) set({ saveState: "saving" });
-        await persistDraft(candidate, baseRevision);
 
         try {
             const result = await saveCanvasProject(scope.workspaceId, canvasId, { baseRevision, title: payload.title, snapshot: payload.snapshot });
-            /** 先推进候选自己的链；即使期间已切 scope，排在它后面的旧 scope 编辑也必须使用这次服务端返回的 revision。 */
             saveRevision.current = result.revision;
+            const latest = saveRevision.latest === payload ? null : saveRevision.latest;
             if (saveRevision.latest === payload) saveRevision.latest = null;
-            await dropDrafts(scope, canvasId);
-            if (isStale(token, scope)) return;
+            const handoff = queueDraftHandoff(candidate, oldDraftKey, result.revision, latest);
+            await settleWithin(handoff, LOCAL_SAVE_HANDOFF_MS);
+            if (isStaleScope(token, scope)) return;
             const current = get().active;
-            /** revision 只从服务端响应推进；本地内容保持不变，避免服务端回包覆盖用户在保存期间的新编辑。 */
             set({
                 ...(current && isCurrent() ? { active: { ...current, revision: result.revision }, saveState: "saved" as CanvasSaveState } : {}),
                 summaries: get().summaries.map((item) => (item.id === canvasId ? { ...item, title: payload.title, revision: result.revision, updatedAt: result.project.updatedAt } : item)),
             });
         } catch (error) {
             if (isRevisionConflictError(error)) {
-                /** 冲突时以该 lineage 最新捕获的内容重写草稿，再阻断所有后续候选，绝不丢掉请求期间的新编辑。 */
                 const conflictPayload = saveRevision.latest ?? payload;
                 saveRevision.blocked = true;
+                saveRevision.latest = conflictPayload;
                 if (pendingSave?.saveRevision === saveRevision) clearSaveTimer();
-                await persistDraft(candidate, baseRevision, conflictPayload);
-                await dropDrafts(scope, canvasId, draftKey);
-                if (isStale(token, scope)) return;
-                set({ conflict: { canvasId, draftKey, baseRevision }, ...(isCurrent() ? { saveState: "conflict" as CanvasSaveState } : {}) });
+                const marker = toConflictMarker(candidate, baseRevision);
+                await settleWithin(queueConflictWrite(candidate, baseRevision, conflictPayload, true), LOCAL_SAVE_HANDOFF_MS);
+                if (!isCurrent()) return;
+                set({ conflict: { canvasId, draftKey: marker.draftKey, baseRevision }, saveState: "conflict" });
                 return;
             }
-            if (isStale(token, scope)) return;
             if (isCurrent()) set({ saveState: "error" });
         }
     };
 
-    /** 把已捕获的待保存内容立刻推进保存队列，返回值用于卸载/pagehide 时等待完成。 */
     const flushPendingSave = (canvasId?: string) => {
         const candidate = pendingSave;
         if (!candidate || (canvasId && candidate.canvasId !== canvasId)) return saveChain;
@@ -222,21 +275,20 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
         return enqueueSave(() => runSave(candidate));
     };
 
-    /** 安排保存时就地捕获快照与 revision，之后无论用户怎么切换画布，这份内容都不会跑到别的画布上。 */
+    /** 编辑发生时立即把固定 payload 排进本地串行写队列；400ms 只用于合并服务端请求。 */
     const scheduleSave = (canvasId: string) => {
         const scope = get().scope;
         const active = get().active;
-        if (!scope || !active || active.project.id !== canvasId || active.saveRevision.blocked || get().conflict?.canvasId === canvasId) return;
+        if (!scope || !active || active.project.id !== canvasId || !sameScope(active.scope, scope)) return;
         const payload = { title: active.project.title, snapshot: projectToSnapshot(active.project) };
-        const candidate: SaveCandidate = {
-            canvasId,
-            scope,
-            scopeToken: get().scopeToken,
-            saveRevision: active.saveRevision,
-            payload,
-        };
+        const candidate: SaveCandidate = { canvasId, scope, scopeToken: get().scopeToken, saveRevision: active.saveRevision, payload };
         active.saveRevision.latest = payload;
-        /** 同一画布的待保存内容直接替换成最新的；换成别的画布时先把上一份提交出去，避免丢编辑。 */
+        if (active.saveRevision.blocked) {
+            const conflict = get().conflict;
+            if (conflict?.canvasId === canvasId) void queueConflictWrite(candidate, conflict.baseRevision, payload);
+            return;
+        }
+        void queueDraftWrite(candidate, active.saveRevision.current, payload);
         if (pendingSave && pendingSave.canvasId !== canvasId) flushPendingSave();
         pendingSave = candidate;
         if (saveTimer) clearTimeout(saveTimer);
@@ -258,18 +310,9 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
 
         setScope: (scope) => {
             if (sameScope(get().scope, scope) && get().scopeToken > 0) return;
-            /** 切 scope 前先把已捕获的编辑提交出去，它带着旧 scope，不会写进新 scope。 */
+            activeGeneration += 1;
             flushPendingSave();
-            set({
-                scope,
-                scopeToken: get().scopeToken + 1,
-                summaries: [],
-                active: null,
-                conflict: null,
-                saveState: "idle",
-                listStatus: "idle",
-                listError: null,
-            });
+            set({ scope, scopeToken: get().scopeToken + 1, summaries: [], active: null, conflict: null, saveState: "idle", listStatus: "idle", listError: null });
         },
 
         refreshList: async () => {
@@ -279,11 +322,10 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             set({ listStatus: "loading", listError: null });
             try {
                 const summaries = await listCanvasSummaries(scope.workspaceId);
-                if (isStale(token, scope)) return;
+                if (isStaleScope(token, scope)) return;
                 set({ summaries, listStatus: "ready" });
             } catch (error) {
-                if (isStale(token, scope)) return;
-                /** 只保留稳定的本地化 key：服务端原文可能包含实现细节，不适合写入界面或 Agent 状态。 */
+                if (isStaleScope(token, scope)) return;
                 set({ listStatus: "error", listError: platformErrorTranslationKey(error, "canvas.listFailed"), summaries: [] });
             }
         },
@@ -292,13 +334,12 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             const token = get().scopeToken;
             const scope = get().scope;
             if (!scope) throw new Error("canvas_scope_missing");
-            /** 新建前先把上一个画布已捕获的编辑提交出去，否则「改完 A 立刻新建 B」会丢掉 A 的最后一次改动。 */
+            const generation = ++activeGeneration;
             await flushPendingSave();
-            if (isStale(token, scope)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
+            if (!isCurrentOperation(token, scope, generation)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
             const { project, revision } = await createCanvasProject(scope.workspaceId, clampCanvasTitle(title));
-            /** scope 已经切换时这条结果属于旧账号/旧 Workspace，既不能进列表也不能让调用方拿去导航。 */
-            if (isStale(token, scope)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
-            set({ active: activeCanvas(project, revision, scope), saveState: "idle", summaries: [projectToSummary(project, revision), ...get().summaries] });
+            if (!isCurrentOperation(token, scope, generation)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
+            set({ active: activeCanvas(project, revision, scope, generation), conflict: null, saveState: "idle", summaries: [projectToSummary(project, revision), ...get().summaries] });
             return project.id;
         },
 
@@ -306,9 +347,8 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             const token = get().scopeToken;
             const scope = get().scope;
             if (!scope) throw new Error("canvas_scope_missing");
-            const body = projectToImportBody(source, fallbackTitle);
-            const { project, revision } = await importCanvasProject(scope.workspaceId, body);
-            if (isStale(token, scope)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
+            const { project, revision } = await importCanvasProject(scope.workspaceId, projectToImportBody(source, fallbackTitle));
+            if (isStaleScope(token, scope)) throw new Error(CANVAS_SCOPE_CHANGED_ERROR);
             set({ summaries: [projectToSummary(project, revision), ...get().summaries] });
             return project.id;
         },
@@ -317,22 +357,48 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             const token = get().scopeToken;
             const scope = get().scope;
             if (!scope) return null;
-            /** 打开新画布前先提交上一个画布已捕获的编辑，再清空计时器。 */
+            const generation = ++activeGeneration;
             await flushPendingSave();
-            if (isStale(token, scope)) return null;
-            const { project, revision } = await loadCanvasProject(scope.workspaceId, id);
-            if (isStale(token, scope)) return null;
-            const conflict = get().conflict?.canvasId === id ? get().conflict : null;
-            /** 冲突草稿必须按记录下来的旧 revision 精确读取；普通恢复只接受当前服务端 revision 的草稿。 */
-            const draft = conflict
-                ? await readCanvasDraftByKey(conflict.draftKey)
-                : await readCanvasDraft({ userId: scope.userId, workspaceId: scope.workspaceId, canvasId: id, baseRevision: revision });
-            if (isStale(token, scope)) return null;
-            /** 草稿只覆盖画布语义字段，id、时间戳与 revision 仍以服务端为准。 */
-            const restored = draft ? { ...project, ...snapshotToProjectContent(draft.snapshot), title: draft.title || project.title } : project;
-            const active = activeCanvas(restored, revision, scope);
-            if (conflict) active.saveRevision.blocked = true;
-            set({ active, saveState: conflict ? "conflict" : "idle" });
+            if (!isCurrentOperation(token, scope, generation)) return null;
+            const result = await loadCanvasProject(scope.workspaceId, id);
+            if (!isCurrentOperation(token, scope, generation) || result.project.id !== id) return null;
+
+            const localScope = { ...scope, canvasId: id };
+            const markerRead = await settleWithin(readCanvasConflictMarker(localScope), LOCAL_READ_TIMEOUT_MS);
+            if (!isCurrentOperation(token, scope, generation)) return null;
+            let draft: CanvasDraftRecord | null = null;
+            let conflict: CanvasConflictInfo | null = null;
+
+            if (markerRead.status === "ok") {
+                const marker = markerRead.value.marker;
+                if (markerRead.value.invalid) {
+                    void queueMarkerCleanup(scope, id);
+                } else if (marker) {
+                    const draftRead = await settleWithin(readCanvasDraftByKey(marker.draftKey), LOCAL_READ_TIMEOUT_MS);
+                    if (!isCurrentOperation(token, scope, generation)) return null;
+                    if (
+                        draftRead.status === "ok" &&
+                        draftRead.value &&
+                        draftRead.value.userId === scope.userId &&
+                        draftRead.value.workspaceId === scope.workspaceId &&
+                        draftRead.value.canvasId === id &&
+                        draftRead.value.baseRevision === marker.baseRevision
+                    ) {
+                        draft = draftRead.value;
+                        conflict = { canvasId: id, draftKey: marker.draftKey, baseRevision: marker.baseRevision };
+                    } else if (draftRead.status === "ok") {
+                        void queueMarkerCleanup(scope, id);
+                    }
+                } else {
+                    const draftRead = await settleWithin(readCanvasDraft({ ...localScope, baseRevision: result.revision }), LOCAL_READ_TIMEOUT_MS);
+                    if (!isCurrentOperation(token, scope, generation)) return null;
+                    if (draftRead.status === "ok") draft = draftRead.value;
+                }
+            }
+
+            const restored = draft ? { ...result.project, ...snapshotToProjectContent(draft.snapshot), title: draft.title || result.project.title } : result.project;
+            if (!isCurrentOperation(token, scope, generation) || restored.id !== id) return null;
+            set({ active: activeCanvas(restored, result.revision, scope, generation, Boolean(conflict)), conflict, saveState: conflict ? "conflict" : "idle" });
             return restored;
         },
 
@@ -343,43 +409,39 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             const scope = get().scope;
             if (!scope) return;
             const active = get().active;
-            /** 当前画布本地已有权威快照，改名走同一条防抖保存链路，避免与正在编辑的内容互相覆盖。 */
-            if (active && active.project.id === id) {
-                if (get().conflict?.canvasId === id) return;
+            if (active && active.project.id === id && sameScope(active.scope, scope)) {
                 set({ active: { ...active, project: { ...active.project, title: trimmed } } });
                 scheduleSave(id);
                 return;
             }
-            /** 列表页改名时本地没有快照，先按服务端 revision 读取，再用同一 revision 条件写回，冲突直接抛给调用方提示。 */
             const { project, revision } = await loadCanvasProject(scope.workspaceId, id);
-            if (isStale(token, scope)) return;
+            if (isStaleScope(token, scope) || project.id !== id) return;
             const result = await saveCanvasProject(scope.workspaceId, id, { baseRevision: revision, title: trimmed, snapshot: projectToSnapshot(project) });
-            if (isStale(token, scope)) return;
-            set({
-                summaries: get().summaries.map((item) => (item.id === id ? { ...item, title: trimmed, revision: result.revision, updatedAt: result.project.updatedAt } : item)),
-            });
+            if (isStaleScope(token, scope) || result.project.id !== id) return;
+            set({ summaries: get().summaries.map((item) => (item.id === id ? { ...item, title: trimmed, revision: result.revision, updatedAt: result.project.updatedAt } : item)) });
         },
 
         deleteProjects: async (ids) => {
             const token = get().scopeToken;
             const scope = get().scope;
             if (!scope || !ids.length) return { deleted: [], failed: [] };
-            /** 先完成已捕获的编辑；删除若失败，画布仍保留且最后一次编辑也不能被提前丢弃。 */
             await flushPendingSave();
-            if (isStale(token, scope)) return { deleted: [], failed: [] };
-            /** 逐个判定成败：一个失败不能让已经删掉的画布继续留在列表里。 */
+            if (isStaleScope(token, scope)) return { deleted: [], failed: [] };
             const outcomes = await Promise.allSettled(ids.map((id) => deleteCanvasProject(scope.workspaceId, id)));
             const deleted = ids.filter((_id, index) => outcomes[index].status === "fulfilled");
             const failed = ids.filter((id) => !deleted.includes(id));
-            for (const id of deleted) await dropDrafts(scope, id);
-            if (isStale(token, scope)) return { deleted: [], failed: [] };
+            deleted.forEach((id) => void queueCanvasCleanup(scope, id));
+            if (isStaleScope(token, scope)) return { deleted: [], failed: [] };
             if (deleted.length) {
                 const active = get().active;
                 const conflict = get().conflict;
+                const deletesActive = Boolean(active && deleted.includes(active.project.id));
+                if (deletesActive) activeGeneration += 1;
                 set({
                     summaries: get().summaries.filter((item) => !deleted.includes(item.id)),
-                    active: active && deleted.includes(active.project.id) ? null : active,
+                    active: deletesActive ? null : active,
                     conflict: conflict && deleted.includes(conflict.canvasId) ? null : conflict,
+                    ...(deletesActive ? { saveState: "idle" as CanvasSaveState } : {}),
                 });
             }
             return { deleted, failed };
@@ -387,16 +449,12 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
 
         updateProject: (id, patch) => {
             const active = get().active;
-            if (!active || active.project.id !== id) return;
+            if (!active || active.project.id !== id || !sameScope(active.scope, get().scope)) return;
             set({ active: { ...active, project: { ...active.project, ...patch } } });
             scheduleSave(id);
         },
 
         flushProject: async (id) => {
-            /**
-             * 只提交已捕获的内容：待保存内容属于哪个画布，就保存到那个画布。
-             * id 只用于表达调用方关心的画布，此时 active 可能已经是别的画布，绝不能拿它的内容顶替。
-             */
             await flushPendingSave(id);
         },
 
@@ -406,17 +464,15 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             if (!scope || !ids.length) return [];
             const active = get().active;
             const results: CanvasProject[] = [];
-            /** 小批次串行拉取：任一失败直接抛给调用方提示，不返回空数组假装「没有可导出内容」。 */
             for (let index = 0; index < ids.length; index += EXPORT_BATCH_SIZE) {
                 const batch = await Promise.all(
                     ids.slice(index, index + EXPORT_BATCH_SIZE).map(async (id) => {
-                        /** 当前画布的内存内容比服务端更新（可能还在防抖窗口内），导出用内存版本更符合用户看到的画面。 */
-                        if (active && active.project.id === id) return active.project;
+                        if (active && active.project.id === id && sameScope(active.scope, scope)) return active.project;
                         const { project } = await loadCanvasProject(scope.workspaceId, id);
                         return project;
                     }),
                 );
-                if (isStale(token, scope)) return [];
+                if (isStaleScope(token, scope)) return [];
                 results.push(...batch);
             }
             return results;
@@ -426,29 +482,30 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
             const token = get().scopeToken;
             const scope = get().scope;
             const conflict = get().conflict;
+            const active = get().active;
             if (!scope || !conflict) return null;
-            const draft = await readCanvasDraftByKey(conflict.draftKey);
-            /** await 期间可能已切换账号/Workspace 或换了冲突画布，此时不能把旧 scope 的草稿导出去。 */
-            if (isStale(token, scope) || get().conflict?.draftKey !== conflict.draftKey) return null;
-            return draft ? draftToProject(draft) : null;
+            if (active?.project.id === conflict.canvasId && active.saveRevision.blocked && sameScope(active.scope, scope)) return active.project;
+            const draftRead = await settleWithin(readCanvasDraftByKey(conflict.draftKey), LOCAL_READ_TIMEOUT_MS);
+            if (isStaleScope(token, scope) || get().conflict?.draftKey !== conflict.draftKey || draftRead.status !== "ok") return null;
+            return draftRead.value ? draftToProject(draftRead.value) : null;
         },
 
         resolveConflictWithServer: async (id) => {
             const token = get().scopeToken;
             const scope = get().scope;
             if (!scope) return null;
-            const { project, revision } = await loadCanvasProject(scope.workspaceId, id);
-            if (isStale(token, scope)) return null;
-            await removeCanvasDraftsOfCanvas({ userId: scope.userId, workspaceId: scope.workspaceId, canvasId: id });
-            if (isStale(token, scope)) return null;
-            set({ active: activeCanvas(project, revision, scope), conflict: null, saveState: "idle" });
-            return project;
+            const generation = ++activeGeneration;
+            const result = await loadCanvasProject(scope.workspaceId, id);
+            if (!isCurrentOperation(token, scope, generation) || result.project.id !== id) return null;
+            set({ active: activeCanvas(result.project, result.revision, scope, generation), conflict: null, saveState: "idle" });
+            void queueCanvasCleanup(scope, id);
+            return result.project;
         },
 
         clearActive: () => {
-            /** 先把已捕获的编辑提交出去，它带着自己的画布 id 与 scope，不会写错目标。 */
+            activeGeneration += 1;
             flushPendingSave();
-            set({ active: null, saveState: "idle" });
+            set({ active: null, conflict: null, saveState: "idle" });
         },
     };
 });

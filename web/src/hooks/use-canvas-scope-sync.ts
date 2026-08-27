@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useLayoutEffect } from "react";
 
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
 
@@ -13,7 +14,8 @@ export function useCanvasScopeSync() {
     const workspaceId = useWorkspaceStore((state) => state.activeWorkspaceId ?? "");
     const setScope = useCanvasStore((state) => state.setScope);
 
-    useEffect(() => {
+    useLayoutEffect(() => {
+        useCanvasUiStore.getState().clearScopeState();
         setScope(userId && workspaceId ? { userId, workspaceId } : null);
     }, [setScope, userId, workspaceId]);
 }

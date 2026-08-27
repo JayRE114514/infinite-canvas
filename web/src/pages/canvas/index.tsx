@@ -21,7 +21,7 @@ export default function CanvasPage() {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const inputRef = useRef<HTMLInputElement>(null);
-    const autoOpenRef = useRef(false);
+    const autoOpenRef = useRef("");
     const scope = useCanvasStore((state) => state.scope);
     const listStatus = useCanvasStore((state) => state.listStatus);
     const listError = useCanvasStore((state) => state.listError);
@@ -37,6 +37,7 @@ export default function CanvasPage() {
     const agentMode = mode === "new" || mode === "recent" || mode === "choose";
     const agentQuery = agentMode ? `?${searchParams.toString()}` : "";
     const ready = Boolean(scope) && listStatus === "ready";
+    const autoOpenScopeKey = scope ? JSON.stringify([scope.userId, scope.workspaceId]) : "";
     const enterProject = (id: string) => {
         const agentHash = hasAgentUrlBootstrap(window.location.hash) ? window.location.hash : "";
         navigate(`/canvas/${id}${agentQuery}${agentHash}`, { replace: Boolean(agentHash) });
@@ -45,10 +46,11 @@ export default function CanvasPage() {
     const createAndEnter = async () => {
         try {
             enterProject(await createProject(t("canvas.defaultTitle", { count: summaries.length + 1 })));
+            return true;
         } catch (error) {
             /** 账号或 Workspace 已经切换时这条结果属于旧作用域，既不导航也不提示失败。 */
-            if (isScopeChangedError(error)) return;
-            message.error(t("canvas.createFailed"));
+            if (!isScopeChangedError(error)) message.error(t("canvas.createFailed"));
+            return false;
         }
     };
     const exportProjects = async (ids: string[]) => {
@@ -107,17 +109,27 @@ export default function CanvasPage() {
 
     /** Agent 的 mode=new / mode=recent 保持原语义，只是改为等服务端列表就绪后再决定打开哪个画布。 */
     useEffect(() => {
-        if (!ready || autoOpenRef.current || (mode !== "new" && mode !== "recent")) return;
-        autoOpenRef.current = true;
+        if (!autoOpenScopeKey) {
+            autoOpenRef.current = "";
+            return;
+        }
+        if (!ready || autoOpenRef.current === autoOpenScopeKey || (mode !== "new" && mode !== "recent")) return;
+        autoOpenRef.current = autoOpenScopeKey;
         void (async () => {
             const recentId = mode === "recent" ? summaries[0]?.id : undefined;
             if (recentId) {
                 enterProject(recentId);
                 return;
             }
-            await createAndEnter();
+            const opened = await createAndEnter();
+            const currentScope = useCanvasStore.getState().scope;
+            const currentScopeKey = currentScope ? JSON.stringify([currentScope.userId, currentScope.workspaceId]) : "";
+            if (!opened && currentScopeKey === autoOpenScopeKey && autoOpenRef.current === autoOpenScopeKey && window.location.pathname === "/canvas") {
+                autoOpenRef.current = "";
+                navigate("/canvas", { replace: true });
+            }
         })();
-    }, [mode, ready, summaries]);
+    }, [autoOpenScopeKey, mode, ready, summaries]);
 
     if (mode === "new" || mode === "recent") return <main className="flex h-full items-center justify-center bg-background text-sm text-stone-500">{t("canvas.opening")}</main>;
 

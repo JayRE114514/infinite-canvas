@@ -33,8 +33,8 @@ export async function createCanvas(workspaceId: string, body: CreateCanvasBody):
     return response.canvas;
 }
 
-export async function saveCanvas(workspaceId: string, canvasId: string, body: SaveCanvasRequest): Promise<Canvas> {
-    const response = await platformRequest<CanvasResponse>(canvasPath(workspaceId, canvasId), { method: "PUT", body: JSON.stringify(body) });
+export async function saveCanvas(workspaceId: string, canvasId: string, body: SaveCanvasRequest, signal?: AbortSignal): Promise<Canvas> {
+    const response = await platformRequest<CanvasResponse>(canvasPath(workspaceId, canvasId), { method: "PUT", body: JSON.stringify(body), signal });
     return response.canvas;
 }
 
