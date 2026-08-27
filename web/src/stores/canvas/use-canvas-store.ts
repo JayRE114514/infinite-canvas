@@ -47,9 +47,11 @@ export const useCanvasStore = create<CanvasStore>()((set, get) => {
         sync: null,
 
         setScope: (scope) => {
-            const current = get().scope;
-            if ((current === null && scope === null) || sameCanvasScope(current, scope)) return;
+            /** 幂等判断交给 manager：它持有作用域令牌，首次的 null 也必须让它完成初始化，适配器不得替它拦下。 */
             canvasSyncManager.setScope(scope);
+            const current = get().scope;
+            /** 视图状态没变就不写 store，避免多余的重渲染；令牌失效已经由上面的 manager 调用完成。 */
+            if ((current === null && scope === null) || sameCanvasScope(current, scope)) return;
             set({ scope, summaries: [], listStatus: "idle", listError: null });
         },
 

@@ -38,23 +38,45 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
     let active: CanvasSyncSession | null = null;
     let activeUnsubscribe: (() => void) | null = null;
     const detached = new Set<CanvasSyncSession>();
+    /**
+     * 已被驱逐、不再计入 detached，但仍在硬收尾与本地落定中的会话数。
+     * 逻辑会话数由 detached 有界保证（上限 MAX_DETACHED_SESSIONS）；这里只计数不持有会话引用，
+     * 用来把「不可取消的 localforage 写」与「逻辑会话跟踪」分开，并在本地存储明显堆积时给出可观测信号。
+     */
+    let evicting = 0;
     const listeners = new Set<() => void>();
 
     const notify = () => listeners.forEach((listener) => listener());
     const isStale = (token: number, open: number) => token !== scopeToken || open !== openToken;
     const draftScopeOf = (session: CanvasSyncSession): CanvasDraftScope => ({ userId: session.scope.userId, workspaceId: session.scope.workspaceId, canvasId: session.canvasId });
 
-    /** detached 上限为 2：超限时最老的一个立即硬收尾，打开新画布永远不等待任何收尾。 */
+    /**
+     * detached 上限为 2：超限时最老的一个立即硬收尾，打开新画布永远不等待任何收尾。
+     * 被驱逐的会话立刻移出 detached，让「逻辑会话数」保持有界；但它的硬收尾与随后的本地落定仍被观察，
+     * 由 evicting 单独计数，避免不可取消的 IndexedDB 写脱离视野后无人收尾。evicting 只增不漏：每个条目都在 finally 里减回。
+     */
     function detach(session: CanvasSyncSession, reason: CanvasDisposeReason) {
         detached.add(session);
         if (detached.size > MAX_DETACHED_SESSIONS) {
             const oldest = detached.values().next().value;
             if (oldest && oldest !== session) {
                 detached.delete(oldest);
-                void oldest.dispose("forced");
+                evicting += 1;
+                /** 驱逐时仍有多个会话卡在本地落定，说明本地存储已经严重变慢，开发期直接暴露出来。 */
+                if (deps.isDev && evicting > MAX_DETACHED_SESSIONS) console.warn("[canvas-sync] local teardown backlog", { evicting, detached: detached.size });
+                void oldest
+                    .dispose("forced")
+                    /** 有界 dispose 返回后本地写可能还在飞，必须等真正落定，晚到的写才不会逃过后续清理。 */
+                    .then(() => oldest.whenLocalSettled())
+                    .finally(() => {
+                        evicting -= 1;
+                    });
             }
         }
-        void session.dispose(reason).finally(() => detached.delete(session));
+        void session
+            .dispose(reason)
+            .then(() => session.whenLocalSettled())
+            .finally(() => detached.delete(session));
     }
 
     function installSession(session: CanvasSyncSession, content: CanvasProject, previousReason: CanvasDisposeReason) {
@@ -122,14 +144,38 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
         if (prepared.status === "cancelled") return "cancelled";
         if (prepared.status !== "ready") return "failed";
         if (!commitAllowed(prepared, content)) return "cancelled";
-        const previous = active;
+        const session = prepared.session;
+        /**
+         * 服务端版本重载只允许替换「同一张画布的同一作用域会话」：
+         * 为 A 准备的重载绝不能收尾 B，更不能拿 B 的 draftKey 去删 B 的草稿。对不上就当作过期结果静默取消。
+         */
+        const previous = active && active.canvasId === session.canvasId && sameCanvasScope(active.scope, session.scope) ? active : null;
+        if (active && !previous) return "cancelled";
         /** 用户显式选择服务端版本：旧冲突会话的本地工作被丢弃，因此用 forced 收尾，不再写任何草稿。 */
-        installSession(prepared.session, content, "forced");
-        void (async () => {
-            if (previous) await settleWithin(previous.dispose("forced"), DETACHED_LOCAL_MS);
-            await clearConflictRecovery(draftScopeOf(prepared.session), previous ? [previous.draftKey] : []);
-        })();
+        installSession(session, content, "forced");
+        void runServerCopyCleanup(session, previous);
         return "committed";
+    }
+
+    /**
+     * 用户显式选择服务端版本后，本地冲突记录必须最终消失。
+     * 但 IndexedDB 的写不可取消：dispose 的有界等待超时后，那次写仍可能在清理之后落盘，把刚删掉的草稿写回来。
+     * 因此做两段：先在有界等待后立即清理一次（快路径，UI 立刻自洽），
+     * 再等被替换会话真正本地落定后补一次幂等清理（慢路径，负责删掉超时后才写回的那条）。
+     * 两段都不阻塞 commit 与画布补水；第二段等待无上界，但它只是一条后台清理链，不在任何打开画布的等待路径上。
+     */
+    async function runServerCopyCleanup(session: CanvasSyncSession, previous: CanvasSyncSession | null) {
+        const draftScope = draftScopeOf(session);
+        const extraKeys = previous ? [previous.draftKey] : [];
+        if (previous) await settleWithin(previous.dispose("forced"), DETACHED_LOCAL_MS);
+        await clearConflictRecovery(draftScope, extraKeys);
+        if (!previous) return;
+        /**
+         * 第二段无条件执行：dispose 内部对本地写的等待同样是有界的，
+         * 因此「dispose 已完成」并不等于「写已落盘」，只有 whenLocalSettled 才是真实落定信号。
+         */
+        await previous.whenLocalSettled();
+        await clearConflictRecovery(draftScope, extraKeys);
     }
 
     /** 7.2：只清理该画布的 marker、marker 引用的草稿和被替换会话自己的草稿；同源其他标签页的活草稿不动。 */
@@ -234,6 +280,11 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
         const outcomes = await Promise.allSettled(canvasIds.map((canvasId) => deps.repository.remove(current.workspaceId, canvasId)));
         const deleted = canvasIds.filter((_id, index) => outcomes[index].status === "fulfilled");
         const failed = canvasIds.filter((canvasId) => !deleted.includes(canvasId));
+        /**
+         * 故意使用调用时捕获的 current，而不是当前 scope：这些画布是在 current 下被删除的，
+         * 它们的草稿与 marker 也只存在于 current 作用域的键下。删除期间若发生作用域切换，
+         * 这里仍必须清理旧作用域，否则旧作用域的草稿会永远泄漏。不要在此加作用域守卫。
+         */
         deleted.forEach((canvasId) => void clearDeletedCanvasRecovery({ userId: current.userId, workspaceId: current.workspaceId, canvasId }));
         return { deleted, failed };
     }

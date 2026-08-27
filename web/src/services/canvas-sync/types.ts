@@ -142,6 +142,12 @@ export interface CanvasSyncSession {
     retryRecovery(): Promise<CanvasRetryRecoveryResult>;
     exportConflictDrafts(): Promise<CanvasProject[]>;
     dispose(reason: CanvasDisposeReason): Promise<void>;
+    /**
+     * 真实的本地落定信号：等到该会话没有任何在飞的本地写为止，故意不设上界。
+     * dispose 的等待有上界，只保证不卡住 UI；不可取消的 IndexedDB 写仍可能在其后完成。
+     * 只允许在已 dispose 或正在 dispose 的会话上调用，且只用于清理路径补一次幂等清理，绝不出现在打开画布的等待路径上。
+     */
+    whenLocalSettled(): Promise<void>;
     subscribe(listener: (view: CanvasSyncView) => void): () => void;
 }
 

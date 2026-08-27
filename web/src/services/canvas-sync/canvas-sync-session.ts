@@ -419,6 +419,21 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         if (settled.status !== "ok") markDegraded();
     }
 
+    /**
+     * 等到本地真的没有在飞的写为止，不设上界：IndexedDB 的写不可取消，dispose 的有界等待超时并不代表写已经结束。
+     * 循环是必要的：一轮 drain 结束时可能又有新的 pendingSlot 被排上，只等一次仍可能漏掉最后一条。
+     */
+    async function whenLocalSettled(): Promise<void> {
+        while (drainPromise) {
+            try {
+                await drainPromise;
+            } catch {
+                /** drainLocal 自己吞掉写失败，这里只关心「不再有在飞的写」。 */
+                return;
+            }
+        }
+    }
+
     function clearNetworkTimer() {
         if (networkTimer) clearTimeout(networkTimer);
         networkTimer = null;
@@ -705,6 +720,7 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         retryRecovery: () => guardAsync(() => retryRecovery(), "failed" as CanvasRetryRecoveryResult),
         exportConflictDrafts: () => guardAsync(() => exportConflictDrafts(), []),
         dispose: (reason) => guardAsync(() => dispose(reason), undefined),
+        whenLocalSettled: () => whenLocalSettled(),
         subscribe: (listener) => {
             listeners.add(listener);
             return () => {
