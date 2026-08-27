@@ -26,6 +26,7 @@ import {
     type CanvasLocalRecovery,
     type CanvasLocalWrite,
     type CanvasProjectPatch,
+    type CanvasRecoveryRepair,
     type CanvasRenameOutcome,
     type CanvasRetryRecoveryResult,
     type CanvasSaveFailure,
@@ -55,6 +56,8 @@ export type CanvasRecoveryResolution = {
     /** 复用被恢复草稿的 draftId，使会话继续写同一条记录；否则是新的 nanoid。 */
     draftId: string;
     conflict: CanvasSyncConflictView | null;
+    /** 判定过程中需要的本地修复；由 install() 之后的会话执行并观察，prepare 被取消时一条都不执行。 */
+    repairs: CanvasRecoveryRepair[];
 };
 
 export type CanvasSessionInit = {
@@ -79,6 +82,12 @@ function restoreContent(server: CanvasProject, draft: CanvasDraftRecord): Canvas
     return { ...server, ...snapshotToProjectContent(draft.snapshot), title: draft.title || server.title };
 }
 
+/** 4.4 与 9.6：marker 条目必须真正指向一条有效的 pending 草稿，且 draftId 与 baseRevision 都对得上，其余一律剔除。 */
+function markerEntryMatches(entry: CanvasConflictMarkerEntry, draft: CanvasDraftRecord | undefined): boolean {
+    if (!draft) return false;
+    return draft.state === "pending" && draft.draftId === entry.draftId && draft.baseRevision === entry.baseRevision;
+}
+
 export async function resolveCanvasOpenRecovery(
     deps: Pick<CanvasSyncSessionDeps, "recovery" | "createDraftId">,
     scope: CanvasScope,
@@ -86,7 +95,7 @@ export async function resolveCanvasOpenRecovery(
 ): Promise<CanvasRecoveryResolution> {
     const canvasId = load.project.id;
     const draftScope: CanvasDraftScope = { userId: scope.userId, workspaceId: scope.workspaceId, canvasId };
-    const server: CanvasRecoveryResolution = { phase: "clean", content: load.project, revision: load.revision, draftId: deps.createDraftId(), conflict: null };
+    const server: CanvasRecoveryResolution = { phase: "clean", content: load.project, revision: load.revision, draftId: deps.createDraftId(), conflict: null, repairs: [] };
 
     let marker: CanvasConflictMarker | null;
     let drafts: CanvasDraftRecord[];
@@ -101,14 +110,9 @@ export async function resolveCanvasOpenRecovery(
     const draftByKey = new Map(drafts.map((draft) => [canvasDraftKey(draftScope, draft.draftId), draft] as const));
 
     if (marker) {
-        const valid = marker.entries.filter((entry) => draftByKey.has(entry.draftKey));
+        /** 只按键存在判断太弱：条目必须与记录的 draftId、baseRevision 完全一致才算有效入口。 */
+        const valid = marker.entries.filter((entry) => markerEntryMatches(entry, draftByKey.get(entry.draftKey)));
         if (valid.length) {
-            /** entries[0] 无效时剔除无效条目并重写 marker，最新的一条永远排在最前。 */
-            if (valid.length !== marker.entries.length) {
-                const write = deps.recovery.writeMarker({ ...marker, entries: valid });
-                /** resolver 尚未创建会话：只消费有界结果，原始落定信号不归属之后才创建的会话。 */
-                await settleWithin(write.result, LOCAL_FLUSH_TIMEOUT_MS);
-            }
             const draft = draftByKey.get(valid[0].draftKey) as CanvasDraftRecord;
             return {
                 phase: "conflict",
@@ -116,41 +120,39 @@ export async function resolveCanvasOpenRecovery(
                 revision: load.revision,
                 draftId: draft.draftId,
                 conflict: { baseRevision: draft.baseRevision, source: "restored", extraDraftCount: valid.length - 1 },
+                /** entries[0] 无效时剔除无效条目并重写 marker，最新的一条永远排在最前；改写交给会话执行。 */
+                repairs: valid.length === marker.entries.length ? [] : [{ kind: "write-marker", marker: { ...marker, entries: valid } }],
             };
         }
-        /** 全部条目都指向已消失或校验失败的草稿，这条 marker 才算确认失效。 */
-        await settleWithin(deps.recovery.deleteMarker(draftScope), LOCAL_FLUSH_TIMEOUT_MS);
+        /** 全部条目都指向已消失或校验失败的草稿，这条 marker 才算确认失效；删除仍需按身份条件执行。 */
+        server.repairs.push({ kind: "delete-marker", expectedDraftKeys: marker.entries.map((entry) => entry.draftKey) });
     }
 
     const pending = drafts.find((draft) => draft.state === "pending");
     if (pending && pending.baseRevision === load.revision) {
         /** 同 revision 的未确认草稿：内容照常恢复，并立即安排一次保存。 */
-        return { phase: "dirty", content: restoreContent(load.project, pending), revision: load.revision, draftId: pending.draftId, conflict: null };
+        return { ...server, phase: "dirty", content: restoreContent(load.project, pending), draftId: pending.draftId };
     }
     if (pending) {
         /** 崩溃或离线路径产生的冲突：提升为 marker 后按冲突处理。 */
         const entry: CanvasConflictMarkerEntry = { draftKey: canvasDraftKey(draftScope, pending.draftId), draftId: pending.draftId, baseRevision: pending.baseRevision, savedAt: pending.savedAt };
-        const write = deps.recovery.writeMarker({ ...draftScope, entries: [entry] });
-        /** resolver 写不附着到稍后创建的会话；打开流程只等待它自己的有界 result。 */
-        await settleWithin(write.result, LOCAL_FLUSH_TIMEOUT_MS);
         return {
             phase: "conflict",
             content: restoreContent(load.project, pending),
             revision: load.revision,
             draftId: pending.draftId,
             conflict: { baseRevision: pending.baseRevision, source: "restored", extraDraftCount: 0 },
+            repairs: [...server.repairs, { kind: "write-marker", marker: { ...draftScope, entries: [entry] } }],
         };
     }
 
     /** state === "synced" 表示服务端已确认过这份内容，打开时直接删除，绝不当作冲突。 */
-    drafts
-        .filter((draft) => draft.state === "synced")
-        .forEach((draft) => void settleWithin(deps.recovery.deleteDraftByKey(canvasDraftKey(draftScope, draft.draftId)), LOCAL_FLUSH_TIMEOUT_MS));
+    drafts.filter((draft) => draft.state === "synced").forEach((draft) => server.repairs.push({ kind: "delete-draft", draftKey: canvasDraftKey(draftScope, draft.draftId) }));
     return server;
 }
 
 const ACTIVE_PHASES: CanvasSyncPhase[] = ["clean", "dirty", "saving", "save-error", "conflict", "recovery-blocked"];
-type SessionEvent = "install" | "update" | "localTick" | "networkTick" | "saveAck" | "saveConflict" | "saveFail" | "retrySave" | "retryRecovery" | "flush" | "dispose";
+type SessionEvent = "install" | "update" | "localTick" | "networkTick" | "saveAck" | "saveConflict" | "saveFail" | "retrySave" | "retryRecovery" | "flush" | "hold" | "dispose";
 
 const ALLOWED_PHASES: Record<SessionEvent, CanvasSyncPhase[]> = {
     install: ["loading"],
@@ -158,12 +160,14 @@ const ALLOWED_PHASES: Record<SessionEvent, CanvasSyncPhase[]> = {
     /** disposing 仍要做最后一次物化落盘（7.4 第 2 步），因此本地物化比其他事件多允许这一个阶段。 */
     localTick: [...ACTIVE_PHASES, "disposing"],
     networkTick: ["dirty", "saving", "save-error"],
-    saveAck: ["saving"],
-    saveConflict: ["saving"],
-    saveFail: ["saving"],
+    /** 收尾期间仍要处理自己那次在飞请求的结果（7.4）：revision、草稿与 marker 都还归本会话。 */
+    saveAck: ["saving", "disposing"],
+    saveConflict: ["saving", "disposing"],
+    saveFail: ["saving", "disposing"],
     retrySave: ["dirty", "save-error"],
     retryRecovery: ["recovery-blocked"],
     flush: ACTIVE_PHASES,
+    hold: ACTIVE_PHASES,
     dispose: [...ACTIVE_PHASES, "loading"],
 };
 
@@ -200,7 +204,18 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
     const inFlightLocal = new Set<Promise<unknown>>();
     let localSettlementWatcher: Promise<void> | null = null;
     let inflightController: AbortController | null = null;
+    /**
+     * 在飞保存请求的完整生命周期，由会话自己持有。
+     * 只记 inflightSeq 无法在收尾时等待或中止它，因此 dispose 必须能拿到这个 promise。
+     */
+    let inflightRequest: Promise<void> | null = null;
+    /** 删除活动画布期间的可逆冻结：拒绝新编辑与新请求，但不终结会话。 */
+    let held = false;
     let disposePromise: Promise<void> | null = null;
+    /** 已经开始的收尾等级；forced 必须能在 replaced/deleted 收尾进行中升级并中止在飞请求。 */
+    let disposeReason: CanvasDisposeReason | null = null;
+    /** forced 升级后置位：抑制此后一切本地写与网络后续动作。 */
+    let aborted = false;
     let emitted: CanvasSyncView | null = null;
     const listeners = new Set<(view: CanvasSyncView) => void>();
 
@@ -220,6 +235,8 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
 
     function canUseNetwork() {
         if (saveError?.kind === "invariant") return false;
+        /** 冻结期间既不排程也不发请求，等待删除结果裁决。 */
+        if (held || aborted) return false;
         return phase === "clean" || phase === "dirty" || phase === "saving" || phase === "save-error";
     }
 
@@ -298,11 +315,22 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         }
         if (phase === "dirty") scheduleNetwork();
         assertCounters("install");
+        /** prepare 期间只判定不改写：真正的本地修复到这里才执行，并登记为本会话拥有的尾巴。 */
+        runRecoveryRepairs();
         notify();
     }
 
+    /** 执行 resolver 给出的修复意图。全部登记进 inFlightLocal，因此清理路径能通过 whenLocalSettled 观察到它们。 */
+    function runRecoveryRepairs() {
+        for (const repair of resolution.repairs) {
+            if (repair.kind === "write-marker") void trackLocal(deps.recovery.writeMarker(repair.marker).settled);
+            else if (repair.kind === "delete-marker") void trackLocal(deps.recovery.deleteMarkerIfOwned(draftScope, repair.expectedDraftKeys).settled);
+            else void trackLocal(deps.recovery.deleteDraftByKey(repair.draftKey).settled);
+        }
+    }
+
     function update(patch: CanvasProjectPatch): boolean {
-        if (phase === "loading" || phase === "disposing" || phase === "disposed") return false;
+        if (held || phase === "loading" || phase === "disposing" || phase === "disposed") return false;
         assertEvent("update");
         let changed = false;
         for (const field of CANVAS_PATCH_FIELDS) {
@@ -332,7 +360,7 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
     }
 
     function rename(nextTitle: string): CanvasRenameOutcome {
-        if (phase === "loading" || phase === "disposing" || phase === "disposed") return "local-only";
+        if (held || phase === "loading" || phase === "disposing" || phase === "disposed") return "local-only";
         if (nextTitle !== content.title) {
             content = { ...content, title: nextTitle };
             registerEdit();
@@ -392,6 +420,11 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         if (drainPromise) return drainPromise;
         drainPromise = (async () => {
             while (pendingSlot) {
+                /** forced 升级后不再落任何盘：它的清理可能已经跑过，迟到写会把旧状态写回来。 */
+                if (aborted) {
+                    pendingSlot = null;
+                    break;
+                }
                 const entry = pendingSlot;
                 pendingSlot = null;
                 try {
@@ -405,9 +438,9 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
                     continue;
                 }
                 /** 保存成功后的收尾固定「先改写、后删除」，中途崩溃留下的必须是一条 synced 记录。 */
-                if (entry.deleteAfterWrite && !pendingSlot && phase === "clean" && editSeq === savedSeq) {
+                if (entry.deleteAfterWrite && !pendingSlot && !aborted && editSeq === savedSeq && (phase === "clean" || tearingDown())) {
                     try {
-                        await deps.recovery.deleteDraftByKey(draftKey);
+                        await trackWrite(deps.recovery.deleteDraftByKey(draftKey));
                     } catch {
                         markDegraded();
                     }
@@ -501,16 +534,30 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         inflightController = controller;
         phase = "saving";
         clearNetworkTimer();
+        /**
+         * 捕获即关闭本批次的 5 s 窗口：请求期间的新编辑属于下一批，从它自己的时间戳重新计时。
+         * 否则每次 saveAck 都会算出 0 延迟，连续编辑退化成一次请求一个来回。
+         */
+        firstUnsavedEditAt = 0;
         assertCounters("startSave");
         notify();
-        try {
-            const result = await deps.repository.save(scope.workspaceId, canvasId, { baseRevision, title: payload.title, snapshot: payload.snapshot }, controller.signal);
-            guard(() => onSaveAck(result), undefined);
-        } catch (error) {
-            const failure = classifyCanvasSaveError(error);
-            if (failure.kind === "conflict") guard(() => onSaveConflict(baseRevision), undefined);
-            else guard(() => onSaveFail(failure), undefined);
-        }
+        /** 请求 promise 由会话持有：收尾时必须能等待它、并按它的结果决定是否补发最终保存。 */
+        const request: Promise<void> = (async () => {
+            try {
+                const result = await deps.repository.save(scope.workspaceId, canvasId, { baseRevision, title: payload.title, snapshot: payload.snapshot }, controller.signal);
+                guard(() => onSaveAck(result), undefined);
+            } catch (error) {
+                const failure = classifyCanvasSaveError(error);
+                if (failure.kind === "conflict") guard(() => onSaveConflict(baseRevision), undefined);
+                else guard(() => onSaveFail(failure), undefined);
+            }
+        })();
+        /** 登记的必须是 tracked 本身：登记 request 而清理时比较派生 promise 会让引用永远对不上，收尾误判成仍有请求在飞。 */
+        const tracked: Promise<void> = request.finally(() => {
+            if (inflightRequest === tracked) inflightRequest = null;
+        });
+        inflightRequest = tracked;
+        await tracked;
     }
 
     function settleAfterRequest() {
@@ -518,12 +565,18 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         inflightController = null;
     }
 
-    /** 会话被替换后返回的结果不再改写阶段：dispose 有自己的收尾路径。 */
+    /**
+     * 只有被 forced 中止或已终结的会话才丢弃请求结果。
+     * 普通收尾必须继续处理这次 ack/409：revision、草稿状态与 marker 都还归本会话所有。
+     */
     function requestOutdated() {
-        if (phase !== "disposing" && phase !== "disposed") return false;
+        if (!aborted && phase !== "disposed") return false;
         settleAfterRequest();
         return true;
     }
+
+    /** 收尾期间的结果只更新事实，不再排程后续工作。 */
+    const tearingDown = () => phase === "disposing" || phase === "disposed";
 
     function onSaveAck(result: CanvasLoadResult) {
         if (requestOutdated()) return;
@@ -534,6 +587,12 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         savedOnce = true;
         saveError = null;
         settleAfterRequest();
+        if (tearingDown()) {
+            /** 先把草稿改写到刚返回的 baseRevision，避免下次打开把已保存内容误判成冲突。 */
+            queueDraftSettlement(editSeq === savedSeq ? "synced" : "pending");
+            notify();
+            return;
+        }
         if (editSeq === savedSeq) {
             phase = "clean";
             firstUnsavedEditAt = 0;
@@ -561,6 +620,8 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         assertEvent("saveFail");
         settleAfterRequest();
         clearNetworkTimer();
+        /** 收尾期间不改阶段，只保留盘上的 pending 草稿等待下次打开。 */
+        if (tearingDown()) return;
         saveError = { kind: failure.kind, messageKey: failure.messageKey };
         phase = "save-error";
         assertCounters("saveFail");
@@ -574,7 +635,13 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         settleAfterRequest();
         clearNetworkTimer();
         conflictBaseRevision = baseRevision;
+        /** 冲突事实先同步建立：收尾路径据此永久阻断网络，绝不会在 409 之后再补发一次保存。 */
         conflict = { baseRevision, source: "save", extraDraftCount: 0 };
+        if (tearingDown()) {
+            /** 迟到的 409 没有 UI，但冲突事实必须落盘：下次打开该画布时呈现。 */
+            void trackLocal(persistConflictRecords(baseRevision));
+            return;
+        }
         saveError = null;
         phase = "conflict";
         firstUnsavedEditAt = 0;
@@ -613,6 +680,32 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         if (canUseNetwork() && editSeq > savedSeq && inflightSeq < 0) await startSave();
     }
 
+    /**
+     * 删除活动画布前的可逆冻结（10 与 11 的「失败项待保存编辑不被丢弃」）。
+     * 只做两件事：停掉计时器与网络、把最后一次编辑强制物化到本地；会话所有权原样保留。
+     */
+    async function holdForDelete() {
+        if (held || phase === "loading" || tearingDown()) return;
+        assertEvent("hold");
+        held = true;
+        clearNetworkTimer();
+        notify();
+        /** 冻结前先落盘：删除失败时这份内容仍在，删除成功时它由 deleted 清理统一删除。 */
+        await flushLocal(LOCAL_FLUSH_TIMEOUT_MS);
+    }
+
+    /** 删除失败：同一个会话继续可用，冻结期间累积的编辑重新排程。 */
+    function releaseHold() {
+        if (!held) return;
+        held = false;
+        if (editSeq > savedSeq && (phase === "clean" || phase === "dirty" || phase === "save-error")) {
+            phase = "dirty";
+            scheduleLocal();
+            scheduleNetwork();
+        }
+        notify();
+    }
+
     async function retrySave() {
         if (phase !== "save-error" && phase !== "dirty") return;
         if (saveError?.kind === "invariant" || inflightSeq >= 0) return;
@@ -643,9 +736,16 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
             return "failed";
         }
         if (phase !== "recovery-blocked") return "failed";
-        const valid = marker ? marker.entries.filter((entry) => drafts.some((draft) => canvasDraftKey(draftScope, draft.draftId) === entry.draftKey)) : [];
-        if (!valid.length) {
-            if (marker) await settleWithin(trackLocal(deps.recovery.deleteMarker(draftScope)), LOCAL_FLUSH_TIMEOUT_MS);
+        const draftByKey = new Map(drafts.map((draft) => [canvasDraftKey(draftScope, draft.draftId), draft] as const));
+        /** 与 4.4 同一张判定表：条目必须指向 draftId 与 baseRevision 都一致的 pending 草稿。 */
+        const valid = marker ? marker.entries.filter((entry) => markerEntryMatches(entry, draftByKey.get(entry.draftKey))) : [];
+        /**
+         * 没有有效 marker 不等于没有冲突：盘上可能还躺着一条未被 marker 引用的外来 pending 草稿
+         * （本会话之外的标签页或上一次崩溃留下的）。它必须被提升为 marker 条目，而不是被忽略后解锁自动保存。
+         */
+        const foreignPending = !valid.length ? drafts.filter((draft) => draft.state === "pending" && canvasDraftKey(draftScope, draft.draftId) !== draftKey && draft.baseRevision !== revision) : [];
+        if (!valid.length && !foreignPending.length) {
+            if (marker) await settleWithin(trackLocal(deps.recovery.deleteMarkerIfOwned(draftScope, marker.entries.map((entry) => entry.draftKey)).result), LOCAL_FLUSH_TIMEOUT_MS);
             if (editSeq > savedSeq) {
                 phase = "dirty";
                 notify();
@@ -659,12 +759,14 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         }
         /** 恢复重试只修正 lineage，绝不替换画布内容：替换内容只允许走冲突条上的显式动作。 */
         const own: CanvasConflictMarkerEntry[] = editSeq > savedSeq ? [{ draftKey, draftId: resolution.draftId, baseRevision: revision, savedAt: new Date(deps.now()).toISOString() }] : [];
-        const entries = [...own, ...valid.filter((entry) => entry.draftKey !== draftKey)].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
+        /** 未被 marker 引用的外来 pending 草稿在此提升为条目，排在本会话条目之后，旧 marker 永远不夺回入口。 */
+        const promoted: CanvasConflictMarkerEntry[] = foreignPending.map((draft) => ({ draftKey: canvasDraftKey(draftScope, draft.draftId), draftId: draft.draftId, baseRevision: draft.baseRevision, savedAt: draft.savedAt }));
+        const entries = [...own, ...[...valid, ...promoted].filter((entry) => entry.draftKey !== draftKey)].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
         const markerWrite = deps.recovery.writeMarker({ ...draftScope, entries });
         /** 恢复重试也是本会话所有：先登记 raw settled，再等待有界 result。 */
         const marked = await settleWithin(trackWrite(markerWrite), LOCAL_FLUSH_TIMEOUT_MS);
         if (marked.status !== "ok") markDegraded();
-        conflictBaseRevision = own.length ? revision : valid[0].baseRevision;
+        conflictBaseRevision = own.length ? revision : entries[0].baseRevision;
         conflict = { baseRevision: conflictBaseRevision, source: "restored", extraDraftCount: entries.length - 1 };
         phase = "conflict";
         clearNetworkTimer();
@@ -687,32 +789,47 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         return projects;
     }
 
+    /** forced 是唯一可以升级已有收尾的等级：中止在飞请求、抑制后续本地写、跳过所有等待。 */
+    function escalateToForced() {
+        aborted = true;
+        disposeReason = "forced";
+        pendingSlot = null;
+        clearLocalTimer();
+        clearNetworkTimer();
+        inflightController?.abort();
+        settleAfterRequest();
+    }
+
     function dispose(reason: CanvasDisposeReason): Promise<void> {
-        if (disposePromise) return disposePromise;
+        if (disposePromise) {
+            /** 已在收尾中：forced 必须真正升级，而不是拿回一个无法中止的旧 promise。 */
+            if (reason === "forced" && disposeReason !== "forced") escalateToForced();
+            return disposePromise;
+        }
         assertEvent("dispose");
+        disposeReason = reason;
+        held = false;
         disposePromise = (async () => {
-            const networkAllowed = canUseNetwork() && editSeq > savedSeq;
+            const networkAllowed = canUseNetwork();
             phase = "disposing";
             clearLocalTimer();
             clearNetworkTimer();
             notify();
             if (reason === "forced") {
-                /** 超出 detached 上限时的硬收尾：中止在飞请求、跳过所有等待。 */
-                inflightController?.abort();
-                settleAfterRequest();
+                escalateToForced();
                 /** 不再新增任何本地写；只等已经在飞的那一次结束，避免它写在清理之后。 */
-                pendingSlot = null;
                 await settleWithin(drainPromise ?? Promise.resolve(), DETACHED_LOCAL_MS);
             } else if (reason === "deleted") {
                 /** 画布已被删除：不再新增任何本地写，只等已经在飞的那一次结束，避免写在清理之后。 */
                 pendingSlot = null;
+                inflightController?.abort();
+                settleAfterRequest();
                 await settleWithin(drainPromise ?? Promise.resolve(), DETACHED_LOCAL_MS);
             } else {
                 await flushLocal(DETACHED_LOCAL_MS);
-                if (networkAllowed && inflightSeq < 0) {
-                    /** 网络有界等待后仍可能迟到 409 并产生 marker 尾巴，先登记整个生产尾巴以封住该空窗。 */
-                    await settleWithin(trackLocal(finalSave()), DETACHED_NETWORK_MS);
-                }
+                if (networkAllowed) await settleWithin(trackLocal(finishNetwork()), DETACHED_NETWORK_MS);
+                /** 10 s 上界必须真正成立：等待结束仍未落定就中止那次请求，绝不把会话拖到 20 s 之外。 */
+                if (inflightSeq >= 0 || inflightRequest) escalateToForced();
             }
             phase = "disposed";
             notify();
@@ -721,25 +838,39 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         return disposePromise;
     }
 
-    /** detached 会话最多再发一次保存；409 只写自己作用域的 marker 与冲突草稿，没有任何 UI。 */
+    /**
+     * 7.4 第 3 步：detached 会话的网络收尾。
+     * 先 settle 已经在飞的那次请求——它的 ack/409 仍归本会话处理，revision 与草稿状态都要推进——
+     * 再按刚返回的 revision 至多补发一次最终保存。合计仍是「单飞行 + 最多一次最终保存」。
+     */
+    async function finishNetwork() {
+        if (inflightRequest) await inflightRequest;
+        /** 冲突或不变量事故期间永久阻断网络（5.2 不变量 4），收尾也不例外。 */
+        if (aborted || conflict || saveError?.kind === "invariant" || editSeq <= savedSeq || inflightSeq >= 0) return;
+        await finalSave();
+    }
+
+    /**
+     * detached 会话最多再发一次保存；409 只写自己作用域的 marker 与冲突草稿，没有任何 UI。
+     * 结果统一走 onSaveAck/onSaveConflict/onSaveFail，因此成功后草稿一定被改写到新的 baseRevision，
+     * 不会在盘上留下一条旧 baseRevision 的 pending 记录被下次打开误判成冲突。
+     */
     async function finalSave() {
         const payload = ensureSnapshot();
         const baseRevision = revision;
         const controller = new AbortController();
+        inflightSeq = payload.seq;
         inflightController = controller;
         try {
             const result = await deps.repository.save(scope.workspaceId, canvasId, { baseRevision, title: payload.title, snapshot: payload.snapshot }, controller.signal);
-            revision = result.revision;
-            savedSeq = payload.seq;
-            savedOnce = true;
+            guard(() => onSaveAck(result), undefined);
         } catch (error) {
-            if (classifyCanvasSaveError(error).kind !== "conflict") return;
-            conflictBaseRevision = baseRevision;
-            /** 整条尾巴也要登记：drain 结束到 marker 读之间存在空隙，只登记内部单条会让落定信号提前返回。 */
-            await settleWithin(trackLocal(persistConflictRecords(baseRevision)), DETACHED_LOCAL_MS);
-        } finally {
-            inflightController = null;
+            const failure = classifyCanvasSaveError(error);
+            if (failure.kind === "conflict") guard(() => onSaveConflict(baseRevision), undefined);
+            else guard(() => onSaveFail(failure), undefined);
         }
+        /** 成功分支的草稿改写已排入单槽，这里有界等待它落盘，让 disposed 之后不再新增写。 */
+        await settleWithin(drainPromise ?? Promise.resolve(), DETACHED_LOCAL_MS);
     }
 
     const session: CanvasSyncSession = {
@@ -759,6 +890,8 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         update: (patch) => guard(() => update(patch), false),
         rename: (title) => guard(() => rename(title), "local-only" as CanvasRenameOutcome),
         flush: () => guardAsync(() => flush(), undefined),
+        holdForDelete: () => guardAsync(() => holdForDelete(), undefined),
+        releaseHold: () => guard(() => releaseHold(), undefined),
         retrySave: () => guardAsync(() => retrySave(), undefined),
         retryRecovery: () => guardAsync(() => retryRecovery(), "failed" as CanvasRetryRecoveryResult),
         exportConflictDrafts: () => guardAsync(() => exportConflictDrafts(), []),

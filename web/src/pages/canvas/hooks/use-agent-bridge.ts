@@ -127,5 +127,6 @@ export function useAgentBridge(params: AgentBridgeParams) {
         return () => setAgentCanvasContext(null);
     }, [agentSnapshot, applyAgentOps, agentUndoSnapshot, enabled, ownsGate, setAgentCanvasContext, undoAgentOps]);
 
-    return { applyAgentOps };
+    /** 闸门代际与所有权判定同时暴露给页面：已启动的生成必须在每个 await 之后重新校验归属。 */
+    return { applyAgentOps, gateGeneration, ownsGate };
 }

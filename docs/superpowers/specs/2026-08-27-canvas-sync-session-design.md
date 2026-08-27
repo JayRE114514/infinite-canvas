@@ -697,7 +697,7 @@ export interface CanvasLocalRecovery {
 15. 用 DevTools 让 IndexedDB 写入 reject；确认状态位出现"本地草稿不可用"，云端保存仍然成功。
 16. 让本地读取永不返回；确认画布仍能打开、进入"本地恢复失败"、网络保存被阻断，重试成功后自动补一次保存。
 17. 在恢复阻断期间编辑，然后让重试读到一条旧 marker；确认导出的第一份是恢复期间的最新内容。
-18. 检查 IndexedDB：`canvas_recovery` 中每画布至多一条会话草稿与一条 marker，旧 `canvas_drafts` 已消失。
+18. 检查 IndexedDB：`canvas_recovery` 中每个会话一条草稿（同源多标签页打开同一画布时同一画布可能有多条）、每画布至多一条 marker，旧 `canvas_drafts` 已消失。
 
 阶段 E：故障与回归
 

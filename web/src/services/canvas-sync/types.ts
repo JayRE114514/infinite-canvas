@@ -45,6 +45,16 @@ export type CanvasDisposeReason = "replaced" | "scope-changed" | "deleted" | "fo
 export type CanvasRetryRecoveryResult = "unlocked" | "conflict" | "failed";
 export type CanvasRenameOutcome = "scheduled" | "local-only";
 
+/**
+ * 打开画布时按 4.4 判定得出的本地修复动作。
+ * resolver 只描述要做什么，不自己执行：这些改写必须由 commit 之后的会话拥有，
+ * 否则被取消的 prepare 会留下无人观察、可能在清理之后落盘的原始写。
+ */
+export type CanvasRecoveryRepair =
+    | { kind: "write-marker"; marker: CanvasConflictMarker }
+    | { kind: "delete-marker"; expectedDraftKeys: string[] }
+    | { kind: "delete-draft"; draftKey: string };
+
 export type CanvasDraftScope = { userId: string; workspaceId: string; canvasId: string };
 export type CanvasDraftState = "pending" | "synced";
 
@@ -87,14 +97,20 @@ export type CanvasLocalWrite = {
     settled: Promise<void>;
 };
 
-/** 只做存取与校验，不做调度，不判断冲突语义；读取/删除有界，写入同时暴露有界结果与原始落定信号。 */
+/** 只做存取与校验，不做调度，不判断冲突语义；读取有界，所有改写（写入与删除）都同时暴露有界结果与原始落定信号。 */
 export interface CanvasLocalRecovery {
     readMarker(scope: CanvasDraftScope): Promise<CanvasConflictMarker | null>;
     writeMarker(marker: CanvasConflictMarker): CanvasLocalWrite;
-    deleteMarker(scope: CanvasDraftScope): Promise<void>;
+    /** 删除同样是不可取消的原始改写：必须与写入对称地暴露 settled，否则超时后的迟到删除无人观察。 */
+    deleteMarker(scope: CanvasDraftScope): CanvasLocalWrite;
+    /**
+     * 仅当 marker 仍与期望身份一致时删除：entries 全部包含在 expectedDraftKeys 内才删，
+     * 否则说明已有更新的会话写入了自己的 marker，迟到清理不得抹掉它。
+     */
+    deleteMarkerIfOwned(scope: CanvasDraftScope, expectedDraftKeys: string[]): CanvasLocalWrite;
     readDraftByKey(key: string): Promise<CanvasDraftRecord | null>;
     writeDraft(record: CanvasDraftRecord): CanvasLocalWrite;
-    deleteDraftByKey(key: string): Promise<void>;
+    deleteDraftByKey(key: string): CanvasLocalWrite;
     /** 前缀枚举该画布全部草稿，savedAt 新的在前。 */
     listCanvasDrafts(scope: CanvasDraftScope): Promise<CanvasDraftRecord[]>;
     /** 删除该画布下不在 keepKeys 中且超过 DRAFT_GC_MIN_AGE_MS 的草稿；失败忽略。 */
@@ -145,6 +161,13 @@ export interface CanvasSyncSession {
     rename(title: string): CanvasRenameOutcome;
     /** 强制物化本地并在允许时提交一次；对外等待全部有界，超时后的原始本地写由 settled 继续观察。 */
     flush(): Promise<void>;
+    /**
+     * 删除活动画布前的可逆冻结：停止接受编辑与网络保存，强制把最后一次编辑物化到本地，但保留会话所有权。
+     * 删除成功由 manager 走 dispose("deleted") 终结；删除失败必须 releaseHold() 让同一个会话继续可用。
+     */
+    holdForDelete(): Promise<void>;
+    /** 撤销 holdForDelete：恢复编辑与网络调度，并把冻结期间累积的编辑重新排程。 */
+    releaseHold(): void;
     retrySave(): Promise<void>;
     retryRecovery(): Promise<CanvasRetryRecoveryResult>;
     exportConflictDrafts(): Promise<CanvasProject[]>;

@@ -86,7 +86,10 @@ function asMarker(value: unknown, scope: CanvasDraftScope): CanvasConflictMarker
     if (!Array.isArray(entries) || !entries.length || entries.length > MAX_CONFLICT_MARKER_ENTRIES) return null;
     const parsed = entries.map(asMarkerEntry);
     if (parsed.some((entry) => entry === null)) return null;
-    return { userId, workspaceId, canvasId, entries: parsed as CanvasConflictMarkerEntry[] };
+    /** entry.draftKey 必须落在本画布的键前缀下，且与自身 draftId 推导出的键一致，否则它指向的根本不是本画布的草稿。 */
+    const entries2 = parsed as CanvasConflictMarkerEntry[];
+    if (entries2.some((entry) => entry.draftKey !== canvasDraftKey(scope, entry.draftId))) return null;
+    return { userId, workspaceId, canvasId, entries: entries2 };
 }
 
 export const canvasLocalRecovery: CanvasLocalRecovery = {
@@ -103,17 +106,32 @@ export const canvasLocalRecovery: CanvasLocalRecovery = {
         return marker;
     },
     writeMarker: (marker) => localWrite("writeMarker", recoveryStore.setItem(canvasConflictMarkerKey(marker), marker)),
-    deleteMarker: async (scope) => {
-        await bounded("deleteMarker", recoveryStore.removeItem(canvasConflictMarkerKey(scope)), LOCAL_FLUSH_TIMEOUT_MS);
+    deleteMarker: (scope) => localWrite("deleteMarker", recoveryStore.removeItem(canvasConflictMarkerKey(scope))),
+    /**
+     * 条件删除：读到的 marker 若含有 expectedDraftKeys 之外的条目，说明它已经属于更新的会话，直接放弃删除。
+     * 读失败（不是「没有 marker」）同样放弃删除：身份未知时不做破坏性改写。
+     */
+    deleteMarkerIfOwned: (scope, expectedDraftKeys) => {
+        const key = canvasConflictMarkerKey(scope);
+        const owned = new Set(expectedDraftKeys);
+        return localWrite(
+            "deleteMarkerIfOwned",
+            (async () => {
+                const value = await recoveryStore.getItem<unknown>(key);
+                if (value === null || value === undefined) return;
+                const marker = asMarker(value, scope);
+                /** 结构性损坏的 marker 没有保留价值，可以删；有效但含更新条目的必须保留。 */
+                if (marker && !marker.entries.every((entry) => owned.has(entry.draftKey))) return;
+                await recoveryStore.removeItem(key);
+            })(),
+        );
     },
     readDraftByKey: async (key) => {
         const value = await bounded("readDraftByKey", recoveryStore.getItem<unknown>(key), LOCAL_READ_TIMEOUT_MS);
         return asDraftRecord(value, key);
     },
     writeDraft: (record) => localWrite("writeDraft", recoveryStore.setItem(canvasDraftKey(record, record.draftId), record)),
-    deleteDraftByKey: async (key) => {
-        await bounded("deleteDraftByKey", recoveryStore.removeItem(key), LOCAL_FLUSH_TIMEOUT_MS);
-    },
+    deleteDraftByKey: (key) => localWrite("deleteDraftByKey", recoveryStore.removeItem(key)),
     listCanvasDrafts: async (scope) => {
         const prefix = canvasDraftKeyPrefix(scope);
         const records: CanvasDraftRecord[] = [];

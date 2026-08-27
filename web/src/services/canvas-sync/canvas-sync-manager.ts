@@ -57,21 +57,24 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
      */
     function detach(session: CanvasSyncSession, reason: CanvasDisposeReason) {
         detached.add(session);
-        if (detached.size > MAX_DETACHED_SESSIONS) {
-            const oldest = detached.values().next().value;
-            if (oldest && oldest !== session) {
-                detached.delete(oldest);
-                evicting += 1;
-                /** 驱逐时仍有多个会话卡在本地落定，说明本地存储已经严重变慢，开发期直接暴露出来。 */
-                if (deps.isDev && evicting > MAX_DETACHED_SESSIONS) console.warn("[canvas-sync] local teardown backlog", { evicting, detached: detached.size });
-                void oldest
-                    .dispose("forced")
-                    /** 有界 dispose 后继续观察该会话自己的 raw 写；不取消、不重试，也不阻塞新画布。 */
-                    .then(() => oldest.whenLocalSettled())
-                    .finally(() => {
-                        evicting -= 1;
-                    });
-            }
+        while (detached.size > MAX_DETACHED_SESSIONS) {
+            const oldest = detached.values().next().value as CanvasSyncSession | undefined;
+            if (!oldest || oldest === session) break;
+            /**
+             * 先中止再移出集合：dispose("forced") 会升级仍在进行的 replaced/scope-changed 收尾，
+             * 中止在飞请求并抑制后续本地写，因此被驱逐的会话不会带着请求与快照脱离视野。
+             */
+            const eviction = oldest.dispose("forced");
+            detached.delete(oldest);
+            evicting += 1;
+            /** 驱逐时仍有多个会话卡在本地落定，说明本地存储已经严重变慢，开发期直接暴露出来。 */
+            if (deps.isDev && evicting > MAX_DETACHED_SESSIONS) console.warn("[canvas-sync] local teardown backlog", { evicting, detached: detached.size });
+            void eviction
+                /** 有界 dispose 后继续观察该会话自己的 raw 写；不取消、不重试，也不阻塞新画布。 */
+                .then(() => oldest.whenLocalSettled())
+                .finally(() => {
+                    evicting -= 1;
+                });
         }
         void session
             .dispose(reason)
@@ -166,7 +169,14 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
      */
     async function runServerCopyCleanup(session: CanvasSyncSession, previous: CanvasSyncSession | null) {
         const draftScope = draftScopeOf(session);
-        const oldDraftKeys = previous ? [previous.draftKey] : [];
+        /**
+         * marker 可能有两条条目（8.3：本会话条目 + 外来条目），只删被替换会话自己的那一条，
+         * 另一条会作为 pending 草稿在下次打开时重新升级成冲突。因此先读一次 marker，把它引用的草稿键全部收集起来。
+         */
+        const markerBefore = await settleWithin(deps.recovery.readMarker(draftScope), LOCAL_READ_TIMEOUT_MS);
+        const markerKeys = markerBefore.status === "ok" && markerBefore.value ? markerBefore.value.entries.map((entry) => entry.draftKey) : [];
+        /** 新会话的草稿键绝不能被删：它是这次「载入服务端版本」之后的当前会话。 */
+        const oldDraftKeys = [...new Set([...(previous ? [previous.draftKey] : []), ...markerKeys])].filter((key) => key !== session.draftKey);
         if (previous) await settleWithin(previous.dispose("forced"), DETACHED_LOCAL_MS);
         await clearConflictRecovery(draftScope, oldDraftKeys);
         if (!previous) return;
@@ -178,23 +188,32 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
         await clearConflictRecovery(draftScope, oldDraftKeys);
     }
 
-    /** 只删画布 marker 与被替换会话明确拥有的草稿键；不枚举同 canvasId 的新会话或其他标签页草稿。 */
+    /**
+     * 只删被替换会话明确拥有的草稿键，marker 则按身份条件删除。
+     * 第二段清理可能在很久之后才跑：此时若已有更新的会话写入了自己的 marker，无条件删除会抹掉一份真实冲突。
+     */
     async function clearConflictRecovery(draftScope: CanvasDraftScope, oldDraftKeys: string[]) {
-        await settleWithin(Promise.allSettled([...oldDraftKeys.map((key) => deps.recovery.deleteDraftByKey(key)), deps.recovery.deleteMarker(draftScope)]), LOCAL_FLUSH_TIMEOUT_MS);
+        await settleWithin(
+            Promise.allSettled([...oldDraftKeys.map((key) => deps.recovery.deleteDraftByKey(key).result), deps.recovery.deleteMarkerIfOwned(draftScope, oldDraftKeys).result]),
+            LOCAL_FLUSH_TIMEOUT_MS,
+        );
     }
 
     /** 画布已被删除：该画布下的全部草稿与 marker 都没有价值，一次清干净。 */
     async function clearDeletedCanvasRecovery(draftScope: CanvasDraftScope) {
         const drafts = await settleWithin(deps.recovery.listCanvasDrafts(draftScope), LOCAL_READ_TIMEOUT_MS);
         const keys = drafts.status === "ok" ? drafts.value.map((draft) => canvasDraftKey(draftScope, draft.draftId)) : [];
-        await settleWithin(Promise.allSettled([...keys.map((key) => deps.recovery.deleteDraftByKey(key)), deps.recovery.deleteMarker(draftScope)]), LOCAL_FLUSH_TIMEOUT_MS);
+        /** 画布已确认删除，marker 无条件清理：这个 canvasId 不会再有合法的新会话。 */
+        await settleWithin(Promise.allSettled([...keys.map((key) => deps.recovery.deleteDraftByKey(key).result), deps.recovery.deleteMarker(draftScope).result]), LOCAL_FLUSH_TIMEOUT_MS);
     }
 
     /** 4.5：打开成功后异步回收，保留当前会话草稿与 marker 引用的草稿，其余超过 6 小时才删。 */
     async function collectDraftGarbage(session: CanvasSyncSession) {
         const draftScope = draftScopeOf(session);
         const marker = await settleWithin(deps.recovery.readMarker(draftScope), LOCAL_READ_TIMEOUT_MS);
-        const keep = [session.draftKey, ...(marker.status === "ok" && marker.value ? marker.value.entries.map((entry) => entry.draftKey) : [])];
+        /** marker 归属未知时完全跳过回收：「读不出来」不能降级成「没有 marker」，否则会删掉正被引用的冲突草稿。 */
+        if (marker.status !== "ok") return;
+        const keep = [session.draftKey, ...(marker.value ? marker.value.entries.map((entry) => entry.draftKey) : [])];
         await deps.recovery.collectGarbage(draftScope, keep);
     }
 
@@ -267,20 +286,31 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
         if (!current || !canvasIds.length) return { deleted: [], failed: [] };
         const target = active && canvasIds.includes(active.canvasId) ? active : null;
         if (target) {
-            activeUnsubscribe?.();
-            activeUnsubscribe = null;
-            active = null;
-            notify();
             /**
-             * 跳过网络收尾，并有界等待已在飞的本地写：这一步只保证「不再新增本地写」，
-             * 不保证写已落盘（等待有上界），所以删除结果最多在此等 DETACHED_LOCAL_MS，
-             * 真正的落定由 runDeletedCanvasCleanup 的第二段负责。
+             * 删除结果未知之前只做「可逆冻结」：停编辑、停网络、强制把最后一次编辑落到本地，
+             * 但仍持有会话。删除失败时必须能原样恢复，否则活动画布会连同它最新的编辑一起消失。
              */
-            await target.dispose("deleted");
+            await target.holdForDelete();
         }
         const outcomes = await Promise.allSettled(canvasIds.map((canvasId) => deps.repository.remove(current.workspaceId, canvasId)));
         const deleted = canvasIds.filter((_id, index) => outcomes[index].status === "fulfilled");
         const failed = canvasIds.filter((canvasId) => !deleted.includes(canvasId));
+        if (target) {
+            if (deleted.includes(target.canvasId)) {
+                /** 服务端确认删除后才终结：此时清空 active，并按 deleted 收尾跳过网络。 */
+                if (active === target) {
+                    activeUnsubscribe?.();
+                    activeUnsubscribe = null;
+                    active = null;
+                }
+                await target.dispose("deleted");
+                notify();
+            } else {
+                /** 删除失败：同一个会话继续可用，冻结期间的编辑重新排程，UI 也要立刻回到可编辑状态。 */
+                target.releaseHold();
+                notify();
+            }
+        }
         /**
          * 故意使用调用时捕获的 current，而不是当前 scope：这些画布是在 current 下被删除的，
          * 它们的草稿与 marker 也只存在于 current 作用域的键下。删除期间若发生作用域切换，
