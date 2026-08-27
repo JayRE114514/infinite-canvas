@@ -12,6 +12,7 @@ import {
     type CanvasDraftRecord,
     type CanvasDraftScope,
     type CanvasLocalRecovery,
+    type CanvasLocalWrite,
 } from "@/services/canvas-sync/types";
 
 const recoveryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "canvas_recovery" });
@@ -41,6 +42,16 @@ async function bounded<T>(operation: string, work: Promise<T>, timeoutMs: number
     const result = await settleWithin(work, timeoutMs);
     if (result.status !== "ok") throw new CanvasLocalRecoveryError(operation);
     return result.value;
+}
+
+/** result 与 settled 共享同一条原始 setItem；settled 吞掉原始拒绝，供后台观察链安全等待。 */
+function localWrite(operation: string, raw: Promise<unknown>): CanvasLocalWrite {
+    const settled = raw.then(
+        () => undefined,
+        () => undefined,
+    );
+    const result = bounded(operation, raw, LOCAL_FLUSH_TIMEOUT_MS).then(() => undefined);
+    return { result, settled };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -91,9 +102,7 @@ export const canvasLocalRecovery: CanvasLocalRecovery = {
         }
         return marker;
     },
-    writeMarker: async (marker) => {
-        await bounded("writeMarker", recoveryStore.setItem(canvasConflictMarkerKey(marker), marker), LOCAL_FLUSH_TIMEOUT_MS);
-    },
+    writeMarker: (marker) => localWrite("writeMarker", recoveryStore.setItem(canvasConflictMarkerKey(marker), marker)),
     deleteMarker: async (scope) => {
         await bounded("deleteMarker", recoveryStore.removeItem(canvasConflictMarkerKey(scope)), LOCAL_FLUSH_TIMEOUT_MS);
     },
@@ -101,9 +110,7 @@ export const canvasLocalRecovery: CanvasLocalRecovery = {
         const value = await bounded("readDraftByKey", recoveryStore.getItem<unknown>(key), LOCAL_READ_TIMEOUT_MS);
         return asDraftRecord(value, key);
     },
-    writeDraft: async (record) => {
-        await bounded("writeDraft", recoveryStore.setItem(canvasDraftKey(record, record.draftId), record), LOCAL_FLUSH_TIMEOUT_MS);
-    },
+    writeDraft: (record) => localWrite("writeDraft", recoveryStore.setItem(canvasDraftKey(record, record.draftId), record)),
     deleteDraftByKey: async (key) => {
         await bounded("deleteDraftByKey", recoveryStore.removeItem(key), LOCAL_FLUSH_TIMEOUT_MS);
     },

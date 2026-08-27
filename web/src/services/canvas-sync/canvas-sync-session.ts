@@ -24,6 +24,7 @@ import {
     type CanvasLoadResult,
     type CanvasLocalPersistState,
     type CanvasLocalRecovery,
+    type CanvasLocalWrite,
     type CanvasProjectPatch,
     type CanvasRenameOutcome,
     type CanvasRetryRecoveryResult,
@@ -104,7 +105,9 @@ export async function resolveCanvasOpenRecovery(
         if (valid.length) {
             /** entries[0] 无效时剔除无效条目并重写 marker，最新的一条永远排在最前。 */
             if (valid.length !== marker.entries.length) {
-                await settleWithin(deps.recovery.writeMarker({ ...marker, entries: valid }), LOCAL_FLUSH_TIMEOUT_MS);
+                const write = deps.recovery.writeMarker({ ...marker, entries: valid });
+                /** resolver 尚未创建会话：只消费有界结果，原始落定信号不归属之后才创建的会话。 */
+                await settleWithin(write.result, LOCAL_FLUSH_TIMEOUT_MS);
             }
             const draft = draftByKey.get(valid[0].draftKey) as CanvasDraftRecord;
             return {
@@ -127,7 +130,9 @@ export async function resolveCanvasOpenRecovery(
     if (pending) {
         /** 崩溃或离线路径产生的冲突：提升为 marker 后按冲突处理。 */
         const entry: CanvasConflictMarkerEntry = { draftKey: canvasDraftKey(draftScope, pending.draftId), draftId: pending.draftId, baseRevision: pending.baseRevision, savedAt: pending.savedAt };
-        await settleWithin(deps.recovery.writeMarker({ ...draftScope, entries: [entry] }), LOCAL_FLUSH_TIMEOUT_MS);
+        const write = deps.recovery.writeMarker({ ...draftScope, entries: [entry] });
+        /** resolver 写不附着到稍后创建的会话；打开流程只等待它自己的有界 result。 */
+        await settleWithin(write.result, LOCAL_FLUSH_TIMEOUT_MS);
         return {
             phase: "conflict",
             content: restoreContent(load.project, pending),
@@ -189,10 +194,11 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
     let pendingSlot: { record: CanvasDraftRecord; seq: number; deleteAfterWrite: boolean } | null = null;
     let drainPromise: Promise<void> | null = null;
     /**
-     * 本会话自己发起、仍在飞的本地恢复操作：草稿落盘、冲突记录整条尾巴（drain + marker 读写）以及恢复重试的 marker 写。
-     * 只登记引用，不重试、不排队快照；草稿仍然只有 pendingSlot 一个槽。
+     * 本会话自己发起、仍在飞的本地恢复操作：原始草稿/marker 写落定信号、可产生写入的完整尾巴及其有界读取。
+     * 集合归属于这个 session 闭包，不按 canvasId 全局共享；只登记引用，不重试、不排队快照。
      */
     const inFlightLocal = new Set<Promise<unknown>>();
+    let localSettlementWatcher: Promise<void> | null = null;
     let inflightController: AbortController | null = null;
     let disposePromise: Promise<void> | null = null;
     let emitted: CanvasSyncView | null = null;
@@ -389,7 +395,9 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
                 const entry = pendingSlot;
                 pendingSlot = null;
                 try {
-                    await deps.recovery.writeDraft(entry.record);
+                    const write = deps.recovery.writeDraft(entry.record);
+                    /** 必须先同步登记 raw settled，再等待可能在 2 秒提前失败的 result。 */
+                    await trackWrite(write);
                     persistedSeq = Math.max(persistedSeq, entry.seq);
                 } catch {
                     /** 丢弃这一条即可：下一次 materialize 会带上更新的内容。 */
@@ -434,20 +442,29 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         return work;
     }
 
+    /** settled 永不拒绝；同步登记后才把有界 result 交还正常控制流。 */
+    function trackWrite(write: CanvasLocalWrite): Promise<void> {
+        trackLocal(write.settled);
+        return write.result;
+    }
+
     /**
-     * 等到本会话再没有在飞的本地恢复操作为止，不设上界。
-     * 覆盖草稿落盘（drainLocal）与 persistConflictRecords 的完整尾巴（drain + marker 读 + marker 写），
-     * 即所有由本会话发起、会改动本地恢复记录的异步操作。
-     * 它只观察，不取消：IndexedDB 的写无法取消，dispose 的有界等待超时也不代表写已经结束。
-     * 循环是必要的：等待期间可能又有新的 drain 或 marker 尾巴被排上，只等一次仍可能漏掉最后一条。
+     * 等到本会话的 drain、写入生产尾巴与每条 raw settled 信号都结束，不设上界。
+     * dispose 会阻断新入口，已启动而稍后才可能产生写入的 finalSave/persistConflictRecords 尾巴也先登记在本集合，
+     * 因此无工作时可立即返回；有工作时必须循环，等待期间新登记的 marker 写交给下一轮。
+     * 同一会话只创建一个观察器。它不取消或重试，原始写永久挂起时这个后台观察器也永久挂起。
      */
-    async function whenLocalSettled(): Promise<void> {
-        while (drainPromise || inFlightLocal.size) {
-            /** 快照当前批次后整批等待；期间新登记的操作留给下一轮循环。 */
-            const pending = [drainPromise, ...inFlightLocal].filter(Boolean) as Promise<unknown>[];
-            /** allSettled 不会因单条失败而提前返回，本地写失败已由各自路径吞掉并标记 degraded。 */
-            await Promise.allSettled(pending);
-        }
+    function whenLocalSettled(): Promise<void> {
+        if (localSettlementWatcher) return localSettlementWatcher;
+        localSettlementWatcher = (async () => {
+            while (drainPromise || inFlightLocal.size) {
+                /** 快照当前批次后整批等待；期间新登记的操作留给下一轮循环。 */
+                const pending = [drainPromise, ...inFlightLocal].filter(Boolean) as Promise<unknown>[];
+                /** raw settled 永不拒绝；allSettled 同时保护其他尾巴失败时不提前结束观察。 */
+                await Promise.allSettled(pending);
+            }
+        })();
+        return localSettlementWatcher;
     }
 
     function clearNetworkTimer() {
@@ -574,12 +591,14 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         const written = await settleWithin(drainLocal(), LOCAL_FLUSH_TIMEOUT_MS);
         if (written.status !== "ok") markDegraded();
         const entry: CanvasConflictMarkerEntry = { draftKey, draftId: resolution.draftId, baseRevision, savedAt: new Date(deps.now()).toISOString() };
-        /** 逐条登记原始 promise：settleWithin 超时会提前返回，但底层写仍在飞，必须能被落定信号观察到。 */
+        /** 完整尾巴已登记；这里也登记有界读取，保证 marker 写开始前观察器不会越过步骤间隙。 */
         const existing = await settleWithin(trackLocal(deps.recovery.readMarker(draftScope)), LOCAL_READ_TIMEOUT_MS);
         const older = existing.status === "ok" && existing.value ? existing.value.entries.filter((item) => item.draftKey !== draftKey) : [];
         /** 最新的本地内容永远排在 entries[0]，旧 marker 不能夺回入口。 */
         const entries = [entry, ...older].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
-        const marked = await settleWithin(trackLocal(deps.recovery.writeMarker({ ...draftScope, entries })), LOCAL_FLUSH_TIMEOUT_MS);
+        const markerWrite = deps.recovery.writeMarker({ ...draftScope, entries });
+        /** raw settled 先进入本会话集合；有界 result 仍负责 degraded。 */
+        const marked = await settleWithin(trackWrite(markerWrite), LOCAL_FLUSH_TIMEOUT_MS);
         if (marked.status !== "ok") markDegraded();
         if (conflict && conflict.extraDraftCount !== entries.length - 1) {
             conflict = { ...conflict, extraDraftCount: entries.length - 1 };
@@ -641,7 +660,9 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         /** 恢复重试只修正 lineage，绝不替换画布内容：替换内容只允许走冲突条上的显式动作。 */
         const own: CanvasConflictMarkerEntry[] = editSeq > savedSeq ? [{ draftKey, draftId: resolution.draftId, baseRevision: revision, savedAt: new Date(deps.now()).toISOString() }] : [];
         const entries = [...own, ...valid.filter((entry) => entry.draftKey !== draftKey)].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
-        const marked = await settleWithin(trackLocal(deps.recovery.writeMarker({ ...draftScope, entries })), LOCAL_FLUSH_TIMEOUT_MS);
+        const markerWrite = deps.recovery.writeMarker({ ...draftScope, entries });
+        /** 恢复重试也是本会话所有：先登记 raw settled，再等待有界 result。 */
+        const marked = await settleWithin(trackWrite(markerWrite), LOCAL_FLUSH_TIMEOUT_MS);
         if (marked.status !== "ok") markDegraded();
         conflictBaseRevision = own.length ? revision : valid[0].baseRevision;
         conflict = { baseRevision: conflictBaseRevision, source: "restored", extraDraftCount: entries.length - 1 };
@@ -688,7 +709,10 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
                 await settleWithin(drainPromise ?? Promise.resolve(), DETACHED_LOCAL_MS);
             } else {
                 await flushLocal(DETACHED_LOCAL_MS);
-                if (networkAllowed && inflightSeq < 0) await settleWithin(finalSave(), DETACHED_NETWORK_MS);
+                if (networkAllowed && inflightSeq < 0) {
+                    /** 网络有界等待后仍可能迟到 409 并产生 marker 尾巴，先登记整个生产尾巴以封住该空窗。 */
+                    await settleWithin(trackLocal(finalSave()), DETACHED_NETWORK_MS);
+                }
             }
             phase = "disposed";
             notify();

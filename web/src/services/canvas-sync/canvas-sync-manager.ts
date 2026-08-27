@@ -66,7 +66,7 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
                 if (deps.isDev && evicting > MAX_DETACHED_SESSIONS) console.warn("[canvas-sync] local teardown backlog", { evicting, detached: detached.size });
                 void oldest
                     .dispose("forced")
-                    /** 有界 dispose 返回后本地写可能还在飞，必须等真正落定，晚到的写才不会逃过后续清理。 */
+                    /** 有界 dispose 后继续观察该会话自己的 raw 写；不取消、不重试，也不阻塞新画布。 */
                     .then(() => oldest.whenLocalSettled())
                     .finally(() => {
                         evicting -= 1;
@@ -158,32 +158,29 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
     }
 
     /**
-     * 用户显式选择服务端版本后，本地冲突记录必须最终消失。
-     * 但 IndexedDB 的写不可取消：dispose 的有界等待超时后，那次写仍可能在清理之后落盘，把刚删掉的草稿写回来。
+     * 用户显式选择服务端版本后，旧会话自己的草稿与它迟到写回的 marker 必须最终消失。
+     * 但 IndexedDB 的 setItem 不可取消：有界 result/dispose 超时后，原始草稿或 marker 写仍可能在清理之后落盘。
      * 因此做两段：先在有界等待后立即清理一次（快路径，UI 立刻自洽），
      * 再等被替换会话真正本地落定后补一次幂等清理（慢路径，负责删掉超时后才写回的那条）。
-     * 两段都不阻塞 commit 与画布补水；第二段等待无上界，但它只是一条后台清理链，不在任何打开画布的等待路径上。
+     * 两段都不阻塞 commit 与画布补水；第二段只观察 previous 会话的 owner-scoped 信号，绝不等待同 canvasId 的新会话。
      */
     async function runServerCopyCleanup(session: CanvasSyncSession, previous: CanvasSyncSession | null) {
         const draftScope = draftScopeOf(session);
-        const extraKeys = previous ? [previous.draftKey] : [];
+        const oldDraftKeys = previous ? [previous.draftKey] : [];
         if (previous) await settleWithin(previous.dispose("forced"), DETACHED_LOCAL_MS);
-        await clearConflictRecovery(draftScope, extraKeys);
+        await clearConflictRecovery(draftScope, oldDraftKeys);
         if (!previous) return;
         /**
-         * 第二段无条件执行：dispose 内部对本地写的等待同样是有界的，
-         * 因此「dispose 已完成」并不等于「写已落盘」，只有 whenLocalSettled 才是真实落定信号。
-         */
+         * 第二段无条件执行：dispose 与 write.result 都有界，只有 whenLocalSettled 会观察 raw setItem 的成功或拒绝。
+         * 重复调用共享 previous 会话唯一的观察器；永久挂起只留下这条后台链，不影响 commit/open/UI。
+        */
         await previous.whenLocalSettled();
-        await clearConflictRecovery(draftScope, extraKeys);
+        await clearConflictRecovery(draftScope, oldDraftKeys);
     }
 
-    /** 7.2：只清理该画布的 marker、marker 引用的草稿和被替换会话自己的草稿；同源其他标签页的活草稿不动。 */
-    async function clearConflictRecovery(draftScope: CanvasDraftScope, extraKeys: string[]) {
-        const marker = await settleWithin(deps.recovery.readMarker(draftScope), LOCAL_READ_TIMEOUT_MS);
-        const keys = new Set(extraKeys);
-        if (marker.status === "ok" && marker.value) marker.value.entries.forEach((entry) => keys.add(entry.draftKey));
-        await settleWithin(Promise.allSettled([...[...keys].map((key) => deps.recovery.deleteDraftByKey(key)), deps.recovery.deleteMarker(draftScope)]), LOCAL_FLUSH_TIMEOUT_MS);
+    /** 只删画布 marker 与被替换会话明确拥有的草稿键；不枚举同 canvasId 的新会话或其他标签页草稿。 */
+    async function clearConflictRecovery(draftScope: CanvasDraftScope, oldDraftKeys: string[]) {
+        await settleWithin(Promise.allSettled([...oldDraftKeys.map((key) => deps.recovery.deleteDraftByKey(key)), deps.recovery.deleteMarker(draftScope)]), LOCAL_FLUSH_TIMEOUT_MS);
     }
 
     /** 画布已被删除：该画布下的全部草稿与 marker 都没有价值，一次清干净。 */
@@ -299,15 +296,15 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
     }
 
     /**
-     * 画布删除后的清理与服务端版本重载同构：dispose 对本地写的等待有上界，
-     * 返回时那次写可能仍在飞，并在清理之后落盘，把已删画布的草稿重新写回来。
+     * 画布删除后的清理与服务端版本重载同构：dispose 与 write.result 都有界，
+     * 返回时 raw setItem 可能仍在飞，并在清理之后落盘，把已删画布的草稿或 marker 写回来。
      * 因此先立即清理一次（删除结果与 UI 不等待本地存储），再等会话真正本地落定后幂等地补清一次。
      * 第二段无上界，但只是后台清理链，不在删除结果、UI 或打开画布的等待路径上。
      */
     async function runDeletedCanvasCleanup(draftScope: CanvasDraftScope, late: CanvasSyncSession | null) {
         await clearDeletedCanvasRecovery(draftScope);
         if (!late) return;
-        /** 覆盖草稿落盘与 marker 尾巴：两者都属于会话自己的本地恢复操作。 */
+        /** 只观察 late 这个会话的 raw 写与生产尾巴；同 canvasId 的其他会话不在其 owner-scoped 集合中。 */
         await late.whenLocalSettled();
         await clearDeletedCanvasRecovery(draftScope);
     }

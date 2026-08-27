@@ -80,13 +80,20 @@ export class CanvasLocalRecoveryError extends Error {
     }
 }
 
-/** 每个方法自带单次调用上界，只做存取与校验，不做调度，不判断冲突语义。 */
+export type CanvasLocalWrite = {
+    /** 最多等待 LOCAL_FLUSH_TIMEOUT_MS；失败或超时统一抛 CanvasLocalRecoveryError。 */
+    result: Promise<void>;
+    /** 观察同一次原始 setItem 直到成功或失败；永不拒绝、没有超时，也不会取消底层写。 */
+    settled: Promise<void>;
+};
+
+/** 只做存取与校验，不做调度，不判断冲突语义；读取/删除有界，写入同时暴露有界结果与原始落定信号。 */
 export interface CanvasLocalRecovery {
     readMarker(scope: CanvasDraftScope): Promise<CanvasConflictMarker | null>;
-    writeMarker(marker: CanvasConflictMarker): Promise<void>;
+    writeMarker(marker: CanvasConflictMarker): CanvasLocalWrite;
     deleteMarker(scope: CanvasDraftScope): Promise<void>;
     readDraftByKey(key: string): Promise<CanvasDraftRecord | null>;
-    writeDraft(record: CanvasDraftRecord): Promise<void>;
+    writeDraft(record: CanvasDraftRecord): CanvasLocalWrite;
     deleteDraftByKey(key: string): Promise<void>;
     /** 前缀枚举该画布全部草稿，savedAt 新的在前。 */
     listCanvasDrafts(scope: CanvasDraftScope): Promise<CanvasDraftRecord[]>;
@@ -136,17 +143,16 @@ export interface CanvasSyncSession {
     update(patch: CanvasProjectPatch): boolean;
     /** 标题在调用前已由 clampCanvasTitle 截断到 CANVAS_TITLE_MAX_LENGTH。 */
     rename(title: string): CanvasRenameOutcome;
-    /** 强制物化本地并在允许时提交一次；内部全部有界。 */
+    /** 强制物化本地并在允许时提交一次；对外等待全部有界，超时后的原始本地写由 settled 继续观察。 */
     flush(): Promise<void>;
     retrySave(): Promise<void>;
     retryRecovery(): Promise<CanvasRetryRecoveryResult>;
     exportConflictDrafts(): Promise<CanvasProject[]>;
     dispose(reason: CanvasDisposeReason): Promise<void>;
     /**
-     * 真实的本地落定信号：等到该会话再没有任何在飞的本地恢复操作为止，故意不设上界。
-     * 覆盖范围是全部由本会话发起、会改动本地恢复记录的异步操作：草稿落盘队列，
-     * 以及冲突记录与恢复重试的完整尾巴（草稿落盘之后的 marker 读取与写入）。
-     * 它只观察，不取消任何操作：IndexedDB 的写无法取消，dispose 的有界等待返回也不代表写已经结束。
+     * 会话所有的本地落定信号：等到该会话的草稿队列、可产生写入的尾巴和原始 setItem 都结束，故意不设上界。
+     * 同一会话的重复调用共享一个观察器；等待期间新登记的操作会在下一轮被重新检查。
+     * 它只观察，不取消或重试：有界 result/dispose 返回不代表原始写已结束，永久挂起也会令本观察器永久挂起。
      * 只允许在已 dispose 或正在 dispose 的会话上调用，且只用于清理路径补一次幂等清理，绝不出现在打开画布的等待路径上。
      */
     whenLocalSettled(): Promise<void>;
