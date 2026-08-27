@@ -43,8 +43,14 @@ export function useCanvasProjectSync({ projectId, hydrate, applyToCanvas }: UseC
     const runRef = useRef(0);
     const hydrateRef = useRef(hydrate);
     const applyRef = useRef(applyToCanvas);
+    const navigateRef = useRef(navigate);
+    const messageRef = useRef(message);
+    const tRef = useRef(t);
     hydrateRef.current = hydrate;
     applyRef.current = applyToCanvas;
+    navigateRef.current = navigate;
+    messageRef.current = message;
+    tRef.current = t;
     const scopeKey = scope ? [scope.userId, scope.workspaceId].join(":") : "";
 
     useEffect(() => {
@@ -59,8 +65,8 @@ export function useCanvasProjectSync({ projectId, hydrate, applyToCanvas }: UseC
             const prepared = await canvasSyncManager.prepareOpen(projectId);
             if (superseded() || prepared.status === "cancelled") return;
             if (prepared.status === "missing") {
-                message.error(t("canvas.notFound"));
-                navigate("/canvas", { replace: true });
+                messageRef.current.error(tRef.current("canvas.notFound"));
+                navigateRef.current("/canvas", { replace: true });
                 return;
             }
             if (prepared.status === "failed") {
@@ -68,7 +74,15 @@ export function useCanvasProjectSync({ projectId, hydrate, applyToCanvas }: UseC
                 setErrorKey(prepared.messageKey);
                 return;
             }
-            const hydrated = await hydrateRef.current(prepared.project);
+            let hydrated: CanvasProject;
+            try {
+                hydrated = await hydrateRef.current(prepared.project);
+            } catch {
+                if (superseded()) return;
+                setStatus("error");
+                setErrorKey("canvas.openFailed");
+                return;
+            }
             if (superseded()) return;
             /** commit 返回 false 一律按 cancelled 处理：不写 React、不导航、不提示。 */
             if (!canvasSyncManager.commitPrepared(prepared, hydrated)) return;
@@ -79,7 +93,7 @@ export function useCanvasProjectSync({ projectId, hydrate, applyToCanvas }: UseC
         return () => {
             runRef.current += 1;
         };
-    }, [message, navigate, openRun, projectId, scopeKey, t]);
+    }, [openRun, projectId, scopeKey]);
 
     const reloadServerCopy = useCallback(async (): Promise<CanvasCommitServerCopyResult> => {
         const run = ++runRef.current;
@@ -92,7 +106,14 @@ export function useCanvasProjectSync({ projectId, hydrate, applyToCanvas }: UseC
             setApplied(true);
             return prepared.status === "cancelled" ? "cancelled" : "failed";
         }
-        const hydrated = await hydrateRef.current(prepared.project);
+        let hydrated: CanvasProject;
+        try {
+            hydrated = await hydrateRef.current(prepared.project);
+        } catch {
+            if (superseded()) return "cancelled";
+            setApplied(true);
+            return "failed";
+        }
         if (superseded()) return "cancelled";
         const result = canvasSyncManager.commitServerCopy(prepared, hydrated);
         if (result !== "committed") {
