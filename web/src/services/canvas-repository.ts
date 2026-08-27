@@ -2,57 +2,95 @@ import type { Canvas, CanvasSnapshot } from "@infinite-canvas/contracts";
 
 import { canvasToProject, summaryToProjectSummary, type CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
 import { createCanvas, deleteCanvas, fetchCanvas, fetchCanvasList, saveCanvas } from "@/services/api/canvases";
-import { PlatformApiError } from "@/services/api/platform-client";
-import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import { PlatformApiError, platformErrorTranslationKey } from "@/services/api/platform-client";
+import { LOAD_REQUEST_TIMEOUT_MS, SAVE_REQUEST_TIMEOUT_MS, type CanvasLoadResult, type CanvasOpenFailure, type CanvasSaveFailure, type CanvasSaveInput, type CanvasSyncRepository } from "@/services/canvas-sync/types";
 
-/**
- * 仓储层只负责「服务端契约 <-> 前端 CanvasProject」的转换与请求编排，不引用任何 Zustand store，
- * 便于在没有 React 环境时单独调用，也避免 store 与网络层互相依赖。
- */
 export const REVISION_CONFLICT_CODE = "revision_conflict";
-const CANVAS_SAVE_TIMEOUT_MS = 20_000;
+const CANVAS_NOT_FOUND_CODE = "canvas_not_found";
+const SNAPSHOT_TOO_LARGE_CODE = "canvas_snapshot_too_large";
+const NETWORK_ERROR_CODE = "platform_network_error";
+
+export class CanvasRequestTimeoutError extends Error {
+    constructor() {
+        super("canvas_request_timeout");
+        this.name = "CanvasRequestTimeoutError";
+    }
+}
 
 export function isRevisionConflictError(error: unknown) {
     return error instanceof PlatformApiError && error.code === REVISION_CONFLICT_CODE;
 }
 
-export type CanvasLoadResult = { project: CanvasProject; revision: number };
-
-export async function listCanvasSummaries(workspaceId: string): Promise<CanvasProjectSummary[]> {
-    const canvases = await fetchCanvasList(workspaceId);
-    return canvases.map(summaryToProjectSummary);
+/** 读取只解除等待，不中止请求；真实拒绝原样抛出，404 与超时因此不会互相污染。 */
+function withReadTimeout<T>(operation: Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new CanvasRequestTimeoutError()), LOAD_REQUEST_TIMEOUT_MS);
+        operation.then(
+            (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            (error) => {
+                clearTimeout(timer);
+                reject(error);
+            },
+        );
+    });
 }
 
-export async function loadCanvasProject(workspaceId: string, canvasId: string): Promise<CanvasLoadResult> {
-    return toResult(await fetchCanvas(workspaceId, canvasId));
-}
-
-export async function createCanvasProject(workspaceId: string, title: string): Promise<CanvasLoadResult> {
-    return toResult(await createCanvas(workspaceId, { title }));
-}
-
-export async function importCanvasProject(workspaceId: string, body: { title: string; snapshot: CanvasSnapshot }): Promise<CanvasLoadResult> {
-    return toResult(await createCanvas(workspaceId, body));
-}
-
-export async function saveCanvasProject(
-    workspaceId: string,
-    canvasId: string,
-    input: { baseRevision: number; title?: string; snapshot: CanvasSnapshot },
-): Promise<CanvasLoadResult> {
+async function saveWithTimeout(workspaceId: string, canvasId: string, input: CanvasSaveInput, external?: AbortSignal): Promise<CanvasLoadResult> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CANVAS_SAVE_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, SAVE_REQUEST_TIMEOUT_MS);
+    const abortFromExternal = () => controller.abort();
+    if (external?.aborted) controller.abort();
+    else external?.addEventListener("abort", abortFromExternal, { once: true });
     try {
         return toResult(await saveCanvas(workspaceId, canvasId, input, controller.signal));
+    } catch (error) {
+        throw timedOut ? new CanvasRequestTimeoutError() : error;
     } finally {
-        clearTimeout(timeout);
+        clearTimeout(timer);
+        external?.removeEventListener("abort", abortFromExternal);
     }
 }
 
-export async function deleteCanvasProject(workspaceId: string, canvasId: string) {
-    await deleteCanvas(workspaceId, canvasId);
+/** revision_conflict 是唯一的冲突来源；canvas_revision_limit_reached 等 409 落在最后一条分支，按 server 处理。 */
+export function classifyCanvasSaveError(error: unknown): CanvasSaveFailure {
+    if (isRevisionConflictError(error)) return { kind: "conflict" };
+    if (error instanceof CanvasRequestTimeoutError) return { kind: "timeout", messageKey: "canvas.save.failed" };
+    if (error instanceof PlatformApiError && error.code === SNAPSHOT_TOO_LARGE_CODE) return { kind: "server", messageKey: "canvas.save.tooLarge" };
+    if (error instanceof PlatformApiError && error.code === NETWORK_ERROR_CODE) return { kind: "network", messageKey: "canvas.save.failed" };
+    return { kind: "server", messageKey: "canvas.save.failed" };
 }
 
-function toResult(canvas: Canvas) {
+export function classifyCanvasOpenError(error: unknown): CanvasOpenFailure {
+    if (error instanceof PlatformApiError && (error.code === CANVAS_NOT_FOUND_CODE || error.status === 404)) return { kind: "missing" };
+    return { kind: "failed", messageKey: platformErrorTranslationKey(error, "canvas.openFailed") };
+}
+
+export const canvasRepository: CanvasSyncRepository = {
+    list: async (workspaceId) => (await withReadTimeout(fetchCanvasList(workspaceId))).map(summaryToProjectSummary),
+    load: async (workspaceId, canvasId) => toResult(await withReadTimeout(fetchCanvas(workspaceId, canvasId))),
+    create: async (workspaceId, title) => toResult(await withReadTimeout(createCanvas(workspaceId, { title }))),
+    importProject: async (workspaceId, body) => toResult(await withReadTimeout(createCanvas(workspaceId, body))),
+    save: (workspaceId, canvasId, input, signal) => saveWithTimeout(workspaceId, canvasId, input, signal),
+    remove: async (workspaceId, canvasId) => {
+        await withReadTimeout(deleteCanvas(workspaceId, canvasId));
+    },
+};
+
+/** 旧 store 仍在调用，Task 3 删除这些包装。 */
+export const listCanvasSummaries = (workspaceId: string): Promise<CanvasProjectSummary[]> => canvasRepository.list(workspaceId);
+export const loadCanvasProject = (workspaceId: string, canvasId: string) => canvasRepository.load(workspaceId, canvasId);
+export const createCanvasProject = (workspaceId: string, title: string) => canvasRepository.create(workspaceId, title);
+export const importCanvasProject = (workspaceId: string, body: { title: string; snapshot: CanvasSnapshot }) => canvasRepository.importProject(workspaceId, body);
+export const saveCanvasProject = (workspaceId: string, canvasId: string, input: CanvasSaveInput) => canvasRepository.save(workspaceId, canvasId, input);
+export const deleteCanvasProject = (workspaceId: string, canvasId: string) => canvasRepository.remove(workspaceId, canvasId);
+
+function toResult(canvas: Canvas): CanvasLoadResult {
     return { project: canvasToProject(canvas), revision: canvas.revision };
 }

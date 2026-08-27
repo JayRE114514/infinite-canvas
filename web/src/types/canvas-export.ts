@@ -1,4 +1,4 @@
-import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import type { CanvasProject } from "@/types/canvas";
 
 export type CanvasExportFile = {
     app: "infinite-canvas";

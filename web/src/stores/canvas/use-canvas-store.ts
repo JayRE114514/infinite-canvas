@@ -2,7 +2,6 @@ import { create } from "zustand";
 
 import type { CanvasSnapshot } from "@infinite-canvas/contracts";
 
-import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { clampCanvasTitle, draftToProject, projectToImportBody, projectToSnapshot, projectToSummary, snapshotToProjectContent, type CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
 import { platformErrorTranslationKey } from "@/services/api/platform-client";
 import {
@@ -27,23 +26,8 @@ import {
     type CanvasConflictMarker,
     type CanvasDraftRecord,
 } from "@/services/canvas-drafts";
-import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
+import type { CanvasProject, CanvasScope } from "@/types/canvas";
 
-export type CanvasProject = {
-    id: string;
-    title: string;
-    createdAt: string;
-    updatedAt: string;
-    nodes: CanvasNodeData[];
-    connections: CanvasConnection[];
-    chatSessions: CanvasAssistantSession[];
-    activeChatId: string | null;
-    backgroundMode: CanvasBackgroundMode;
-    showImageInfo: boolean;
-    viewport: ViewportTransform;
-};
-
-export type CanvasScope = { userId: string; workspaceId: string };
 export type CanvasSaveState = "idle" | "saving" | "saved" | "conflict" | "error" | "recoveryError";
 
 /** 内存冲突只描述当前 active；跨画布、跨刷新事实由 localforage 中每画布独立的 marker 表达。 */

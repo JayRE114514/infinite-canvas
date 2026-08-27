@@ -385,6 +385,8 @@ export default {
         deleteFailed: "删除失败，请稍后重试",
         deletePartialFailed: "部分画布删除失败，请稍后重试",
         exportFailed: "导出失败，请稍后重试",
+        openFailed: "打开画布失败，请稍后重试",
+        notFound: "画布不存在或已被删除",
         retry: "重试",
         conflict: {
             title: "版本冲突",
@@ -406,6 +408,8 @@ export default {
             recoveryFailed: "本地草稿状态未知，已暂停云端保存",
             recoveryRetry: "重新检查",
             recoveryRetryFailed: "仍然读不到本地草稿状态，请稍后再试",
+            tooLarge: "画布内容过大，暂时无法保存到云端",
+            invariant: "同步状态异常，请重新载入画布",
         },
         exportSelected: "导出选中",
         deleteSelected: "删除选中",

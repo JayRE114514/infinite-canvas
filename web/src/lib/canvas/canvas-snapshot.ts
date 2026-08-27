@@ -1,8 +1,7 @@
 import type { Canvas, CanvasSnapshot, CanvasSummary } from "@infinite-canvas/contracts";
 
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
-import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
-import { CanvasNodeType, type CanvasAssistantSession, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata, type ViewportTransform } from "@/types/canvas";
+import { CanvasNodeType, type CanvasAssistantSession, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata, type CanvasProject, type ViewportTransform } from "@/types/canvas";
 
 /** 服务端只保证快照是合法 JSON，节点与连线语义仍由前端维护，这里集中做一次结构归一。 */
 export const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };

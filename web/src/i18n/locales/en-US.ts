@@ -385,6 +385,8 @@ export default {
         deleteFailed: "Could not delete the canvas. Please retry.",
         deletePartialFailed: "Some canvases could not be deleted. Please retry.",
         exportFailed: "Could not export the canvas. Please retry.",
+        openFailed: "Could not open the canvas. Try again.",
+        notFound: "This canvas no longer exists.",
         retry: "Retry",
         conflict: {
             title: "Revision conflict",
@@ -406,6 +408,8 @@ export default {
             recoveryFailed: "Local draft state unknown; cloud saving is paused",
             recoveryRetry: "Recheck",
             recoveryRetryFailed: "Still cannot read the local draft state. Try again later.",
+            tooLarge: "This canvas is too large to save to the cloud.",
+            invariant: "Sync state is inconsistent. Reload the canvas.",
         },
         exportSelected: "Export selected",
         deleteSelected: "Delete selected",

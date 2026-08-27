@@ -1,3 +1,5 @@
+import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+
 export type Position = {
     x: number;
     y: number;
@@ -161,3 +163,21 @@ export type ContextMenuState =
           y: number;
           connectionId: string;
       };
+
+/** 画布的前端权威内容结构；服务端只存 snapshot，id/时间戳/revision 以服务端返回为准。 */
+export type CanvasProject = {
+    id: string;
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    nodes: CanvasNodeData[];
+    connections: CanvasConnection[];
+    chatSessions: CanvasAssistantSession[];
+    activeChatId: string | null;
+    backgroundMode: CanvasBackgroundMode;
+    showImageInfo: boolean;
+    viewport: ViewportTransform;
+};
+
+/** 画布数据作用域 = 已登录 userId + 当前 Workspace ID。 */
+export type CanvasScope = { userId: string; workspaceId: string };
