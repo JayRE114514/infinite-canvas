@@ -18,8 +18,11 @@ const recoveryStore = localforage.createInstance({ name: "infinite-canvas", stor
 const DRAFT_PREFIX = "canvas-draft";
 const CONFLICT_PREFIX = "canvas-conflict";
 
-/** 项目尚未上线，不保留旧键兼容层：模块首次加载时丢弃一次旧 store，失败忽略。 */
-void localforage.dropInstance({ name: "infinite-canvas", storeName: "canvas_drafts" }).catch(() => undefined);
+/**
+ * 项目尚未上线，不保留旧键兼容层：模块首次加载时丢弃一次旧 store，失败忽略。
+ * 必须由隔离实例发起：默认实例已被 app_state 配置占用，在它上面调用会与既有配置竞争。
+ */
+void recoveryStore.dropInstance({ name: "infinite-canvas", storeName: "canvas_drafts" }).catch(() => undefined);
 
 export function canvasDraftKeyPrefix(scope: CanvasDraftScope) {
     return [DRAFT_PREFIX, encodeURIComponent(scope.userId), encodeURIComponent(scope.workspaceId), encodeURIComponent(scope.canvasId), ""].join(":");

@@ -1,6 +1,6 @@
-import type { Canvas, CanvasSnapshot } from "@infinite-canvas/contracts";
+import type { Canvas } from "@infinite-canvas/contracts";
 
-import { canvasToProject, summaryToProjectSummary, type CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
+import { canvasToProject, summaryToProjectSummary } from "@/lib/canvas/canvas-snapshot";
 import { createCanvas, deleteCanvas, fetchCanvas, fetchCanvasList, saveCanvas } from "@/services/api/canvases";
 import { PlatformApiError, platformErrorTranslationKey } from "@/services/api/platform-client";
 import { LOAD_REQUEST_TIMEOUT_MS, SAVE_REQUEST_TIMEOUT_MS, type CanvasLoadResult, type CanvasOpenFailure, type CanvasSaveFailure, type CanvasSaveInput, type CanvasSyncRepository } from "@/services/canvas-sync/types";
@@ -82,14 +82,6 @@ export const canvasRepository: CanvasSyncRepository = {
         await withReadTimeout(deleteCanvas(workspaceId, canvasId));
     },
 };
-
-/** 旧 store 仍在调用，Task 3 删除这些包装。 */
-export const listCanvasSummaries = (workspaceId: string): Promise<CanvasProjectSummary[]> => canvasRepository.list(workspaceId);
-export const loadCanvasProject = (workspaceId: string, canvasId: string) => canvasRepository.load(workspaceId, canvasId);
-export const createCanvasProject = (workspaceId: string, title: string) => canvasRepository.create(workspaceId, title);
-export const importCanvasProject = (workspaceId: string, body: { title: string; snapshot: CanvasSnapshot }) => canvasRepository.importProject(workspaceId, body);
-export const saveCanvasProject = (workspaceId: string, canvasId: string, input: CanvasSaveInput) => canvasRepository.save(workspaceId, canvasId, input);
-export const deleteCanvasProject = (workspaceId: string, canvasId: string) => canvasRepository.remove(workspaceId, canvasId);
 
 function toResult(canvas: Canvas): CanvasLoadResult {
     return { project: canvasToProject(canvas), revision: canvas.revision };

@@ -96,7 +96,7 @@ export const useAssetStore = create<AssetStore>()(
                 if (!releaseData) return;
                 window.setTimeout(async () => {
                     const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    const activeProject = useCanvasStore.getState().active?.project;
+                    const activeProject = useCanvasStore.getState().getActiveProject();
                     const retained = { assets: get().assets, extra, activeProject };
                     const retainedImages = collectImageStorageKeys(retained);
                     const retainedMedia = collectMediaStorageKeys(retained);
