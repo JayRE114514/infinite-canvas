@@ -142,7 +142,7 @@ ALTER ROLE app_maintenance NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPAS
 
 After the first RED is observed, `startPostgres` executes this bootstrap as the ephemeral container administrator before returning. `startRoleDatabase` builds on it and uses fixed, test-only `ALTER ROLE app_api PASSWORD 'test-app-api'` statements for the four static role names; it does not attempt to bind a password parameter into utility SQL. The helper grants database `CONNECT`, transfers the `public` schema to `schema_owner`, and grants that role `CREATE`. Thus the original compile-valid test becomes green through the real bootstrap rather than by changing its assertion.
 
-`adopt-ownership.sql` is an explicit deployment-administrator action for the pre-release database. It revokes `PUBLIC CREATE` on both `public` and the migrator's `drizzle` schema when present, changes both schema owners, and enumerates existing relations, sequences, and routines in those schemas, executing catalog-derived, identifier-quoted `ALTER ... OWNER TO schema_owner`; it excludes extension-owned objects. The upgrade-path test creates `legacy_owner`, applies the real immutable `0000/0001` journal entries as that role, snapshots every `drizzle.__drizzle_migrations` hash/timestamp row, and runs adoption as the container administrator. Task 1 proves every current application object plus the migration metadata table/sequence transferred, the history rows remained byte-for-byte unchanged, and extension objects did not transfer; Task 2 extends the same fixture to run `0002+` as `schema_owner`, assert the latest journal tag, and execute final application queries. A separate fresh-install path runs every available migration as `schema_owner`. The helper keeps known hashes for `0000/0001` so the upgrade fixture cannot silently follow rewritten historical SQL.
+`adopt-ownership.sql` is an explicit deployment-administrator action for the pre-release database. It revokes `PUBLIC CREATE` on both `public` and the migrator's `drizzle` schema when present, changes both schema owners, and enumerates existing relations, sequences, and routines in those schemas, executing catalog-derived, identifier-quoted `ALTER ... OWNER TO schema_owner`; it excludes extension-owned objects. The upgrade-path test creates `legacy_owner`, applies the real immutable `0000/0001` journal entries as that role, snapshots every `drizzle.__drizzle_migrations` hash/timestamp row, and runs adoption as the container administrator. Task 1 proves every current application object plus the migration metadata table/sequence transferred, the history rows remained byte-for-byte unchanged, and extension objects did not transfer; Task 2 extends the same fixture to run `0002+` as `schema_owner`, assert the SQL hash and journal `when` corresponding to the latest tag, and execute final application queries. A separate fresh-install path runs every available migration as `schema_owner`. The helper keeps known hashes for `0000/0001` so the upgrade fixture cannot silently follow rewritten historical SQL.
 
 - [ ] **Step 4: Split process configuration by credential**
 
@@ -189,7 +189,7 @@ Expected: FAIL at `toBe(false)` because the existing readiness implementation ch
 
 - [ ] **Step 7: Replace ad-hoc migration loading with the journaled migrator**
 
-`test/helpers/database.ts` uses Drizzle's `migrate` from `drizzle-orm/node-postgres/migrator` against the schema-owner handle and `server/migrations/meta/_journal.json`; `auth.ts` and Canvas tests call that one helper and stop reading individual SQL files. Add a fresh-database assertion that the journal's latest tag is recorded and the expected schema is owned by `schema_owner`.
+`test/helpers/database.ts` uses Drizzle's `migrate` from `drizzle-orm/node-postgres/migrator` against the schema-owner handle and `server/migrations/meta/_journal.json`; `auth.ts` and Canvas tests call that one helper and stop reading individual SQL files. Pinned Drizzle stores only migration `id`, `hash`, and `created_at`, not a tag string, so the fresh-database assertion maps the latest `_journal.json` entry to its SQL hash and `when`, then compares those values to the latest metadata row and verifies ownership by `schema_owner`.
 
 - [ ] **Step 8: Run focused and existing database tests to verify GREEN**
 
@@ -232,6 +232,10 @@ Record focused role/bootstrap evidence in the SDD ledger. Do not commit or hand 
 - Modify: `server/migrations/meta/_journal.json`
 - Generate: `server/migrations/meta/0002_snapshot.json`
 - Modify: `packages/contracts/src/workspaces.ts`
+- Modify: `web/src/router.tsx`
+- Modify: `web/src/pages/auth/accept-invitation.tsx`
+- Modify: `web/src/services/api/invitation-acceptance.ts`
+- Modify: `web/src/services/api/workspaces.ts`
 
 **Interfaces:**
 - Produces: `users` as the Identity module's public database reference from `modules/identity/schema.ts`; `workspaces`, `workspaceMembers`, `workspaceInvitations` only from `modules/workspaces/schema.ts`. Canvas imports Workspace only through that public schema entry.
@@ -363,6 +367,8 @@ Implement each direct service and `requireWorkspaceAccess` against a passed `App
 
 Invitation creation generates `randomBytes(32).toString("base64url")`, persists `sha256(token)` only, and sends a URL containing the raw token. Replace the old invitation-ID acceptance path with `POST /api/v1/workspace-invitations/accept` and strict body `{ token: string }`; acceptance hashes that raw token and conditionally claims the matching `pending`, unexpired invitation for the current user's verified email. An invitation ID cannot substitute for the token. Raw tokens never enter responses, logs, or the database, and duplicate/concurrent claims have exactly one winner.
 
+Cut the browser over in the same atomic unit: the route parameter and page/service variables become `token`, `acceptInvitationOnce` sends `platformRequest("/workspace-invitations/accept", { method: "POST", body: JSON.stringify({ token }) })`, and React Query lifecycle keys use the token only as in-memory key material. The server integration test asserts this exact JSON contract; the later Gate 0 user-owned web typecheck remains required, but no old path request survives in source.
+
 Member removal uses a conditional delete that excludes `role = 'owner'`. Workspace updates accept only name/slug. `WorkspaceStatusSchema` is the closed union `active | suspended | deactivated`, never an arbitrary response string; `WorkspaceMemberSchema.joinedAt` replaces the old `createdAt`; invitation responses use `WorkspaceInvitationRoleSchema = admin | member` and can never return owner. Direct services convert unique violations to existing stable application errors without Better Auth error-code mapping.
 
 - [ ] **Step 6: Add the executable boundary command**
@@ -470,9 +476,9 @@ export async function withTenantTransaction<T>(
 
 - [ ] **Step 4: Generate admin/audit tables and add SECURITY DEFINER functions**
 
-Update the Drizzle schema first, then run `bun --cwd server run db:generate -- --name transaction-context` to create the journaled `0003` migration and snapshot. The migration creates `platform_admins`, immutable `admin_operations`, immutable platform-target `global_audit_logs`, Workspace-scoped immutable `workspace_audit_logs`, and global immutable `workspace_provisioning_audits`. `admin_operations.transaction_xid` and audit transaction references use PostgreSQL `xid8`. Audit tables have no UPDATE/DELETE path; schema-owner triggers reject mutation after insert. `workspace_provisioning_audits` has a unique `(user_id, source)` event key and can be appended only by a narrow SECURITY DEFINER function that records the current user, source `email_verification | explicit_repair`, resolved Workspace, a server-derived request ID, and current transaction ID. The function uses `INSERT ... ON CONFLICT (user_id, source) DO NOTHING RETURNING`; on replay it reads the existing row under definer ownership, returns success only when Workspace/source/request identity matches, and raises an invariant error on mismatch instead of leaking `23505` or silently accepting divergent history.
+Update the Drizzle schema first, then run `bun --cwd server run db:generate -- --name transaction-context` to create the journaled `0003` migration and snapshot. The migration creates `platform_admins`, immutable `admin_operations`, immutable platform-target `global_audit_logs`, Workspace-scoped immutable `workspace_audit_logs`, and global immutable `workspace_provisioning_audits`. `admin_operations.transaction_xid` and audit transaction references use PostgreSQL `xid8`. Audit tables have no UPDATE/DELETE path; schema-owner triggers reject mutation after insert. `workspace_provisioning_audits` stores `user_id`, source `email_verification | explicit_repair`, deterministic `event_id`, resolved Workspace, and transaction ID, with unique `(user_id, source)`. It can be appended only by `record_workspace_provisioning(source text, workspace_id text, event_id text) RETURNS uuid`. The function uses `INSERT ... ON CONFLICT (user_id, source) DO NOTHING RETURNING`; on replay it reads the existing row under definer ownership, returns the existing audit ID only when Workspace/source/event identity matches, and raises an invariant error on mismatch instead of leaking `23505` or silently accepting divergent history.
 
-`begin_admin_operation` validates current active admin status and this exact architecture-level purpose set: platform targets accept `user_read | model_read | model_write | provider_route_read | provider_route_write`; Workspace targets accept `workspace_read | workspace_suspend | workspace_deactivate | workspace_restore | wallet_adjust | wallet_status_write | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export`. Gate 0 implements only Workspace read/suspend/deactivate/restore. The remaining names are fixed protocol vocabulary only: no Gate 0 policy or service consumes them, and they grant no business access. The function writes `pg_current_xact_id()` and sets `app.admin_operation_id` with `is_local = true`. `is_current_admin_operation` checks operation ID, current transaction xid, current `app.user_id`, target, purpose, row Workspace, and current admin status.
+`begin_admin_operation(target_kind text, target_workspace_id text, purpose text, request_id text) RETURNS uuid` validates current active admin status and this exact architecture-level purpose set: platform targets accept `user_read | model_read | model_write | provider_route_read | provider_route_write`; Workspace targets accept `workspace_read | workspace_suspend | workspace_deactivate | workspace_restore | wallet_adjust | wallet_status_write | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export`. Gate 0 implements only Workspace read/suspend/deactivate/restore. The remaining names are fixed protocol vocabulary only: no Gate 0 policy or service consumes them, and they grant no business access. The function writes `pg_current_xact_id()` and sets `app.admin_operation_id` with `is_local = true`. `is_current_admin_operation(required_target_kind text, required_purpose text, row_workspace_id text) RETURNS boolean` checks operation ID, current transaction xid, current `app.user_id`, target, purpose, row Workspace, and current admin status.
 
 All control functions use `SECURITY DEFINER SET search_path = pg_catalog, public`, fully qualified names, no dynamic SQL, `REVOKE ALL ... FROM PUBLIC`, and signature-specific `GRANT EXECUTE TO app_api`. `app_api`, `app_worker`, and `app_maintenance` receive no direct table privileges on `platform_admins`, `admin_operations`, or `workspace_provisioning_audits`.
 
@@ -510,6 +516,7 @@ Record focused transaction/control-function evidence, but do not commit or hand 
 - Modify: `server/src/modules/workspaces/routes.ts`
 - Modify: `server/src/modules/canvases/service.ts`
 - Modify: `server/src/modules/canvases/routes.ts`
+- Modify: `server/src/app.ts`
 - Modify: `server/src/infrastructure/database/role-assertions.ts`
 - Modify: `server/test/workspaces/workspaces.test.ts`
 - Modify: `server/test/canvases/routes.test.ts`
@@ -582,7 +589,7 @@ Before policies, explicitly revoke business privileges from `PUBLIC` and all run
 | `app_api` | `workspace_invitations` | `SELECT, INSERT, UPDATE` |
 | `app_api` | `canvases` | `SELECT, INSERT, UPDATE` |
 | `app_api` | `workspace_audit_logs` | `INSERT` |
-| `app_api` | `is_active_workspace_member(text,text)`, `is_workspace_manager(text,text)`, `is_current_verified_email(text,text)`, `has_accepted_workspace_invitation(text,text,text)`, `begin_admin_operation(...)`, `is_current_admin_operation(...)`, `record_workspace_provisioning(text,text,text)` | signature-specific `EXECUTE` |
+| `app_api` | `is_active_workspace_member(text,text) RETURNS boolean`, `is_workspace_manager(text,text) RETURNS boolean`, `is_current_verified_email(text,text) RETURNS boolean`, `has_accepted_workspace_invitation(text,text,text) RETURNS boolean`, `begin_admin_operation(text,text,text,text) RETURNS uuid`, `is_current_admin_operation(text,text,text) RETURNS boolean`, `record_workspace_provisioning(text,text,text) RETURNS uuid` | signature-specific `EXECUTE` |
 | `app_worker` | all Gate 0 business tables/functions | none |
 | `app_maintenance` | `workspaces` | column-level `SELECT (id, status)` only |
 | every runtime role | `platform_admins`, `admin_operations`, `global_audit_logs`, `workspace_provisioning_audits` | no direct table privilege |
@@ -611,6 +618,8 @@ Delete the two-stage `requireWorkspaceMember(request, workspaceId)` API. Its rep
 
 Add the team-owner deactivation route through `withTenantTransaction` and platform-admin read/status routes through `withPlatformAdminTransaction`. The admin read service selects its operation-bound Workspace and appends one `workspace_read` audit before returning, in the same transaction. Each status service locks the Workspace, checks the exact allowed source/target state, appends `workspace_audit_logs`, then performs the conditional status update as the final business statement in the same transaction; this ordering keeps the tenant audit writable before `active -> deactivated` closes normal-member policies. Platform-admin routes map each requested transition to one fixed purpose server-side; clients cannot submit a purpose string. Personal Workspace owner deactivation is a stable 409 error. No hard-delete Workspace route is introduced.
 
+The composition root imports and calls `registerPlatformAdminRoutes(app)` alongside Identity, Workspace, and Canvas registration. An app-runtime test proves the admin route exists (401/403 when unauthenticated/non-admin rather than 404) and uses the same API database handle.
+
 - [ ] **Step 5: Extend startup assertions to privileges**
 
 `role-assertions.ts` now rejects runtime ownership, `rolbypassrls`, role membership/inheritance, schema `CREATE`, access to the `drizzle` schema, missing or extra function EXECUTE/table command grants, any Gate 0 business privilege on `app_worker`, and Maintenance access to non-allowlisted columns. A production process with any violation fails readiness rather than logging and continuing.
@@ -631,7 +640,7 @@ Expected: PASS for the complete atomic unit under runtime roles; module boundari
 - [ ] **Step 7: Commit**
 
 ```bash
-git add .env.example packages/contracts/src/workspaces.ts server
+git add .env.example packages/contracts/src/workspaces.ts server web/src/router.tsx web/src/pages/auth/accept-invitation.tsx web/src/services/api/invitation-acceptance.ts web/src/services/api/workspaces.ts
 git commit -m "feat: establish transaction-scoped PostgreSQL tenant security"
 ```
 
@@ -651,7 +660,7 @@ git commit -m "feat: establish transaction-scoped PostgreSQL tenant security"
 
 **Interfaces:**
 - Produces: `onEmailVerified(user: { id: string; name: string; email: string }): Promise<void>` injected into Identity by the composition root.
-- Produces: `provisionPersonalWorkspace(db, user): Promise<WorkspaceSummary>` using `withUserTransaction` and `adoptOwnedWorkspaceContext`.
+- Produces: `provisionPersonalWorkspace(db, user, event: { source: "email_verification" | "explicit_repair"; eventId: string }): Promise<WorkspaceSummary>` using `withUserTransaction` and `adoptOwnedWorkspaceContext`; `event` is supplied only by trusted composition/route code, never request JSON.
 - Produces: authenticated, naturally idempotent `POST /api/v1/workspaces/personal/repair`, requiring a verified identity, as the explicit recovery path for a failed post-verification callback.
 - Removes: personal Workspace creation from `GET /api/v1/workspaces`.
 - Defers: Wallet and signup-grant creation to the Gate 3 ledger plan; the adoption callback remains inside the same transaction so Gate 3 can append those writes without changing Identity.
@@ -673,7 +682,7 @@ it("GET workspaces is read-only and never repairs a missing personal Workspace",
 });
 ```
 
-Add a concurrent test calling `provisionPersonalWorkspace` twice and asserting identical returned Workspace IDs, one Workspace, and one owner member; separately invoke the `Promise<void>` verification callback concurrently and assert the same final database state. Inject a failure after Workspace insert but before owner insert and assert the transaction leaves neither row. Add a post-commit callback failure case through the real Better Auth verification endpoint: email verification remains complete, the automatic provisioning callback fails, then `POST /api/v1/workspaces/personal/repair` creates the missing Workspace; replay returns the same Workspace, leaves one owner member, and leaves exactly one immutable provisioning audit. An unverified user fails closed. The endpoint does not claim the generic `Idempotency-Key` protocol reserved by the architecture for later AI/ledger operations.
+Add a concurrent test calling `provisionPersonalWorkspace` twice with the same trusted event and asserting identical returned Workspace IDs, one Workspace, and one owner member; separately invoke the `Promise<void>` verification callback concurrently and assert the same final database state. Identity supplies deterministic `eventId = "personal-workspace:email-verification:<userId>"`; repair supplies `eventId = "personal-workspace:explicit-repair:<userId>"`. Inject a failure after Workspace insert but before owner insert and assert the transaction leaves neither row. Add a post-commit callback failure case through the real Better Auth verification endpoint: email verification remains complete, the automatic provisioning callback fails, then `POST /api/v1/workspaces/personal/repair` creates the missing Workspace; replay returns the same Workspace, leaves one owner member, and leaves exactly one repair audit. Also test verification success followed by repair: it returns the existing Workspace and yields one audit per distinct trusted source/event (two total). An unverified user and a replay with the same `(user, source)` but different event ID fail closed. The endpoint does not claim the generic `Idempotency-Key` protocol reserved by the architecture for later AI/ledger operations.
 
 Stage these tests. The first RED file uses only existing HTTP routes and test-local SQL helpers: verification is expected to provision before any GET, GET is expected not to mutate, and POST repair is expected to return 200 rather than the current 404. After adding the final `provisionPersonalWorkspace` signature with an explicit `not_implemented` body, add the direct concurrency/fault tests and observe that stable error before implementing logic. No RED may fail from a missing module import.
 
@@ -703,7 +712,7 @@ Identity does not import Workspaces. `app.ts` composes `createAuth` with a callb
 
 - [ ] **Step 4: Implement idempotent provisioning**
 
-Inside `withUserTransaction`: lock the current user row `FOR UPDATE`; verify the persisted `emailVerified` state; select the lifetime-unique personal Workspace; insert when absent with `ON CONFLICT` on `owner_user_id WHERE type = 'personal'`; insert the owner member; resolve the committed row; call `adoptOwnedWorkspaceContext`; append `workspace_provisioning_audits` through its replay-validating `ON CONFLICT` function with a server-derived unique `(user_id, source)` event key; return the existing or created summary. Automatic verification and explicit repair converge on this same function. Tests cover concurrent callbacks, repair replay, and a deliberately divergent existing audit that must fail and roll back. The GET list route only selects active memberships and cannot mutate.
+Inside `withUserTransaction`: lock the current user row `FOR UPDATE`; verify the persisted `emailVerified` state; select the lifetime-unique personal Workspace; insert when absent with `ON CONFLICT` on `owner_user_id WHERE type = 'personal'`; insert the owner member; resolve the committed row; call `adoptOwnedWorkspaceContext`; append `workspace_provisioning_audits` through its replay-validating `ON CONFLICT` function with trusted `source + eventId`; return the summary from the resolved Workspace row regardless of whether the audit insert was new or a validated replay. Automatic verification and explicit repair converge on this same function. Tests cover concurrent callbacks, repair replay, verification-then-repair, and a deliberately divergent existing audit that must fail and roll back. The GET list route only selects active memberships and cannot mutate.
 
 - [ ] **Step 5: Run provisioning and identity regressions to verify GREEN**
 
