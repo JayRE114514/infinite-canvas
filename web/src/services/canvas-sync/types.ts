@@ -143,8 +143,10 @@ export interface CanvasSyncSession {
     exportConflictDrafts(): Promise<CanvasProject[]>;
     dispose(reason: CanvasDisposeReason): Promise<void>;
     /**
-     * 真实的本地落定信号：等到该会话没有任何在飞的本地写为止，故意不设上界。
-     * dispose 的等待有上界，只保证不卡住 UI；不可取消的 IndexedDB 写仍可能在其后完成。
+     * 真实的本地落定信号：等到该会话再没有任何在飞的本地恢复操作为止，故意不设上界。
+     * 覆盖范围是全部由本会话发起、会改动本地恢复记录的异步操作：草稿落盘队列，
+     * 以及冲突记录与恢复重试的完整尾巴（草稿落盘之后的 marker 读取与写入）。
+     * 它只观察，不取消任何操作：IndexedDB 的写无法取消，dispose 的有界等待返回也不代表写已经结束。
      * 只允许在已 dispose 或正在 dispose 的会话上调用，且只用于清理路径补一次幂等清理，绝不出现在打开画布的等待路径上。
      */
     whenLocalSettled(): Promise<void>;

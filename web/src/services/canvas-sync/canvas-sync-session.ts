@@ -188,6 +188,11 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
     let snapshotCache: { seq: number; title: string; snapshot: CanvasSnapshot } | null = null;
     let pendingSlot: { record: CanvasDraftRecord; seq: number; deleteAfterWrite: boolean } | null = null;
     let drainPromise: Promise<void> | null = null;
+    /**
+     * 本会话自己发起、仍在飞的本地恢复操作：草稿落盘、冲突记录整条尾巴（drain + marker 读写）以及恢复重试的 marker 写。
+     * 只登记引用，不重试、不排队快照；草稿仍然只有 pendingSlot 一个槽。
+     */
+    const inFlightLocal = new Set<Promise<unknown>>();
     let inflightController: AbortController | null = null;
     let disposePromise: Promise<void> | null = null;
     let emitted: CanvasSyncView | null = null;
@@ -420,17 +425,28 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
     }
 
     /**
-     * 等到本地真的没有在飞的写为止，不设上界：IndexedDB 的写不可取消，dispose 的有界等待超时并不代表写已经结束。
-     * 循环是必要的：一轮 drain 结束时可能又有新的 pendingSlot 被排上，只等一次仍可能漏掉最后一条。
+     * 登记一条本会话发起的本地恢复操作，使其可被 whenLocalSettled 观察到。
+     * 登记的是同一个 promise 引用，不复制、不重试；结束后自动摘除。
+     */
+    function trackLocal<T>(work: Promise<T>): Promise<T> {
+        inFlightLocal.add(work);
+        void work.catch(() => undefined).finally(() => inFlightLocal.delete(work));
+        return work;
+    }
+
+    /**
+     * 等到本会话再没有在飞的本地恢复操作为止，不设上界。
+     * 覆盖草稿落盘（drainLocal）与 persistConflictRecords 的完整尾巴（drain + marker 读 + marker 写），
+     * 即所有由本会话发起、会改动本地恢复记录的异步操作。
+     * 它只观察，不取消：IndexedDB 的写无法取消，dispose 的有界等待超时也不代表写已经结束。
+     * 循环是必要的：等待期间可能又有新的 drain 或 marker 尾巴被排上，只等一次仍可能漏掉最后一条。
      */
     async function whenLocalSettled(): Promise<void> {
-        while (drainPromise) {
-            try {
-                await drainPromise;
-            } catch {
-                /** drainLocal 自己吞掉写失败，这里只关心「不再有在飞的写」。 */
-                return;
-            }
+        while (drainPromise || inFlightLocal.size) {
+            /** 快照当前批次后整批等待；期间新登记的操作留给下一轮循环。 */
+            const pending = [drainPromise, ...inFlightLocal].filter(Boolean) as Promise<unknown>[];
+            /** allSettled 不会因单条失败而提前返回，本地写失败已由各自路径吞掉并标记 degraded。 */
+            await Promise.allSettled(pending);
         }
     }
 
@@ -547,7 +563,8 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         firstUnsavedEditAt = 0;
         assertCounters("saveConflict");
         notify();
-        void persistConflictRecords(baseRevision);
+        /** 尾巴登记为在飞的本地操作：marker 写落在 drain 之后，清理必须等到它也结束。 */
+        void trackLocal(persistConflictRecords(baseRevision));
     }
 
     async function persistConflictRecords(baseRevision: number) {
@@ -557,11 +574,12 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         const written = await settleWithin(drainLocal(), LOCAL_FLUSH_TIMEOUT_MS);
         if (written.status !== "ok") markDegraded();
         const entry: CanvasConflictMarkerEntry = { draftKey, draftId: resolution.draftId, baseRevision, savedAt: new Date(deps.now()).toISOString() };
-        const existing = await settleWithin(deps.recovery.readMarker(draftScope), LOCAL_READ_TIMEOUT_MS);
+        /** 逐条登记原始 promise：settleWithin 超时会提前返回，但底层写仍在飞，必须能被落定信号观察到。 */
+        const existing = await settleWithin(trackLocal(deps.recovery.readMarker(draftScope)), LOCAL_READ_TIMEOUT_MS);
         const older = existing.status === "ok" && existing.value ? existing.value.entries.filter((item) => item.draftKey !== draftKey) : [];
         /** 最新的本地内容永远排在 entries[0]，旧 marker 不能夺回入口。 */
         const entries = [entry, ...older].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
-        const marked = await settleWithin(deps.recovery.writeMarker({ ...draftScope, entries }), LOCAL_FLUSH_TIMEOUT_MS);
+        const marked = await settleWithin(trackLocal(deps.recovery.writeMarker({ ...draftScope, entries })), LOCAL_FLUSH_TIMEOUT_MS);
         if (marked.status !== "ok") markDegraded();
         if (conflict && conflict.extraDraftCount !== entries.length - 1) {
             conflict = { ...conflict, extraDraftCount: entries.length - 1 };
@@ -608,7 +626,7 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         if (phase !== "recovery-blocked") return "failed";
         const valid = marker ? marker.entries.filter((entry) => drafts.some((draft) => canvasDraftKey(draftScope, draft.draftId) === entry.draftKey)) : [];
         if (!valid.length) {
-            if (marker) await settleWithin(deps.recovery.deleteMarker(draftScope), LOCAL_FLUSH_TIMEOUT_MS);
+            if (marker) await settleWithin(trackLocal(deps.recovery.deleteMarker(draftScope)), LOCAL_FLUSH_TIMEOUT_MS);
             if (editSeq > savedSeq) {
                 phase = "dirty";
                 notify();
@@ -623,7 +641,7 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         /** 恢复重试只修正 lineage，绝不替换画布内容：替换内容只允许走冲突条上的显式动作。 */
         const own: CanvasConflictMarkerEntry[] = editSeq > savedSeq ? [{ draftKey, draftId: resolution.draftId, baseRevision: revision, savedAt: new Date(deps.now()).toISOString() }] : [];
         const entries = [...own, ...valid.filter((entry) => entry.draftKey !== draftKey)].slice(0, MAX_CONFLICT_MARKER_ENTRIES);
-        const marked = await settleWithin(deps.recovery.writeMarker({ ...draftScope, entries }), LOCAL_FLUSH_TIMEOUT_MS);
+        const marked = await settleWithin(trackLocal(deps.recovery.writeMarker({ ...draftScope, entries })), LOCAL_FLUSH_TIMEOUT_MS);
         if (marked.status !== "ok") markDegraded();
         conflictBaseRevision = own.length ? revision : valid[0].baseRevision;
         conflict = { baseRevision: conflictBaseRevision, source: "restored", extraDraftCount: entries.length - 1 };
@@ -693,7 +711,8 @@ export function createCanvasSyncSession(init: CanvasSessionInit, deps: CanvasSyn
         } catch (error) {
             if (classifyCanvasSaveError(error).kind !== "conflict") return;
             conflictBaseRevision = baseRevision;
-            await settleWithin(persistConflictRecords(baseRevision), DETACHED_LOCAL_MS);
+            /** 整条尾巴也要登记：drain 结束到 marker 读之间存在空隙，只登记内部单条会让落定信号提前返回。 */
+            await settleWithin(trackLocal(persistConflictRecords(baseRevision)), DETACHED_LOCAL_MS);
         } finally {
             inflightController = null;
         }

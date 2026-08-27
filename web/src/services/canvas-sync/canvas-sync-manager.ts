@@ -274,7 +274,11 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
             activeUnsubscribe = null;
             active = null;
             notify();
-            /** 跳过网络收尾，并等已在飞的本地写结束，避免它写在清理之后。 */
+            /**
+             * 跳过网络收尾，并有界等待已在飞的本地写：这一步只保证「不再新增本地写」，
+             * 不保证写已落盘（等待有上界），所以删除结果最多在此等 DETACHED_LOCAL_MS，
+             * 真正的落定由 runDeletedCanvasCleanup 的第二段负责。
+             */
             await target.dispose("deleted");
         }
         const outcomes = await Promise.allSettled(canvasIds.map((canvasId) => deps.repository.remove(current.workspaceId, canvasId)));
@@ -285,8 +289,27 @@ export function createCanvasSyncManager(deps: CanvasSyncManagerDeps): CanvasSync
          * 它们的草稿与 marker 也只存在于 current 作用域的键下。删除期间若发生作用域切换，
          * 这里仍必须清理旧作用域，否则旧作用域的草稿会永远泄漏。不要在此加作用域守卫。
          */
-        deleted.forEach((canvasId) => void clearDeletedCanvasRecovery({ userId: current.userId, workspaceId: current.workspaceId, canvasId }));
+        deleted.forEach((canvasId) => {
+            const draftScope = { userId: current.userId, workspaceId: current.workspaceId, canvasId };
+            /** 只有被收尾的那张活动画布可能还有在飞的本地写；其余画布没有会话，一次清理即可。 */
+            const late = target && target.canvasId === canvasId ? target : null;
+            void runDeletedCanvasCleanup(draftScope, late);
+        });
         return { deleted, failed };
+    }
+
+    /**
+     * 画布删除后的清理与服务端版本重载同构：dispose 对本地写的等待有上界，
+     * 返回时那次写可能仍在飞，并在清理之后落盘，把已删画布的草稿重新写回来。
+     * 因此先立即清理一次（删除结果与 UI 不等待本地存储），再等会话真正本地落定后幂等地补清一次。
+     * 第二段无上界，但只是后台清理链，不在删除结果、UI 或打开画布的等待路径上。
+     */
+    async function runDeletedCanvasCleanup(draftScope: CanvasDraftScope, late: CanvasSyncSession | null) {
+        await clearDeletedCanvasRecovery(draftScope);
+        if (!late) return;
+        /** 覆盖草稿落盘与 marker 尾巴：两者都属于会话自己的本地恢复操作。 */
+        await late.whenLocalSettled();
+        await clearDeletedCanvasRecovery(draftScope);
     }
 
     async function loadForExport(canvasIds: string[]): Promise<CanvasProject[]> {
