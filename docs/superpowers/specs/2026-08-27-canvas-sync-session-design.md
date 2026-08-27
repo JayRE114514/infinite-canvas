@@ -1,6 +1,8 @@
 # 画布同步会话架构设计（Task 3 重构）
 
-状态：已确认，待实施
+状态：历史实现规格；Session/Manager 边界已实现，本文不再授权继续实施
+
+> 上游 `2026-08-26-backend-platform-architecture-design.md` 经对抗审查后覆盖本文的本地持久化、测试与视口决策：恢复层必须改为独立原生 IndexedDB 事务/CAS，`web/` 必须具备范围受限的自动化测试，普通平移缩放不得触发云端全快照保存，collaborative 模式使用独立文档引擎。本文中的 localforage store、无前端测试框架、视口 revision 写入和“直接替换会话内部协议”仅用于解释历史实现，不得作为新实施依据。后续以冻结复审后的上游规格和新的 Gate 0 计划为准。
 
 基线提交：`aa498df84e84b9158cdb743b568320ad4c598c39`
 
@@ -32,7 +34,7 @@ Task 3 已经把画布改成服务端权威存储，`fa7e297..aa498df` 共四次
 - 无静默覆盖：服务端内容只能被"用户显式动作 + 令牌校验通过的提交"替换，本地内容只能被同一会话推进。
 - 无静默丢失：任何未成功保存到服务端的本地内容，都必须有一条可从界面导出的路径；确实无法落盘时必须显式告知，而不是假装成功。
 - 有界资源：本地写、网络写、内存中的完整快照数量、detached 会话数量都有明确上限，慢速或永不返回的 IndexedDB 不能冻结云端保存。
-- 可拆解交付：重构范围限定在画布同步边界，7 天上线目标不变。
+- 可拆解交付：重构范围限定在画布同步边界；期限只能缩减范围，不能替代并发和数据安全验证。
 
 ### 2.2 非目标
 
@@ -40,7 +42,7 @@ Task 3 已经把画布改成服务端权威存储，`fa7e297..aa498df` 共四次
 - 不实现离线优先与跨会话操作队列；断网时只保证本地草稿与显式错误提示。
 - 不改服务端契约、路由、迁移与保存条件更新语义。
 - 不解决媒体跨设备可移植性，该问题属于 Task 4/5 的 Asset 切换。
-- 不引入 Redis、WebSocket、Service Worker 与前端测试框架。会话被设计成可注入依赖（仓储、本地存储、时钟）的纯 TypeScript 对象，日后补测试无需再次改结构，但本次不加测试框架，验收依赖第 14 节的人工矩阵。
+- 不引入 Redis、WebSocket 或 Service Worker。本文原先不引入前端测试框架的决定已被上游 Gate 0 覆盖：原生 IndexedDB CAS 必须使用范围受限的 Vitest + fake-indexeddb 自动化测试，并补真实浏览器矩阵。
 
 ## 3. 组件边界
 
@@ -79,7 +81,7 @@ CanvasSyncManager（作用域 + active session + 有界 detached sessions）
 
 ### 4.1 存储位置与键
 
-项目尚未上线，不保留旧键兼容层。新模块使用新的 localforage store，并在模块初始化时对旧 store 做一次 best-effort 丢弃（失败忽略，不阻塞任何流程）：
+以下 localforage 结构只记录已实现的历史状态，已被上游原生 IndexedDB CAS 决策取代，不得继续扩展。项目尚未上线，不保留旧键兼容层；新的 Gate 0 计划将显式删除该 store，并使用独立数据库：
 
 - 新 store：`localforage.createInstance({ name: "infinite-canvas", storeName: "canvas_recovery" })`
 - 旧 store：`localforage.dropInstance({ name: "infinite-canvas", storeName: "canvas_drafts" })`，只在新模块首次加载时执行一次。
@@ -731,7 +733,7 @@ export interface CanvasLocalRecovery {
 | --- | --- | --- |
 | A（采纳） | 抽出 `CanvasSyncSession` 状态机 + manager，Zustand 退化为视图层 | 消除所有权/生命周期/状态三类隐式，改动集中在同步边界，工期可控 |
 | B | 继续在现有 store 上打补丁 | 三轮审查已证明单点修复会持续产生新的竞态：每次修复都要在新的位置手写五重令牌校验，缺陷密度不下降。放弃 |
-| C | 直接做完整协同层（操作日志 + CRDT/OT + 实时通道） | 需要后端操作日志、快照压缩、Presence 与实时网关，工作量以周计，且当前非目标就是不做多人实时编辑。与 7 天上线冲突，放弃 |
+| C | 直接做完整协同层（操作日志 + CRDT/OT + 实时通道） | 需要后端操作日志、快照压缩、Presence 与实时网关，且当前非目标就是不做多人实时编辑；应由独立协作规格和验证门禁推进，不能混入 snapshot 修复。放弃 |
 | D | 引入 Yjs/Automerge 只为单人保存 | 单用户场景下 CRDT 只增加序列化体积与依赖，解决不了"何时保存、冲突如何呈现、本地存储何时可信"这三个真实问题。放弃 |
 
-方案 A 与未来协同的关系：会话已经是"一个画布 + 一条 revision lineage + 一组本地恢复记录"的封装，日后接入操作日志时，只需在会话内把"整快照 + baseRevision"替换为"操作序列 + 服务端确认点"，manager、store、页面与 UI 的边界都不需要再改。这是选它而不是继续打补丁的长期理由。
+方案 A 与未来协同的关系：Session/Manager、store 和页面的边界可以保留，但 collaborative 模式必须创建独立文档引擎实例，不能在 snapshot Session 内直接把"整快照 + baseRevision"替换成操作序列。可复用的是所有权和页面边界，不是同步协议实例。

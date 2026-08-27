@@ -1,5 +1,7 @@
 # Cloud Canvases and Assets Implementation Plan
 
+> **状态：已废止，不得继续执行。** 本计划混合了已完成代码和已被对抗审查推翻的 localforage 草稿方案。后续只以冻结复审后的 `docs/superpowers/specs/2026-08-26-backend-platform-architecture-design.md` 及用户批准后生成的新 Gate 0 实施计划为准；本文件仅保留为历史追踪。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move Canvas snapshots and user Assets to Workspace-scoped PostgreSQL and private object storage while retaining responsive local editing.
