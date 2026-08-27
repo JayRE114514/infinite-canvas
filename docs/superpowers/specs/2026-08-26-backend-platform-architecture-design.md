@@ -1,6 +1,6 @@
 # Infinite Canvas 后端平台架构设计
 
-状态：第三轮差异审查问题已修订，待最终复审与用户复核；本文件通过前不授权继续实施
+状态：第四轮差异审查问题已修订，待最终收敛复审与用户复核；本文件通过前不授权继续实施
 
 ## 1. 背景与决策
 
@@ -178,7 +178,7 @@ Provider Adapter 将统一平台输入转换成特定平台请求，并解析同
 
 ### 5.8 Admin
 
-MVP 提供用户和 Workspace 查询、钱包查看、积分调整、冻结、任务查询、人工对账和 Provider 路由启停。首版 admin purpose 固定为平台目标的 `user_read | model_write | provider_route_write`，以及 Workspace 目标的 `workspace_read | wallet_adjust | wallet_status_write | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export | workspace_restore`；新增 purpose 必须经过迁移、动作矩阵和授权测试，不能接受自由字符串。所有管理动作写入不可变审计日志。
+MVP 提供用户和 Workspace 查询、钱包查看、积分调整、冻结、任务查询、人工对账和 Provider 路由启停。首版 admin purpose 固定为平台目标的 `user_read | model_read | model_write | provider_route_read | provider_route_write`，以及 Workspace 目标的 `workspace_read | workspace_suspend | workspace_deactivate | workspace_restore | wallet_adjust | wallet_status_write | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export`；新增 purpose 必须经过迁移、动作矩阵和授权测试，不能接受自由字符串。所有管理动作写入不可变审计日志。
 
 ### 5.9 Collaboration（预留边界，第一阶段不实现）
 
@@ -199,9 +199,9 @@ MVP 提供用户和 Workspace 查询、钱包查看、积分调整、冻结、�
 
 `workspaces`：`id`、`name`、`slug`、`type`、`owner_user_id`、`status`、`created_at`、`updated_at`、`deleted_at`。`owner_user_id` 对 `users` 使用 `RESTRICT/NO ACTION`，禁止身份删除级联删除 Workspace。`status` 固定为 `active | suspended | deactivated`；只有 `deactivated` 允许且必须带 `deleted_at`，其余状态必须为空。数据库使用 `(owner_user_id) WHERE type = 'personal'` 部分唯一索引保证一个用户终身至多一个个人 Workspace（包括已停用记录），停用后只能恢复原 Workspace，不能新建替代项；Gate 0 重命名现有列时必须保留并重新验证该索引。
 
-`workspace_members`：`workspace_id`、`user_id`、`role`、`status`、`joined_at`，唯一约束为 `(workspace_id, user_id)`；`role` 受 `owner | admin | member` CHECK/枚举约束。部分唯一索引保证最多一个 `owner`，延迟约束触发器保证活动 Workspace 提交时至少一个 owner，且 `workspaces.owner_user_id` 必须等于该成员的 `user_id`。部分唯一索引不可延迟，因此团队所有者转移必须在同一事务中先把原 owner 降为 `admin`，再把目标成员提升为 `owner` 并更新 `owner_user_id`；提交时由延迟触发器验证最终状态。个人 Workspace 不允许转移所有者。
+`workspace_members`：`workspace_id`、`user_id`、`role`、`status`、`joined_at`，唯一约束为 `(workspace_id, user_id)`；`role` 受 `owner | admin | member` CHECK/枚举约束。部分唯一索引保证最多一个 `owner`，延迟约束触发器保证 active Workspace 提交时恰有一个 status=active 的 owner，且 `workspaces.owner_user_id` 必须等于该成员的 `user_id`。部分唯一索引不可延迟，因此团队所有者转移必须在同一事务中先把原 owner 降为 `admin`，再把目标成员提升为 `owner` 并更新 `owner_user_id`；提交时由延迟触发器验证最终状态。个人 Workspace 不允许转移所有者。
 
-个人 Workspace 禁止邀请其他成员。删除 Workspace 只允许把状态改为 `deactivated` 并写 `deleted_at`；账本、任务、Attempt、Asset 元数据和审计不物理删除。普通业务外键不得对 Workspace 使用级联删除。
+个人 Workspace 禁止邀请其他成员。Workspace 状态转换全部使用“期望起始状态”的条件更新并写审计：owner 可在 active 状态经 `withTenantTransaction` 自助执行 active→deactivated；该流程先插入审计，再把状态更新作为最后一条租户业务语句，两者任一失败都整体回滚，避免更新后普通成员 policy 无法写审计。平台管理员可用 `workspace_suspend` 执行 active→suspended、用 `workspace_deactivate` 执行 active/suspended→deactivated、用 `workspace_restore` 执行 suspended/deactivated→active。进入 deactivated 同事务写 `deleted_at`，恢复同事务清空；恢复前必须重新满足 active Workspace 的 owner/成员不变量。停用不物理删除账本、任务、Attempt、Asset 元数据或审计，普通业务外键不得对 Workspace 使用级联删除；已受理任务继续由 Worker 完成或对账，但停用后不得接收新任务。
 
 `workspace_invitations` 由 Workspaces 模块拥有，保存 Workspace、目标邮箱、角色、邀请者、状态、到期时间和一次性令牌摘要。身份模块只提供当前用户和已验证邮箱，不处理成员状态转换。
 
@@ -275,7 +275,7 @@ captured_amount + released_amount <= original_amount
 
 `provider_routes` 保存模型、`adapter_key`、上游精确模型 ID、Base URL、`secret_ref`、优先级、不可执行配置和启用状态。真实密钥只存在于服务端 Secret。
 
-两表都是全局配置而非 Workspace 数据，但不能只依赖路由层保护写入：它们启用并 FORCE RLS，策略按角色和命令拆分。普通 `app_api` 只有 Model 公开列的列级 SELECT，且只能看到 enabled 行；`app_worker` 只有执行所需 Model/Route 列的 SELECT；应用角色没有普通 DML 权限。平台管理员修改 Model/Route 必须走 `target_kind = platform` 的 admin operation 和固定 `model_write | provider_route_write` 动作，由独立 `TO app_api` DML policy 调用 admin helper 授权并写全局审计；Workspace 目标 operation 不能修改平台配置。
+两表都是全局配置而非 Workspace 数据，但不能只依赖路由层保护写入：它们启用并 FORCE RLS，策略按角色和命令拆分。普通 `app_api` 只有 Model 公开列的列级 SELECT，且只能看到 enabled 行；`app_worker` 只有执行所需 Model/Route 列的 SELECT；应用角色没有普通 DML 权限。平台管理员读取 disabled Model 或 Route 必须分别走 `model_read | provider_route_read` 的平台目标 operation 和独立 `TO app_api` SELECT policy，且只授予管理界面所需列；Route 响应只暴露 `credential_configured` 等状态，不授予 `secret_ref` 或真实 Secret 的 SELECT。修改必须走 `model_write | provider_route_write` 的平台目标 operation，由独立 DML policy 调用 admin helper 授权并写全局审计；Workspace 目标 operation 不能读取或修改平台配置。
 
 ### 6.6 AI Task 和 Attempt
 
@@ -320,8 +320,9 @@ RLS 策略必须遵守以下非递归基线：
 - `workspace_members` 的自查策略直接比较 `user_id = app.user_id`，不得在自身 policy 中再次查询 `workspace_members`。
 - 管理员列成员、叶子表成员判断、邀请状态转换和平台 operation 校验统一调用各自最小化的 `SECURITY DEFINER` helper。helper 由 `schema_owner` 拥有，只读其声明的授权/控制表，固定安全 `search_path`、使用全限定表名、无动态 SQL、撤销 `PUBLIC EXECUTE`，并只向应用角色授予必要签名；任何 helper 都禁止读取 Canvas、Asset、Wallet、Ledger、Billing 或 Task 等叶子业务表。授权表不 FORCE、全局控制表不套 Workspace RLS，因此 owner helper 只在这些明确边界内读取完整事实，应用角色自身仍受 RLS。
 - Workspace 自创建只允许 `owner_user_id = app.user_id`；首个成员只能是同一用户的 `owner`。邀请接受只能把当前已验证邮箱对应用户加入邀请指定 Workspace，并以一次性条件更新认领邀请；这些流程必须有独立 policy/helper 和事务集成测试，不能借用普通成员 policy。
+- owner 自助 deactivation 使用独立、命令专用的 `TO app_api` UPDATE policy：`USING` 只接受当前用户拥有的 active Workspace，`WITH CHECK` 只接受同一 owner 的 deactivated + 非空 `deleted_at` 终态；普通成员更新 policy 仍只允许 active→active。路由 SQL 只能修改状态和删除时间，不能借该分支改 owner、类型或其他字段。
 - 首个 Wallet 只允许在上述 adopted context 中创建，相关行的 `workspace_id` 必须等于当前上下文、Workspace owner 必须是当前用户且 Wallet 尚不存在；团队 Workspace 只创建零余额 Wallet。注册赠送分录额外要求目标是当前用户唯一的个人 Workspace。重复调用读取既有 Wallet 和交易，不向团队 Workspace 发放赠送；个人 Workspace 部分唯一索引、`signup-grant:<userId>` 的 Workspace 内唯一操作键和请求哈希共同保证重放幂等。
-- `workspaces.status = active`、`workspaces.deleted_at IS NULL`、`workspace_members.status = active` 是 `withTenantTransaction` 普通成员分支的共同前置条件。平台管理员分支不要求成员关系，也不要求 Workspace 为 active，但只能按 §5.8 固定动作矩阵访问 operation ID 所绑定的 Workspace：active 允许全部 Workspace 目标动作；suspended/deactivated 只允许 `workspace_read | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export | workspace_restore`，禁止标准积分增发、普通 Canvas 写入、成员变更或新建生成任务。
+- `workspaces.status = active`、`workspaces.deleted_at IS NULL`、`workspace_members.status = active` 是 `withTenantTransaction` 普通成员分支的共同前置条件；owner 自助 deactivation 是在验证该前置条件后执行的专用终态动作。平台管理员分支不要求成员关系，也不要求 Workspace 为 active，但只能按 §5.8 固定动作矩阵访问 operation ID 所绑定的 Workspace：active 允许除 `workspace_restore` 外的全部 Workspace 目标动作；suspended 只允许 `workspace_read | workspace_deactivate | workspace_restore | billing_confirm_charge | billing_confirm_no_charge | ledger_compensate | workspace_export`；deactivated 只允许上述集合去掉 `workspace_deactivate`。非 active 状态禁止标准积分增发、Wallet 状态修改、普通 Canvas 写入、成员变更或新建生成任务。
 
 RLS 不是应用授权替代品。路由仍执行成员和角色检查；RLS 负责阻止遗漏租户条件、错误 join 或未来代码回归造成的跨租户访问。全局 Reaper 和对账仅通过 `app_maintenance` 的列级只读授权扫描最小字段并投递候选，再由 `app_worker` 在租户上下文中重新读取、加锁和条件更新；Maintenance 扫描结果不是状态转换依据。面向人的平台管理员操作必须走 `withPlatformAdminTransaction`，不能借用维护凭据，也不能依赖把管理员加入所有 Workspace。
 
@@ -482,7 +483,7 @@ Adapter 可返回临时 URL、Base64 或异步任务 ID。Worker 校验内容类
 - Gate 0 只使用 local scope 即可完成 CAS，不依赖尚未交付的账号或 Workspace。Gate 1/2 直接使用同一 version 1 键模型增加 account scope，不修改 object store 或主键。登录、登出和切换账号必须先关闭当前 Session，再切换 scope；其他身份的草稿不可见且不被当前身份 GC。local scope 不自动归属任何账号，只能通过显式导入创建新的云端 Canvas/Asset 和新 account scope，不能静默“认领”原记录。
 - 恢复层以 factory 接收 `IDBFactory` 并显式执行 open/migrate，不在模块导入时产生删除或升级副作用。`versionchange` 必须关闭旧连接，`blocked` 必须有有界错误和可操作提示。
 - `epochs` 记录分离 `coordinationRevision`、`deletionGeneration` 和持久 `tombstonedAt`。`writeSeq` 只在一个 `[scopeId, draftId]` 写会话内单调递增；普通 upsert/ack 在同一事务读取 scope epoch 与自身 draft，先拒绝 tombstone 或 `deletionGeneration` 不匹配，再拒绝 `stored.writeSeq >= incoming.writeSeq`，但不比较或推进 `coordinationRevision`。因此其他标签的 marker/repair 活动不会饿死本草稿，而确认删除后的迟到会话也不能复活它。
-- marker 变更、外部草稿删除、repair commit 和 GC 携带打开时读取的 `expectedCoordinationRevision + expectedDeletionGeneration`，并在同一 `readwrite` 事务内校验后推进 `coordinationRevision`。打开画布必须在同一个只读事务中取得同 scope 的 marker、drafts 和 epoch 一致快照；过期 repair 必须重新解析。GC 删除前重新验证草稿仍过期且未被 marker 引用。确认删除在单个事务中递增 `deletionGeneration`、写 tombstone 并删除该 scope 的 drafts/markers；tombstone 长期保留，同一 Canvas 若要重新创建必须使用新的 Canvas ID/scope。
+- marker 变更、外部草稿删除、repair commit 和 GC 携带打开时读取的 `expectedCoordinationRevision + expectedDeletionGeneration`，并在同一 `readwrite` 事务内校验后推进 `coordinationRevision`。打开画布必须在同一个只读事务中取得同 scope 的 marker、drafts 和 epoch 一致快照；过期 repair 必须重新解析。GC 删除前重新验证草稿仍过期且未被 marker 引用。“确认删除”只表示用户或服务端已经确认删除 Canvas 资源本身：本地 Canvas 可直接执行；云端 Canvas 必须先收到服务端删除成功或经查询确认已删除，响应不确定时不得预写 tombstone。确认后在单个事务中递增 `deletionGeneration`、写 tombstone 并删除该 scope 的 drafts/markers；tombstone 长期保留，首版不恢复同一 Canvas ID，若要找回内容必须创建新的 Canvas ID/scope。接受服务端版本、解决冲突、关闭 Session、普通草稿清理和 GC 都属于外部/自有草稿删除，只推进 `coordinationRevision`，绝不能写 tombstone 或推进 `deletionGeneration`。
 - 每个有界操作独占一个 `IDBTransaction`；deadline 到期必须调用 `transaction.abort()`，不能只让 Promise 超时后允许迟到提交。事务 request queue 排空后不得 await 非 IndexedDB Promise。任何删除都不能基于事务外的旧读取结果。
 - 当前 `canvas_recovery` localforage store 不是新协议的合法数据源。项目未上线，Gate 0 以显式升级动作删除它，不写双读兼容；升级前的测试草稿如需保留，由用户先显式导出。
 - API Key 不再保存在普通用户浏览器。
@@ -584,7 +585,7 @@ API、数据库事务、队列等待、Worker Attempt、Provider HTTP、对象�
 
 真实 PostgreSQL 集成测试覆盖邮箱验证后“个人 Workspace + owner + Wallet + signup grant”单事务提交、重复/并发验证回调最终全平台只有一个个人 Workspace/Wallet/signup grant、越权 context adoption 拒绝、并发防透支、幂等 Hold、延迟约束下的账本平衡、分录复合租户键、Wallet 投影对账、owner 合法转移顺序和 `owner_user_id` 一致性、租约接管与 fencing、重复 Worker 结算、管理员调整重放/冲突与审计原子性、任务与 pg-boss 原子入队、pg-boss 预期索引，以及 Canvas 并发 revision、软删除、模式不匹配和不可见资源的稳定错误映射。已有 Canvas 同 baseRevision 并发保存测试可作为 revision 证据，但不能替代新增 RLS、队列和账本测试。
 
-租户隔离测试由 schema owner 只负责建库/迁移，并单独断言该 owner 没有 `BYPASSRLS`；实际请求使用生产等价的 `app_api`、`app_worker` 和 `app_maintenance` 登录角色。测试自身断言三者均非 owner、均无 `BYPASSRLS`，并证明缺少上下文、缺少显式 Workspace 条件、错误 join、伪造路径 Workspace、API 伪设无成员 Workspace、跨租户子资源 ID、伪造/跨事务复用 admin operation、邀请接受和池连接复用均默认拒绝；真实平台管理员事务只能访问 operation 绑定的目标 Workspace，并按动作矩阵处理 active/suspended/deactivated，跨 Workspace 或错误动作仍拒绝。平台目标 operation 只能修改 Model/Route，Workspace 目标或错误 purpose 必须失败。Maintenance 只能读取清单中的扫描列，任何租户表写入或未授权列读取均失败，候选交给 Worker 后必须重新验证。不得以 schema owner 或超级用户运行后宣称 RLS 生效。
+租户隔离测试由 schema owner 只负责建库/迁移，并单独断言该 owner 没有 `BYPASSRLS`；实际请求使用生产等价的 `app_api`、`app_worker` 和 `app_maintenance` 登录角色。测试自身断言三者均非 owner、均无 `BYPASSRLS`，并证明缺少上下文、缺少显式 Workspace 条件、错误 join、伪造路径 Workspace、API 伪设无成员 Workspace、跨租户子资源 ID、伪造/跨事务复用 admin operation、邀请接受和池连接复用均默认拒绝；真实平台管理员事务只能访问 operation 绑定的目标 Workspace，并按动作矩阵处理 active/suspended/deactivated，跨 Workspace 或错误动作仍拒绝。状态机测试覆盖 owner 专用 policy 的 active→deactivated、管理员 active→suspended→deactivated、suspended/deactivated→active，并证明 deactivated 下 `wallet_adjust` 失败、restore 后才恢复 active 动作集合。平台目标 operation 只能按 read/write purpose 读取或修改 Model/Route；普通 app_api 读取 Route、读取 disabled Model、Workspace 目标 operation 和错误 purpose 必须失败，管理响应必须断言不含 `secret_ref` 或真实 Secret。Maintenance 只能读取清单中的扫描列，任何租户表写入或未授权列读取均失败，候选交给 Worker 后必须重新验证。不得以 schema owner 或超级用户运行后宣称 RLS 生效。
 
 身份边界测试证明 Identity 适配器替换不会改变 Workspace 成员、角色、邀请、钱包或 Canvas 数据；Workspaces 模块测试不得依赖 Better Auth Organization API。
 
@@ -594,7 +595,7 @@ API、数据库事务、队列等待、Worker Attempt、Provider HTTP、对象�
 
 Gate 0 先为 `web/` 建立范围受限的 Vitest + fake-indexeddb 测试入口，不引入 DOM/React 测试框架。snapshot 文档模式先让当前非原子实现下的关键测试失败，再用原生 IndexedDB 事务/CAS使其通过；至少覆盖双连接同键 CAS、同 draft 的 `writeSeq` 乱序拒绝、另一标签频繁推进 `coordinationRevision` 时私有草稿仍可前进、coordination CAS 过期拒绝、旧 `deletionGeneration` 与 tombstone 阻止迟到复活、事务/deadline abort 全量回滚、草稿 + marker 原子写、所有权条件删除、GC 不删除外部活动草稿，以及同一浏览器切换身份后另一 scope 的草稿不可读且不可被 GC 删除。
 
-自动化测试还必须穿过真实的 Session/Manager adapter，而不只测存储原语：取消的 prepare 不写入、普通 open 原子提交 repairs、server-copy 使用 `repairs: []`、过期 repair 重新解析、双标签冲突保留两份入口、未知 marker 所有权时跳过 GC、确认删除写 tombstone、forced dispose abort 自有事务。当前 server-copy 漏传 `repairs` 的路径先作为红色回归测试，clean/server 结果改由统一构造函数产生。
+自动化测试还必须穿过真实的 Session/Manager adapter，而不只测存储原语：取消的 prepare 不写入、普通 open 原子提交 repairs、server-copy 使用 `repairs: []`、过期 repair 重新解析、双标签冲突保留两份入口、未知 marker 所有权时跳过 GC、服务端删除失败/不确定时不写 tombstone、确认删除 Canvas 后写 tombstone 且旧会话不能复活、接受服务端版本清除冲突草稿后新 Session 仍能在原 scope 正常写入、forced dispose abort 自有事务。当前 server-copy 漏传 `repairs` 的路径先作为红色回归测试，clean/server 结果改由统一构造函数产生。
 
 fake-indexeddb 只能证明单进程 API 语义。Chrome、Firefox、Safari 的独立测试页必须覆盖双标签 `versionchange/blocked`、异常关闭、刷新后耐久性、跨标签竞争、隐私模式/配额失败和后台节流；不得关闭用户已打开页面。Gate 0 关闭前必须实际执行并归档三浏览器结果、用户执行的 typecheck 结果和失败截图，不能只定义矩阵。
 
@@ -624,7 +625,7 @@ Canvas 保存容量测试按“并发编辑者 × 快照大小 × 保存节奏�
 
 ### Gate 2：云端 Canvas 与 Asset
 
-成员可以创建、保存、重开和冲突恢复 snapshot Canvas，并通过预签名 URL 上传和读取私有 Asset。浏览器本地恢复失败不能覆盖云端权威状态；多标签共享草稿发生冲突时必须显式展示，载入服务端版本会删除同一画布的共享本地冲突草稿。Asset ID 转换、不可解析本地 `storageKey` 状态和 Canvas 保存写放大测试全部通过后才关闭 Gate 2。
+成员可以创建、保存、重开和冲突恢复 snapshot Canvas，并通过预签名 URL 上传和读取私有 Asset。浏览器本地恢复失败不能覆盖云端权威状态；多标签共享草稿发生冲突时必须显式展示，载入服务端版本会按 coordination CAS 删除同一画布的共享本地冲突草稿，但不写 Canvas 删除 tombstone，之后新 Session 仍可正常建立恢复草稿。Asset ID 转换、不可解析本地 `storageKey` 状态和 Canvas 保存写放大测试全部通过后才关闭 Gate 2。
 
 ### Gate 3：积分账本
 
