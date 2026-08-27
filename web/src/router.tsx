@@ -42,6 +42,6 @@ export const router = createBrowserRouter([
     },
     { path: "/login", element: <LoginPage /> },
     { path: "/register", element: <RegisterPage /> },
-    { path: "/accept-invitation/:invitationId", element: <AcceptInvitationPage /> },
+    { path: "/accept-invitation/:token", element: <AcceptInvitationPage /> },
     { path: "*", element: <NotFound /> },
 ]);

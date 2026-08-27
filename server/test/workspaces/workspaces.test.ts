@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { users, workspaceMembers } from "../../src/modules/identity/auth-schema.js";
-import { ensurePersonalWorkspace } from "../../src/modules/workspaces/service.js";
+import { sql } from "drizzle-orm";
+
+import { withUserTransaction } from "../../src/infrastructure/database/transactions.js";
+import { hashInvitationToken, resolvePersonalWorkspace } from "../../src/modules/workspaces/service.js";
 import {
     createAuthTestHarness,
     registerVerifiedUser,
@@ -11,6 +13,13 @@ import {
 } from "../helpers/auth.js";
 
 const harness = createAuthTestHarness();
+
+function latestInvitationToken(mailer: MemoryMailer): string {
+    const url = new URL(mailer.invitations.at(-1)?.invitationUrl ?? "");
+    const token = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+    if (!token) throw new Error("Invitation URL has no token");
+    return token;
+}
 
 async function createTeam(app: AuthApp, owner: VerifiedUser, name: string, slug: string) {
     const response = await app.inject({
@@ -31,6 +40,7 @@ async function inviteAndAccept(
     workspaceId: string,
     invitee: { name: string; email: string; role: "admin" | "member" },
 ) {
+    const invitationCount = mailer.invitations.length;
     const invited = await app.inject({
         method: "POST",
         url: `/api/v1/workspaces/${workspaceId}/invitations`,
@@ -40,15 +50,18 @@ async function inviteAndAccept(
 
     expect(invited.statusCode).toBe(201);
     const invitationId = invited.json().invitation.id as string;
+    expect(mailer.invitations).toHaveLength(invitationCount + 1);
+    const token = latestInvitationToken(mailer);
     const user = await registerVerifiedUser(app, mailer, invitee);
     const accepted = await app.inject({
         method: "POST",
-        url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+        url: "/api/v1/workspace-invitations/accept",
         headers: { cookie: user.cookie },
+        payload: { token },
     });
 
-    expect(accepted.statusCode).toBe(200);
-    return { ...user, invitationId };
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    return { ...user, invitationId, token };
 }
 
 beforeAll(async () => {
@@ -65,44 +78,56 @@ afterAll(async () => {
 
 describe("personal workspace provisioning", () => {
     it("creates exactly one personal workspace for repeated calls", async () => {
-        const { database } = await harness.openAuthApp();
+        const { database, adminPool } = await harness.openAuthApp();
         const user = { id: "personal-repeated", name: "重复用户" };
-        await database.db.insert(users).values({ ...user, email: "repeated@example.com", emailVerified: true });
+        await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+            user.id,
+            user.name,
+            "repeated@example.com",
+        ]);
 
-        const first = await ensurePersonalWorkspace(database.db, user);
-        const second = await ensurePersonalWorkspace(database.db, user);
-        const stored = await database.pool.query(
-            'select "id", "slug" from "workspaces" where "owner_user_id" = $1 and "workspace_type" = \'personal\'',
+        const first = await withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user));
+        const second = await withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user));
+        const stored = await adminPool.query(
+            'select "id", "slug" from "workspaces" where "owner_user_id" = $1 and "type" = \'personal\'',
             [user.id],
         );
 
-        expect(second.id).toBe(first.id);
+        expect(second.summary.id).toBe(first.summary.id);
         expect(stored.rows).toHaveLength(1);
         expect(stored.rows[0]?.slug).toMatch(new RegExp(`^personal-${user.id}`));
     }, 60_000);
 
     it("returns the committed winner for concurrent personal creation", async () => {
-        const { database } = await harness.openAuthApp();
+        const { database, adminPool } = await harness.openAuthApp();
         const user = { id: "personal-concurrent", name: "并发用户" };
-        await database.db.insert(users).values({ ...user, email: "concurrent@example.com", emailVerified: true });
+        await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+            user.id,
+            user.name,
+            "concurrent@example.com",
+        ]);
 
         const results = await Promise.all(
-            Array.from({ length: 8 }, () => ensurePersonalWorkspace(database.db, user)),
+            Array.from({ length: 8 }, () =>
+                withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user)),
+            ),
         );
-        const stored = await database.pool.query(
-            'select w."id", m."role" from "workspaces" w join "workspace_members" m on m."organizationId" = w."id" where w."owner_user_id" = $1 and w."workspace_type" = \'personal\'',
+        const stored = await adminPool.query(
+            'select w."id", m."role" from "workspaces" w join "workspace_members" m on m."workspace_id" = w."id" where w."owner_user_id" = $1 and w."type" = \'personal\'',
             [user.id],
         );
 
-        expect(new Set(results.map((workspace) => workspace.id))).toEqual(new Set([results[0]!.id]));
-        expect(stored.rows).toEqual([{ id: results[0]!.id, role: "owner" }]);
+        expect(new Set(results.map((workspace) => workspace.summary.id))).toEqual(
+            new Set([results[0]!.summary.id]),
+        );
+        expect(stored.rows).toEqual([{ id: results[0]!.summary.id, role: "owner" }]);
     }, 60_000);
 
     it("guarantees a personal workspace when a verified user lists workspaces", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const user = await registerVerifiedUser(app, mailer, { name: "个人用户", email: "personal@example.com" });
 
-        const before = await database.pool.query('select count(*)::int as count from "workspaces"');
+        const before = await adminPool.query('select count(*)::int as count from "workspaces"');
         const response = await app.inject({
             method: "GET",
             url: "/api/v1/workspaces",
@@ -115,13 +140,43 @@ describe("personal workspace provisioning", () => {
             expect.objectContaining({ type: "personal", ownerUserId: user.userId, role: "owner" }),
         ]);
     }, 60_000);
+
+    it("maps an invisible lifetime-unique personal Workspace to a stable conflict", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerVerifiedUser(app, mailer, { name: "个人用户", email: "personal@example.com" });
+        const initial = await app.inject({
+            method: "GET",
+            url: "/api/v1/workspaces",
+            headers: { cookie: user.cookie },
+        });
+        const personalId = initial.json().workspaces[0].id as string;
+        await adminPool.query("update public.workspaces set status = 'suspended' where id = $1", [personalId]);
+        await adminPool.query(
+            "update public.workspace_members set status = 'removed' where workspace_id = $1 and user_id = $2",
+            [personalId, user.userId],
+        );
+
+        const response = await app.inject({
+            method: "GET",
+            url: "/api/v1/workspaces",
+            headers: { cookie: user.cookie },
+        });
+        const stored = await adminPool.query(
+            "select count(*)::int as count from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.userId],
+        );
+
+        expect(response.statusCode).toBe(409);
+        expect(response.json().error.code).toBe("personal_workspace_already_exists");
+        expect(stored.rows).toEqual([{ count: 1 }]);
+    }, 90_000);
 });
 
 describe("workspace routes", () => {
     it("requires an authenticated verified user to create a team", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const user = await registerVerifiedUser(app, mailer, { name: "待验证所有者", email: "unverified@example.com" });
-        await database.pool.query('update "users" set "emailVerified" = false where "id" = $1', [user.userId]);
+        await adminPool.query('update "users" set "emailVerified" = false where "id" = $1', [user.userId]);
 
         const unauthenticated = await app.inject({
             method: "POST",
@@ -134,7 +189,7 @@ describe("workspace routes", () => {
             headers: { cookie: user.cookie },
             payload: { name: "未验证团队", slug: "unverified-team" },
         });
-        const stored = await database.pool.query(
+        const stored = await adminPool.query(
             'select "slug" from "workspaces" where "slug" in ($1, $2)',
             ["anonymous-team", "unverified-team"],
         );
@@ -147,23 +202,23 @@ describe("workspace routes", () => {
     }, 60_000);
 
     it("creates a team transactionally with one owner member", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "团队所有者", email: "owner@example.com" });
 
         const workspace = await createTeam(app, owner, "产品团队", "product-team");
-        const stored = await database.pool.query(
-            'select w."workspace_type", w."owner_user_id", m."role" from "workspaces" w join "workspace_members" m on m."organizationId" = w."id" where w."id" = $1',
+        const stored = await adminPool.query(
+            'select w."type", w."owner_user_id", m."role" from "workspaces" w join "workspace_members" m on m."workspace_id" = w."id" where w."id" = $1',
             [workspace.id],
         );
 
         expect(workspace).toMatchObject({ name: "产品团队", slug: "product-team" });
-        expect(stored.rows).toEqual([{ workspace_type: "team", owner_user_id: owner.userId, role: "owner" }]);
+        expect(stored.rows).toEqual([{ type: "team", owner_user_id: owner.userId, role: "owner" }]);
     }, 60_000);
 
     it("rolls back the team row when owner membership insertion fails", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "事务所有者", email: "transaction@example.com" });
-        await database.pool.query(`
+        await adminPool.query(`
             create function fail_workspace_member_insert() returns trigger language plpgsql as $$
             begin
                 raise exception 'injected membership failure';
@@ -179,7 +234,7 @@ describe("workspace routes", () => {
             headers: { cookie: owner.cookie },
             payload: { name: "失败团队", slug: "failed-team" },
         });
-        const stored = await database.pool.query('select "id" from "workspaces" where "slug" = $1', ["failed-team"]);
+        const stored = await adminPool.query('select "id" from "workspaces" where "slug" = $1', ["failed-team"]);
 
         expect(response.statusCode).toBe(500);
         expect(response.json().error.code).toBe("internal_error");
@@ -221,8 +276,8 @@ describe("workspace routes", () => {
         expect(response.json().error.code).toBe("workspace_forbidden");
     }, 60_000);
 
-    it("authorizes from database membership without Better Auth activeOrganizationId", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+    it("authorizes from current database membership on every request", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "实时权限团队", "fresh-membership");
         const member = await inviteAndAccept(app, mailer, owner, workspace.id, {
@@ -235,13 +290,9 @@ describe("workspace routes", () => {
             url: `/api/v1/workspaces/${workspace.id}`,
             headers: { cookie: member.cookie },
         });
-        await database.pool.query(
-            'delete from "workspace_members" where "organizationId" = $1 and "userId" = $2',
+        await adminPool.query(
+            'update "workspace_members" set "status" = \'removed\' where "workspace_id" = $1 and "user_id" = $2',
             [workspace.id, member.userId],
-        );
-        const session = await database.pool.query(
-            'select "activeOrganizationId" from "sessions" where "userId" = $1',
-            [member.userId],
         );
         const after = await app.inject({
             method: "GET",
@@ -250,7 +301,6 @@ describe("workspace routes", () => {
         });
 
         expect(before.statusCode).toBe(200);
-        expect(session.rows[0]?.activeOrganizationId).toBeNull();
         expect(after.statusCode).toBe(403);
         expect(after.json().error.code).toBe("workspace_forbidden");
     }, 90_000);
@@ -287,7 +337,7 @@ describe("workspace routes", () => {
 
 describe("workspace members and invitations", () => {
     it("rejects all personal member and invitation mutations with the stable conflict", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "个人用户", email: "personal@example.com" });
         const listed = await app.inject({ method: "GET", url: "/api/v1/workspaces", headers: { cookie: owner.cookie } });
         const workspaceId = listed.json().workspaces[0].id as string;
@@ -309,24 +359,8 @@ describe("workspace members and invitations", () => {
             url: `/api/v1/workspaces/${workspaceId}/members/${memberId}`,
             headers: { cookie: owner.cookie },
         });
-        const directInvite = await app.inject({
-            method: "POST",
-            url: "/api/auth/organization/invite-member",
-            headers: { cookie: owner.cookie },
-            payload: { organizationId: workspaceId, email: "direct@example.com", role: "member" },
-        });
-        const additionalUser = await registerVerifiedUser(app, mailer, {
-            name: "额外用户",
-            email: "additional@example.com",
-        });
-        if (!app.auth) throw new Error("Auth is not registered");
-        await expect(
-            app.auth.api.addMember({
-                body: { organizationId: workspaceId, userId: additionalUser.userId, role: "member" },
-            }),
-        ).rejects.toMatchObject({ statusCode: 409 });
-        const storedInvitations = await database.pool.query(
-            'select count(*)::int as count from "workspace_invitations" where "organizationId" = $1',
+        const storedInvitations = await adminPool.query(
+            'select count(*)::int as count from "workspace_invitations" where "workspace_id" = $1',
             [workspaceId],
         );
 
@@ -334,7 +368,6 @@ describe("workspace members and invitations", () => {
         expect(invited.json().error.code).toBe("personal_workspace_single_member");
         expect(removed.statusCode).toBe(409);
         expect(removed.json().error.code).toBe("personal_workspace_single_member");
-        expect(directInvite.statusCode).toBe(404);
         expect(storedInvitations.rows[0]?.count).toBe(0);
     }, 60_000);
 
@@ -455,7 +488,7 @@ describe("workspace members and invitations", () => {
     }, 120_000);
 
     it("maps concurrent case-insensitive pending invitation conflicts to a stable envelope", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "并发邀请团队", "concurrent-invitation-team");
         const invite = (email: string) =>
@@ -468,8 +501,8 @@ describe("workspace members and invitations", () => {
 
         const responses = await Promise.all([invite("Invitee@Example.com"), invite("invitee@example.com")]);
         const sorted = responses.sort((left, right) => left.statusCode - right.statusCode);
-        const stored = await database.pool.query(
-            'select lower("email") as "email", "status" from "workspace_invitations" where "organizationId" = $1 and lower("email") = lower($2)',
+        const stored = await adminPool.query(
+            'select lower("email") as "email", "status" from "workspace_invitations" where "workspace_id" = $1 and lower("email") = lower($2)',
             [workspace.id, "invitee@example.com"],
         );
 
@@ -479,7 +512,7 @@ describe("workspace members and invitations", () => {
     }, 90_000);
 
     it("cancels an expired pending invitation before generating its replacement", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "重新邀请团队", "reinvite-team");
         const first = await app.inject({
@@ -488,7 +521,7 @@ describe("workspace members and invitations", () => {
             headers: { cookie: owner.cookie },
             payload: { email: "invitee@example.com", role: "member" },
         });
-        await database.pool.query('update "workspace_invitations" set "expiresAt" = now() - interval \'1 second\' where "id" = $1', [
+        await adminPool.query('update "workspace_invitations" set "expires_at" = now() - interval \'1 second\' where "id" = $1', [
             first.json().invitation.id,
         ]);
 
@@ -498,8 +531,8 @@ describe("workspace members and invitations", () => {
             headers: { cookie: owner.cookie },
             payload: { email: "INVITEE@example.com", role: "member" },
         });
-        const stored = await database.pool.query(
-            'select "id", "status" from "workspace_invitations" where "organizationId" = $1 order by "createdAt", "id"',
+        const stored = await adminPool.query(
+            'select "id", "status" from "workspace_invitations" where "workspace_id" = $1 order by "created_at", "id"',
             [workspace.id],
         );
 
@@ -512,7 +545,7 @@ describe("workspace members and invitations", () => {
     }, 90_000);
 
     it("binds invitation cancellation to the path workspace", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const first = await createTeam(app, owner, "团队一", "team-one");
         const second = await createTeam(app, owner, "团队二", "team-two");
@@ -529,7 +562,7 @@ describe("workspace members and invitations", () => {
             url: `/api/v1/workspaces/${second.id}/invitations/${invitationId}`,
             headers: { cookie: owner.cookie },
         });
-        const pending = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const pending = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
         const canceled = await app.inject({
@@ -537,7 +570,7 @@ describe("workspace members and invitations", () => {
             url: `/api/v1/workspaces/${first.id}/invitations/${invitationId}`,
             headers: { cookie: owner.cookie },
         });
-        const stored = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const stored = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
 
@@ -549,7 +582,7 @@ describe("workspace members and invitations", () => {
     }, 90_000);
 
     it("never removes the team owner", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "所有权团队", "owner-team");
         const members = await app.inject({
@@ -564,8 +597,8 @@ describe("workspace members and invitations", () => {
             url: `/api/v1/workspaces/${workspace.id}/members/${ownerMember.id}`,
             headers: { cookie: owner.cookie },
         });
-        const stored = await database.pool.query(
-            'select "role" from "workspace_members" where "organizationId" = $1 and "userId" = $2',
+        const stored = await adminPool.query(
+            'select "role" from "workspace_members" where "workspace_id" = $1 and "user_id" = $2',
             [workspace.id, owner.userId],
         );
 
@@ -575,7 +608,7 @@ describe("workspace members and invitations", () => {
     }, 60_000);
 
     it("blocks owner-role creation through application contracts and internal hooks", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "唯一所有者团队", "single-owner-team");
         await inviteAndAccept(app, mailer, owner, workspace.id, {
@@ -583,28 +616,18 @@ describe("workspace members and invitations", () => {
             email: "admin@example.com",
             role: "admin",
         });
-        const candidate = await registerVerifiedUser(app, mailer, {
-            name: "候选所有者",
-            email: "owner-candidate@example.com",
-        });
         const ownerInvite = await app.inject({
             method: "POST",
             url: `/api/v1/workspaces/${workspace.id}/invitations`,
             headers: { cookie: owner.cookie },
             payload: { email: "second-owner@example.com", role: "owner" },
         });
-        if (!app.auth) throw new Error("Auth is not registered");
-        await expect(
-            app.auth.api.addMember({
-                body: { organizationId: workspace.id, userId: candidate.userId, role: "owner" },
-            }),
-        ).rejects.toMatchObject({ statusCode: 409 });
-        const roles = await database.pool.query(
-            'select "role" from "workspace_members" where "organizationId" = $1 order by "role"',
+        const roles = await adminPool.query(
+            'select "role" from "workspace_members" where "workspace_id" = $1 order by "role"',
             [workspace.id],
         );
-        const invitations = await database.pool.query(
-            'select count(*)::int as count from "workspace_invitations" where "organizationId" = $1 and "role" = \'owner\'',
+        const invitations = await adminPool.query(
+            'select count(*)::int as count from "workspace_invitations" where "workspace_id" = $1 and "role" = \'owner\'',
             [workspace.id],
         );
 
@@ -615,8 +638,45 @@ describe("workspace members and invitations", () => {
 });
 
 describe("workspace invitation acceptance", () => {
+    it("accepts only the strict token body contract and never persists the raw token", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
+        const workspace = await createTeam(app, owner, "令牌契约团队", "token-contract-team");
+        const invited = await app.inject({
+            method: "POST",
+            url: `/api/v1/workspaces/${workspace.id}/invitations`,
+            headers: { cookie: owner.cookie },
+            payload: { email: "invitee@example.com", role: "member" },
+        });
+        const invitationId = invited.json().invitation.id as string;
+        const token = latestInvitationToken(mailer);
+        const invitee = await registerVerifiedUser(app, mailer, { name: "受邀人", email: "invitee@example.com" });
+
+        const extraBody = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspace-invitations/accept",
+            headers: { cookie: invitee.cookie },
+            payload: { token, invitationId },
+        });
+        const oldPath = await app.inject({
+            method: "POST",
+            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            headers: { cookie: invitee.cookie },
+        });
+        const stored = await adminPool.query(
+            "select token_digest, status from public.workspace_invitations where id = $1",
+            [invitationId],
+        );
+
+        expect(extraBody.statusCode).toBe(400);
+        expect(oldPath.statusCode).toBe(404);
+        expect(stored.rows).toEqual([{ token_digest: expect.stringMatching(/^[0-9a-f]{64}$/), status: "pending" }]);
+        expect(stored.rows[0]?.token_digest).not.toBe(token);
+        expect(invited.body).not.toContain(token);
+    }, 90_000);
+
     it("atomically accepts one of two concurrent requests and creates one membership", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool, database } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "接受邀请团队", "accept-invitation-team");
         const invited = await app.inject({
@@ -626,21 +686,33 @@ describe("workspace invitation acceptance", () => {
             payload: { email: "invitee@example.com", role: "member" },
         });
         const invitationId = invited.json().invitation.id as string;
+        const token = latestInvitationToken(mailer);
         const invitee = await registerVerifiedUser(app, mailer, { name: "受邀人", email: "invitee@example.com" });
+        const acceptancePrerequisites = await withUserTransaction(database.db, invitee.userId, async (tx) => {
+            const result = await tx.execute<{ verified: boolean; visible: number }>(sql`
+                select public.is_current_verified_email(${'invitee@example.com'}, ${invitee.userId}) as verified,
+                       count(*)::int as visible
+                from public.workspace_invitations
+                where token_digest = ${hashInvitationToken(token)}
+            `);
+            return result.rows[0];
+        });
+        expect(acceptancePrerequisites).toEqual({ verified: true, visible: 1 });
         const accept = () =>
             app.inject({
                 method: "POST",
-                url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+                url: "/api/v1/workspace-invitations/accept",
                 headers: { cookie: invitee.cookie },
+                payload: { token },
             });
 
         const responses = await Promise.all([accept(), accept()]);
         const sorted = responses.sort((left, right) => left.statusCode - right.statusCode);
-        const members = await database.pool.query(
-            'select "role" from "workspace_members" where "organizationId" = $1 and "userId" = $2',
+        const members = await adminPool.query(
+            'select "role" from "workspace_members" where "workspace_id" = $1 and "user_id" = $2',
             [workspace.id, invitee.userId],
         );
-        const invitation = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const invitation = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
 
@@ -652,7 +724,7 @@ describe("workspace invitation acceptance", () => {
     }, 90_000);
 
     it("serializes different invitation acceptances at the 100-member limit", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "容量上限团队", "member-limit-team");
         const seededUsers = Array.from({ length: 98 }, (_, index) => ({
@@ -661,17 +733,29 @@ describe("workspace invitation acceptance", () => {
             email: `capacity-user-${index}@example.com`,
             emailVerified: true,
         }));
-        await database.db.insert(users).values(seededUsers);
-        await database.db.insert(workspaceMembers).values(
-            seededUsers.map((user, index) => ({
-                id: `capacity-member-${index}`,
-                organizationId: workspace.id,
-                userId: user.id,
-                role: "member",
-            })),
+        for (const [index, user] of seededUsers.entries()) {
+            await adminPool.query(
+                'insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)',
+                [user.id, user.name, user.email],
+            );
+            await adminPool.query(
+                "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'member', 'active')",
+                [`capacity-member-${index}`, workspace.id, user.id],
+            );
+        }
+        await adminPool.query(
+            'insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)',
+            ["capacity-removed-user", "已移除成员", "capacity-removed@example.com"],
         );
-        const before = await database.pool.query(
-            'select count(*)::int as count from "workspace_members" where "organizationId" = $1',
+        await adminPool.query(
+            "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'member', 'removed')",
+            ["capacity-removed-member", workspace.id, "capacity-removed-user"],
+        );
+        const before = await adminPool.query(
+            `select count(*)::int as count,
+                    count(*) filter (where status = 'active')::int as active_count
+             from "workspace_members"
+             where "workspace_id" = $1`,
             [workspace.id],
         );
         const firstInvitation = await app.inject({
@@ -680,12 +764,14 @@ describe("workspace invitation acceptance", () => {
             headers: { cookie: owner.cookie },
             payload: { email: "capacity-first@example.com", role: "member" },
         });
+        const firstToken = latestInvitationToken(mailer);
         const secondInvitation = await app.inject({
             method: "POST",
             url: `/api/v1/workspaces/${workspace.id}/invitations`,
             headers: { cookie: owner.cookie },
             payload: { email: "capacity-second@example.com", role: "member" },
         });
+        const secondToken = latestInvitationToken(mailer);
         const firstInvitationId = firstInvitation.json().invitation.id as string;
         const secondInvitationId = secondInvitation.json().invitation.id as string;
         const firstInvitee = await registerVerifiedUser(app, mailer, {
@@ -696,7 +782,7 @@ describe("workspace invitation acceptance", () => {
             name: "容量候选人二",
             email: "capacity-second@example.com",
         });
-        await database.pool.query(`
+        await adminPool.query(`
             create function delay_capacity_member_insert() returns trigger language plpgsql as $$
             begin
                 perform pg_sleep(1);
@@ -706,26 +792,30 @@ describe("workspace invitation acceptance", () => {
             create trigger delay_capacity_member_insert before insert on "workspace_members"
             for each row execute function delay_capacity_member_insert();
         `);
-        const accept = async (invitationId: string, cookie: string) => ({
+        const accept = async (invitationId: string, token: string, cookie: string) => ({
             invitationId,
             response: await app.inject({
                 method: "POST",
-                url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+                url: "/api/v1/workspace-invitations/accept",
                 headers: { cookie },
+                payload: { token },
             }),
         });
 
         const attempts = await Promise.all([
-            accept(firstInvitationId, firstInvitee.cookie),
-            accept(secondInvitationId, secondInvitee.cookie),
+            accept(firstInvitationId, firstToken, firstInvitee.cookie),
+            accept(secondInvitationId, secondToken, secondInvitee.cookie),
         ]);
         const winner = attempts.find(({ response }) => response.statusCode === 200)!;
         const loser = attempts.find(({ response }) => response.statusCode === 409)!;
-        const after = await database.pool.query(
-            'select count(*)::int as count from "workspace_members" where "organizationId" = $1',
+        const after = await adminPool.query(
+            `select count(*)::int as count,
+                    count(*) filter (where status = 'active')::int as active_count
+             from "workspace_members"
+             where "workspace_id" = $1`,
             [workspace.id],
         );
-        const invitations = await database.pool.query(
+        const invitations = await adminPool.query(
             'select "id", "status" from "workspace_invitations" where "id" = any($1::text[])',
             [[firstInvitationId, secondInvitationId]],
         );
@@ -733,18 +823,18 @@ describe("workspace invitation acceptance", () => {
             invitations.rows.map((invitation: { id: string; status: string }) => [invitation.id, invitation.status]),
         );
 
-        expect(before.rows).toEqual([{ count: 99 }]);
+        expect(before.rows).toEqual([{ count: 100, active_count: 99 }]);
         expect([firstInvitation.statusCode, secondInvitation.statusCode]).toEqual([201, 201]);
         expect(attempts.map(({ response }) => response.statusCode).sort()).toEqual([200, 409]);
         expect(winner.response.json()).toEqual({ workspaceId: workspace.id });
         expect(loser.response.json().error.code).toBe("workspace_member_limit_reached");
-        expect(after.rows).toEqual([{ count: 100 }]);
+        expect(after.rows).toEqual([{ count: 101, active_count: 100 }]);
         expect(invitationStatuses[winner.invitationId]).toBe("accepted");
         expect(invitationStatuses[loser.invitationId]).toBe("pending");
     }, 120_000);
 
     it("keeps the invitation pending when membership insertion fails", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "回滚邀请团队", "rollback-invitation-team");
         const invited = await app.inject({
@@ -754,8 +844,9 @@ describe("workspace invitation acceptance", () => {
             payload: { email: "invitee@example.com", role: "member" },
         });
         const invitationId = invited.json().invitation.id as string;
+        const token = latestInvitationToken(mailer);
         const invitee = await registerVerifiedUser(app, mailer, { name: "受邀人", email: "invitee@example.com" });
-        await database.pool.query(`
+        await adminPool.query(`
             create function fail_workspace_member_insert() returns trigger language plpgsql as $$
             begin
                 raise exception 'injected acceptance failure';
@@ -767,14 +858,15 @@ describe("workspace invitation acceptance", () => {
 
         const response = await app.inject({
             method: "POST",
-            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            url: "/api/v1/workspace-invitations/accept",
             headers: { cookie: invitee.cookie },
+            payload: { token },
         });
-        const invitation = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const invitation = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
-        const members = await database.pool.query(
-            'select "id" from "workspace_members" where "organizationId" = $1 and "userId" = $2',
+        const members = await adminPool.query(
+            'select "id" from "workspace_members" where "workspace_id" = $1 and "user_id" = $2',
             [workspace.id, invitee.userId],
         );
 
@@ -786,7 +878,7 @@ describe("workspace invitation acceptance", () => {
     }, 90_000);
 
     it("rejects a different verified account without claiming the invitation", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "收件人团队", "recipient-team");
         const invited = await app.inject({
@@ -796,24 +888,26 @@ describe("workspace invitation acceptance", () => {
             payload: { email: "invitee@example.com", role: "member" },
         });
         const invitationId = invited.json().invitation.id as string;
+        const token = latestInvitationToken(mailer);
         const other = await registerVerifiedUser(app, mailer, { name: "其他用户", email: "other@example.com" });
 
         const response = await app.inject({
             method: "POST",
-            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            url: "/api/v1/workspace-invitations/accept",
             headers: { cookie: other.cookie },
+            payload: { token },
         });
-        const invitation = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const invitation = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
 
-        expect(response.statusCode).toBe(403);
-        expect(response.json().error.code).toBe("workspace_invitation_recipient_mismatch");
+        expect(response.statusCode).toBe(409);
+        expect(response.json().error.code).toBe("workspace_invitation_unavailable");
         expect(invitation.rows).toEqual([{ status: "pending" }]);
     }, 90_000);
 
     it("does not claim an expired pending invitation", async () => {
-        const { app, mailer, database } = await harness.openAuthApp();
+        const { app, mailer, adminPool } = await harness.openAuthApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "owner@example.com" });
         const workspace = await createTeam(app, owner, "过期邀请团队", "expired-invitation-team");
         const invited = await app.inject({
@@ -823,17 +917,19 @@ describe("workspace invitation acceptance", () => {
             payload: { email: "invitee@example.com", role: "member" },
         });
         const invitationId = invited.json().invitation.id as string;
-        await database.pool.query('update "workspace_invitations" set "expiresAt" = now() - interval \'1 second\' where "id" = $1', [
+        const token = latestInvitationToken(mailer);
+        await adminPool.query('update "workspace_invitations" set "expires_at" = now() - interval \'1 second\' where "id" = $1', [
             invitationId,
         ]);
         const invitee = await registerVerifiedUser(app, mailer, { name: "受邀人", email: "invitee@example.com" });
 
         const response = await app.inject({
             method: "POST",
-            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            url: "/api/v1/workspace-invitations/accept",
             headers: { cookie: invitee.cookie },
+            payload: { token },
         });
-        const invitation = await database.pool.query('select "status" from "workspace_invitations" where "id" = $1', [
+        const invitation = await adminPool.query('select "status" from "workspace_invitations" where "id" = $1', [
             invitationId,
         ]);
 

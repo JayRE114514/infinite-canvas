@@ -33,8 +33,9 @@ export const CanvasSnapshotSchema = Type.Cyclic(
     {
         JsonValue: Type.Union([
             Type.Null(),
+            // 数字必须先于布尔，避免 AJV union coercion 把 1/0 改写成 true/false。
+            Type.Number({ minimum: -Number.MAX_VALUE, maximum: Number.MAX_VALUE }),
             Type.Boolean(),
-            Type.Number(),
             Type.String(),
             Type.Array(Type.Ref("JsonValue")),
             Type.Record(JsonKeySchema, Type.Ref("JsonValue")),

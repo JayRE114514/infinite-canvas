@@ -4,7 +4,7 @@ import { loadConfig } from "../src/config.js";
 
 const baseEnv: NodeJS.ProcessEnv = {
     NODE_ENV: "test",
-    DATABASE_URL: "postgres://test:test@localhost/test",
+    DATABASE_URL_API: "postgres://app_api:test@localhost/test",
     BETTER_AUTH_SECRET: "x".repeat(32),
     APP_ORIGIN: "http://localhost:3000",
     SMTP_HOST: "localhost",
@@ -13,9 +13,9 @@ const baseEnv: NodeJS.ProcessEnv = {
 
 describe("loadConfig", () => {
     it("rejects a missing database URL", () => {
-        const { DATABASE_URL: _omitted, ...env } = baseEnv;
+        const { DATABASE_URL_API: _omitted, ...env } = baseEnv;
 
-        expect(() => loadConfig(env)).toThrow("DATABASE_URL");
+        expect(() => loadConfig(env)).toThrow("DATABASE_URL_API");
     });
 
     it("parses bounded pool and server settings", () => {
@@ -32,23 +32,23 @@ describe("loadConfig", () => {
             port: 4000,
             appOrigin: "http://localhost:3000",
             betterAuthSecret: "x".repeat(32),
-            database: { url: "postgres://test:test@localhost/test", poolMax: 10 },
+            database: { url: "postgres://app_api:test@localhost/test", poolMax: 10, expectedRole: "app_api" },
             smtp: { host: "localhost", port: 587, user: "", password: "", from: "no-reply@example.com" },
         });
     });
 
-    it.each(["DATABASE_URL", "APP_ORIGIN", "BETTER_AUTH_SECRET", "SMTP_HOST", "SMTP_FROM"])("rejects a missing %s", (name) => {
+    it.each(["DATABASE_URL_API", "APP_ORIGIN", "BETTER_AUTH_SECRET", "SMTP_HOST", "SMTP_FROM"])("rejects a missing %s", (name) => {
         expect(() => loadConfig({ ...baseEnv, [name]: undefined })).toThrow(name);
     });
 
-    it.each(["DATABASE_URL", "APP_ORIGIN", "SMTP_HOST", "SMTP_FROM"])("treats a whitespace-only %s as missing", (name) => {
+    it.each(["DATABASE_URL_API", "APP_ORIGIN", "SMTP_HOST", "SMTP_FROM"])("treats a whitespace-only %s as missing", (name) => {
         expect(() => loadConfig({ ...baseEnv, [name]: "   " })).toThrow(name);
     });
 
     it("trims surrounding whitespace from required values", () => {
-        const config = loadConfig({ ...baseEnv, DATABASE_URL: "  postgres://test:test@localhost/test  " });
+        const config = loadConfig({ ...baseEnv, DATABASE_URL_API: "  postgres://app_api:test@localhost/test  " });
 
-        expect(config.database.url).toBe("postgres://test:test@localhost/test");
+        expect(config.database.url).toBe("postgres://app_api:test@localhost/test");
     });
 
     describe("NODE_ENV", () => {
@@ -58,8 +58,15 @@ describe("loadConfig", () => {
             expect(loadConfig(env).nodeEnv).toBe("development");
         });
 
-        it.each(["development", "test", "production"] as const)("accepts %s", (nodeEnv) => {
+        it.each(["development", "test"] as const)("accepts %s", (nodeEnv) => {
             expect(loadConfig({ ...baseEnv, NODE_ENV: nodeEnv }).nodeEnv).toBe(nodeEnv);
+        });
+
+        // production 必须配 HTTPS origin，否则 loadConfig 会按设计直接拒绝。
+        it("accepts production with an HTTPS origin", () => {
+            const config = loadConfig({ ...baseEnv, NODE_ENV: "production", APP_ORIGIN: "https://canvas.example.com" });
+
+            expect(config.nodeEnv).toBe("production");
         });
 
         it.each(["staging", "Development", "production ", "prod", ""])("rejects the unsupported value %j", (nodeEnv) => {

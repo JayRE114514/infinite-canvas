@@ -8,6 +8,7 @@
         "dev:worker": "tsx watch src/worker.ts",
         "test": "vitest run",
         "typecheck": "tsc --noEmit",
+        "check:boundaries": "tsx scripts/check-module-boundaries.ts src",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate"
     },

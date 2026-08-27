@@ -208,7 +208,7 @@ describe("auth route mounting", () => {
 
 describe("workspace mapping", () => {
     it("stores an application-created team as a workspace row with one owner", async () => {
-        const { app, mailer, database } = await openAuthApp();
+        const { app, mailer, adminPool } = await openAuthApp();
 
         const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
 
@@ -221,89 +221,78 @@ describe("workspace mapping", () => {
 
         expect(created.statusCode).toBe(201);
 
-        const workspaces = await database.pool.query(
-            'select "id", "workspace_type", "status", "owner_user_id", "slug" from "workspaces"',
+        const workspaces = await adminPool.query(
+            'select "id", "type", "status", "owner_user_id", "slug" from "workspaces"',
         );
 
         expect(workspaces.rows).toHaveLength(1);
         expect(workspaces.rows[0]).toMatchObject({
             id: created.json().workspace.id,
-            workspace_type: "team",
+            type: "team",
             status: "active",
             slug: "team-workspace",
             owner_user_id: owner.userId,
         });
 
-        const members = await database.pool.query('select "userId", "role", "organizationId" from "workspace_members"');
+        const members = await adminPool.query('select "user_id", "role", "workspace_id" from "workspace_members"');
 
         expect(members.rows).toHaveLength(1);
         expect(members.rows[0]).toMatchObject({
-            userId: owner.userId,
+            user_id: owner.userId,
             role: "owner",
-            organizationId: created.json().workspace.id,
+            workspace_id: created.json().workspace.id,
         });
     }, 60_000);
 
-    it("disallows direct Better Auth Organization creation as defense in depth", async () => {
-        const { app, mailer } = await openAuthApp();
-        const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
+    it("does not expose identity APIs that can create or delete workspaces", async () => {
+        const { app } = await openAuthApp();
         if (!app.auth) throw new Error("Auth is not registered");
 
-        await expect(
-            app.auth.api.createOrganization({
-                headers: new Headers({ origin: APP_ORIGIN, cookie: owner.cookie }),
-                body: { name: "绕过团队", slug: "bypass-team" },
-            }),
-        ).rejects.toMatchObject({ statusCode: 403 });
-    }, 60_000);
-
-    it("disables Better Auth Organization deletion as defense in depth", async () => {
-        const { app, mailer, database } = await openAuthApp();
-        const owner = await registerVerifiedUser(app, mailer, { name: "工作区所有者", email: "owner@example.com" });
-        const created = await app.inject({
-            method: "POST",
-            url: "/api/v1/workspaces",
-            headers: { cookie: owner.cookie },
-            payload: { name: "保留团队", slug: "retained-team" },
-        });
-        const workspaceId = created.json().workspace.id as string;
-        if (!app.auth) throw new Error("Auth is not registered");
-
-        await expect(
-            app.auth.api.deleteOrganization({
-                headers: new Headers({ origin: APP_ORIGIN, cookie: owner.cookie }),
-                body: { organizationId: workspaceId },
-            }),
-        ).rejects.toMatchObject({ statusCode: 404 });
-        const stored = await database.pool.query('select "id" from "workspaces" where "id" = $1', [workspaceId]);
-
-        expect(stored.rows).toEqual([{ id: workspaceId }]);
+        expect(app.auth.api).not.toHaveProperty("createOrganization");
+        expect(app.auth.api).not.toHaveProperty("deleteOrganization");
+        expect(app.auth.api).not.toHaveProperty("addMember");
+        expect(app.auth.api).not.toHaveProperty("createInvitation");
     }, 60_000);
 
     it("allows only one personal workspace per owner", async () => {
-        const { database } = await openAuthApp();
+        const { adminPool } = await openAuthApp();
 
-        await database.pool.query(
+        await adminPool.query(
             'insert into "users" ("id", "name", "email", "emailVerified") values ($1, $2, $3, true)',
             ["user-personal", "个人用户", "personal@example.com"],
         );
-        const insertWorkspace = (id: string, slug: string, type: string) =>
-            database.pool.query(
-                'insert into "workspaces" ("id", "name", "slug", "createdAt", "workspace_type", "status", "owner_user_id") values ($1, $2, $3, now(), $4, \'active\', $5)',
-                [id, slug, slug, type, "user-personal"],
-            );
+        const insertWorkspace = async (id: string, slug: string, type: string) => {
+            const client = await adminPool.connect();
+            try {
+                await client.query("begin");
+                await client.query(
+                    'insert into "workspaces" ("id", "name", "slug", "type", "status", "owner_user_id") values ($1, $2, $3, $4, \'active\', $5)',
+                    [id, slug, slug, type, "user-personal"],
+                );
+                await client.query(
+                    'insert into "workspace_members" ("id", "workspace_id", "user_id", "role", "status") values ($1, $2, $3, \'owner\', \'active\')',
+                    [`member-${id}`, id, "user-personal"],
+                );
+                await client.query("commit");
+            } catch (error) {
+                await client.query("rollback").catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        };
 
         await insertWorkspace("ws-personal", "personal-one", "personal");
 
         await expect(insertWorkspace("ws-personal-2", "personal-two", "personal")).rejects.toThrow();
 
-        await expect(insertWorkspace("ws-team", "team-one", "team")).resolves.toBeTruthy();
+        await expect(insertWorkspace("ws-team", "team-one", "team")).resolves.toBeUndefined();
     }, 60_000);
 });
 
 describe("workspace invitations", () => {
-    it("emails a same-origin acceptance URL carrying the invitation id", async () => {
-        const { app, mailer, database } = await openAuthApp();
+    it("emails a same-origin acceptance URL carrying the raw token only", async () => {
+        const { app, mailer, adminPool } = await openAuthApp();
 
         const owner = await registerVerifiedUser(app, mailer, { name: "邀请人", email: "inviter@example.com" });
         const created = await app.inject({
@@ -325,26 +314,31 @@ describe("workspace invitations", () => {
 
         expect(invited.statusCode).toBe(201);
 
-        const stored = await database.pool.query(
-            'select "id", "email", "status", "expiresAt" from "workspace_invitations"',
+        const stored = await adminPool.query(
+            'select "id", "email", "status", "expires_at", "token_digest" from "workspace_invitations"',
         );
 
         expect(stored.rows).toHaveLength(1);
         expect(stored.rows[0]?.status).toBe("pending");
-        expect(stored.rows[0]?.expiresAt.getTime()).toBeGreaterThan(Date.now());
+        expect(stored.rows[0]?.expires_at.getTime()).toBeGreaterThan(Date.now());
 
         expect(mailer.invitations).toHaveLength(1);
         expect(mailer.invitations[0]?.email).toBe("invitee@example.com");
 
-        // 邮件必须给出可直接打开的同源接受链接，而不是裸邀请 id。
+        // 邮件给出同源 token 链接；数据库与响应都不包含原始 token。
         const acceptUrl = new URL(mailer.invitations[0]!.invitationUrl);
+        const token = decodeURIComponent(acceptUrl.pathname.split("/").at(-1) ?? "");
 
         expect(acceptUrl.origin).toBe(APP_ORIGIN);
-        expect(acceptUrl.pathname).toBe(`/accept-invitation/${stored.rows[0]?.id}`);
+        expect(acceptUrl.pathname).toBe(`/accept-invitation/${encodeURIComponent(token)}`);
+        expect(token).not.toBe(stored.rows[0]?.id);
+        expect(stored.rows[0]?.token_digest).toMatch(/^[0-9a-f]{64}$/);
+        expect(stored.rows[0]?.token_digest).not.toBe(token);
+        expect(invited.body).not.toContain(token);
     }, 60_000);
 
-    it("accepts the invitation with the id carried by the emailed URL", async () => {
-        const { app, mailer, database } = await openAuthApp();
+    it("accepts the invitation with the token carried by the emailed URL", async () => {
+        const { app, mailer, adminPool } = await openAuthApp();
 
         const owner = await registerVerifiedUser(app, mailer, { name: "邀请人", email: "inviter2@example.com" });
         const created = await app.inject({
@@ -363,32 +357,33 @@ describe("workspace invitations", () => {
 
         expect(mailer.invitations).toHaveLength(1);
 
-        const invitationId = new URL(mailer.invitations[0]!.invitationUrl).pathname.split("/").pop();
+        const token = decodeURIComponent(new URL(mailer.invitations[0]!.invitationUrl).pathname.split("/").pop() ?? "");
         const invitee = await registerVerifiedUser(app, mailer, { name: "受邀人", email: "invitee2@example.com" });
 
         const accepted = await app.inject({
             method: "POST",
-            url: `/api/v1/workspace-invitations/${invitationId}/accept`,
+            url: "/api/v1/workspace-invitations/accept",
             headers: { cookie: invitee.cookie },
+            payload: { token },
         });
 
         expect(accepted.statusCode).toBe(200);
         expect(accepted.json()).toEqual({ workspaceId });
 
-        const members = await database.pool.query(
-            'select "userId", "role" from "workspace_members" where "organizationId" = $1',
+        const members = await adminPool.query(
+            'select "user_id", "role" from "workspace_members" where "workspace_id" = $1',
             [workspaceId],
         );
 
         expect(members.rows).toHaveLength(2);
         expect(members.rows).toEqual(
             expect.arrayContaining([
-                { userId: owner.userId, role: "owner" },
-                { userId: invitee.userId, role: "member" },
+                { user_id: owner.userId, role: "owner" },
+                { user_id: invitee.userId, role: "member" },
             ]),
         );
 
-        const invitations = await database.pool.query('select "status" from "workspace_invitations"');
+        const invitations = await adminPool.query('select "status" from "workspace_invitations"');
 
         expect(invitations.rows[0]?.status).toBe("accepted");
     }, 90_000);
@@ -396,14 +391,14 @@ describe("workspace invitations", () => {
 
 describe("auth schema constraints", () => {
     it("rejects a duplicate provider identity at the database level", async () => {
-        const { database } = await openAuthApp();
+        const { adminPool } = await openAuthApp();
 
-        await database.pool.query(
+        await adminPool.query(
             'insert into "users" ("id", "name", "email", "emailVerified") values ($1, $2, $3, true)',
             ["user-accounts", "凭据用户", "accounts@example.com"],
         );
         const insertAccount = (id: string) =>
-            database.pool.query(
+            adminPool.query(
                 'insert into "accounts" ("id", "issuer", "accountId", "providerId", "userId") values ($1, $2, $3, $4, $5)',
                 [id, "https://accounts.google.com", "google-subject-1", "google", "user-accounts"],
             );

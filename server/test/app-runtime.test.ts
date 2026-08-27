@@ -6,7 +6,7 @@ import { requireAppConfig, requireDatabase } from "../src/infrastructure/databas
 
 const config = loadConfig({
     NODE_ENV: "test",
-    DATABASE_URL: "postgres://test:test@127.0.0.1:1/test",
+    DATABASE_URL_API: "postgres://app_api:test@127.0.0.1:1/test",
     BETTER_AUTH_SECRET: "x".repeat(32),
     APP_ORIGIN: "http://localhost:3000",
     SMTP_HOST: "localhost",
@@ -82,10 +82,11 @@ describe("config-driven app construction", () => {
         const app = await buildApp({ logger: false, config });
 
         try {
-            const { db, pool } = requireDatabase(app);
+            const { db, pool, role } = requireDatabase(app);
 
             expect(db).toBe(app.db);
             expect(pool).toBe(app.pgPool);
+            expect(role).toBe("app_api");
         } finally {
             await app.close();
         }

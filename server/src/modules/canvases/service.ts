@@ -8,7 +8,7 @@ import type {
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import { AppError } from "../../errors.js";
-import type { AppDatabase } from "../../infrastructure/database/types.js";
+import type { AppTransaction } from "../../infrastructure/database/types.js";
 import type { WorkspaceAccess } from "../workspaces/authorization.js";
 import { canvases } from "./schema.js";
 
@@ -46,24 +46,28 @@ function revisionConflict(): AppError {
     return new AppError("revision_conflict", 409, "画布已在其他位置更新");
 }
 
-async function findActiveCanvas(db: AppDatabase, access: WorkspaceAccess, canvasId: string): Promise<CanvasRow> {
-    const row = await db.query.canvases.findFirst({
-        where: and(
-            eq(canvases.id, canvasId),
-            eq(canvases.workspaceId, access.workspaceId),
-            isNull(canvases.deletedAt),
-        ),
-    });
+async function findActiveCanvas(tx: AppTransaction, access: WorkspaceAccess, canvasId: string): Promise<CanvasRow> {
+    const [row] = await tx
+        .select()
+        .from(canvases)
+        .where(
+            and(
+                eq(canvases.id, canvasId),
+                eq(canvases.workspaceId, access.workspaceId),
+                isNull(canvases.deletedAt),
+            ),
+        )
+        .limit(1);
     if (!row) throw canvasNotFound();
     return row;
 }
 
 export async function createCanvas(
-    db: AppDatabase,
+    tx: AppTransaction,
     access: WorkspaceAccess,
     input: CreateCanvasBody,
 ): Promise<Canvas> {
-    const [created] = await db
+    const [created] = await tx
         .insert(canvases)
         .values({
             workspaceId: access.workspaceId,
@@ -77,8 +81,8 @@ export async function createCanvas(
     return toCanvas(created);
 }
 
-export async function listCanvases(db: AppDatabase, access: WorkspaceAccess): Promise<CanvasSummary[]> {
-    const rows = await db
+export async function listCanvases(tx: AppTransaction, access: WorkspaceAccess): Promise<CanvasSummary[]> {
+    const rows = await tx
         .select({
             id: canvases.id,
             workspaceId: canvases.workspaceId,
@@ -94,24 +98,24 @@ export async function listCanvases(db: AppDatabase, access: WorkspaceAccess): Pr
     return rows.map(toCanvasSummary);
 }
 
-export async function getCanvas(db: AppDatabase, access: WorkspaceAccess, canvasId: string): Promise<Canvas> {
-    return toCanvas(await findActiveCanvas(db, access, canvasId));
+export async function getCanvas(tx: AppTransaction, access: WorkspaceAccess, canvasId: string): Promise<Canvas> {
+    return toCanvas(await findActiveCanvas(tx, access, canvasId));
 }
 
 export async function saveCanvas(
-    db: AppDatabase,
+    tx: AppTransaction,
     access: WorkspaceAccess,
     canvasId: string,
     input: SaveCanvasRequest,
 ): Promise<Canvas> {
     if (input.baseRevision === Number.MAX_SAFE_INTEGER) {
         // 上限只能由“已存到上限的活跃画布”触发；base 是上限但存储不是，仍属过期写入。
-        const current = await findActiveCanvas(db, access, canvasId);
+        const current = await findActiveCanvas(tx, access, canvasId);
         if (current.revision !== Number.MAX_SAFE_INTEGER) throw revisionConflict();
         throw new AppError("canvas_revision_limit_reached", 409, "画布版本已达到上限");
     }
 
-    const [saved] = await db
+    const [saved] = await tx
         .update(canvases)
         .set({
             snapshotJson: input.snapshot,
@@ -132,13 +136,13 @@ export async function saveCanvas(
 
     if (saved) return toCanvas(saved);
 
-    await findActiveCanvas(db, access, canvasId);
+    await findActiveCanvas(tx, access, canvasId);
     throw revisionConflict();
 }
 
-export async function softDeleteCanvas(db: AppDatabase, access: WorkspaceAccess, canvasId: string): Promise<void> {
+export async function softDeleteCanvas(tx: AppTransaction, access: WorkspaceAccess, canvasId: string): Promise<void> {
     const now = new Date();
-    const [deleted] = await db
+    const [deleted] = await tx
         .update(canvases)
         .set({ deletedAt: now, updatedAt: now, updatedBy: access.userId })
         .where(
@@ -151,7 +155,7 @@ export async function softDeleteCanvas(db: AppDatabase, access: WorkspaceAccess,
         .returning({ id: canvases.id });
     if (deleted) return;
 
-    const [existing] = await db
+    const [existing] = await tx
         .select({ id: canvases.id })
         .from(canvases)
         .where(and(eq(canvases.id, canvasId), eq(canvases.workspaceId, access.workspaceId)))

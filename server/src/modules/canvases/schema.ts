@@ -1,7 +1,8 @@
 import { sql } from "drizzle-orm";
 import { bigint, check, index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 
-import { users, workspaces } from "../identity/auth-schema.js";
+import { users } from "../identity/schema.js";
+import { workspaces } from "../workspaces/schema.js";
 
 // 画布 ID 由数据库生成 UUID；workspace_id 沿用 Better Auth 的不透明 text ID。
 // 快照整体存 JSONB，revision 由条件更新递增，用于拒绝过期写入。

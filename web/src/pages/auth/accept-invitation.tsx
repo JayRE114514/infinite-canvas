@@ -21,10 +21,10 @@ import { useWorkspaceStore } from "@/stores/use-workspace-store";
 
 type InvitationAcceptanceFlowProps = {
     userId: string;
-    invitationId: string;
+    token: string;
 };
 
-function InvitationAcceptanceFlow({ userId, invitationId }: InvitationAcceptanceFlowProps) {
+function InvitationAcceptanceFlow({ userId, token }: InvitationAcceptanceFlowProps) {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const queryClient = useQueryClient();
@@ -32,29 +32,29 @@ function InvitationAcceptanceFlow({ userId, invitationId }: InvitationAcceptance
     const setActiveWorkspaceId = useWorkspaceStore((state) => state.setActiveWorkspaceId);
 
     const synchronizeMutation = useMutation({
-        mutationFn: ({ scopedUserId, organizationId }: { scopedUserId: string; organizationId: string }) => synchronizeAcceptedWorkspace(queryClient, scopedUserId, organizationId),
+        mutationFn: ({ scopedUserId, workspaceId }: { scopedUserId: string; workspaceId: string }) => synchronizeAcceptedWorkspace(queryClient, scopedUserId, workspaceId),
         onSuccess: ({ workspace, generation }) => {
             if (flowActive.current && isInvitationLifecycleActive(generation)) setActiveWorkspaceId(workspace.id);
         },
     });
     const synchronize = synchronizeMutation.mutate;
     const acceptMutation = useMutation({
-        mutationFn: ({ scopedUserId, scopedInvitationId }: { scopedUserId: string; scopedInvitationId: string }) => acceptInvitationOnce(queryClient, scopedUserId, scopedInvitationId),
-        onSuccess: ({ organizationId, generation }, { scopedUserId }) => {
-            if (flowActive.current && isInvitationLifecycleActive(generation)) synchronize({ scopedUserId, organizationId });
+        mutationFn: ({ scopedUserId, scopedToken }: { scopedUserId: string; scopedToken: string }) => acceptInvitationOnce(queryClient, scopedUserId, scopedToken),
+        onSuccess: ({ workspaceId, generation }, { scopedUserId }) => {
+            if (flowActive.current && isInvitationLifecycleActive(generation)) synchronize({ scopedUserId, workspaceId });
         },
     });
     const accept = acceptMutation.mutate;
 
     useEffect(() => {
         flowActive.current = true;
-        const accepted = getAcceptedInvitation(userId, invitationId);
-        if (accepted) synchronize({ scopedUserId: userId, organizationId: accepted.organizationId });
-        else accept({ scopedUserId: userId, scopedInvitationId: invitationId });
+        const accepted = getAcceptedInvitation(userId, token);
+        if (accepted) synchronize({ scopedUserId: userId, workspaceId: accepted.workspaceId });
+        else accept({ scopedUserId: userId, scopedToken: token });
         return () => {
             flowActive.current = false;
         };
-    }, [accept, invitationId, synchronize, userId]);
+    }, [accept, synchronize, token, userId]);
 
     if (synchronizeMutation.isSuccess && isInvitationLifecycleActive(synchronizeMutation.data.generation)) {
         return (
@@ -91,7 +91,7 @@ function InvitationAcceptanceFlow({ userId, invitationId }: InvitationAcceptance
                 <CircleX className="size-11 text-destructive" strokeWidth={1.5} aria-hidden />
                 <Alert className="mt-5" type="error" showIcon message={t(errorKey)} />
                 <div className="mt-6 flex flex-wrap justify-center gap-2">
-                    <Button type="primary" onClick={() => accept({ scopedUserId: userId, scopedInvitationId: invitationId })}>{t("auth.invitation.retryAccept")}</Button>
+                    <Button type="primary" onClick={() => accept({ scopedUserId: userId, scopedToken: token })}>{t("auth.invitation.retryAccept")}</Button>
                     <Button onClick={() => navigate("/", { replace: true })}>{t("auth.invitation.backHome")}</Button>
                 </div>
             </AuthPageShell>
@@ -116,13 +116,13 @@ export default function AcceptInvitationPage() {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const queryClient = useQueryClient();
-    const { invitationId = "" } = useParams();
+    const { token = "" } = useParams();
     const { data: session, error: sessionError, isPending, refetch } = authClient.useSession();
     const anonymousSessionHandled = useRef(false);
     const clearUser = useUserStore((state) => state.clearUser);
     const clearWorkspace = useWorkspaceStore((state) => state.clearWorkspace);
     const userId = session?.user.id ?? "";
-    const returnTo = `/accept-invitation/${encodeURIComponent(invitationId)}`;
+    const returnTo = `/accept-invitation/${encodeURIComponent(token)}`;
     const loginPath = createLoginPath(returnTo);
     const anonymousSession = !isPending && !session && !sessionError;
 
@@ -146,7 +146,7 @@ export default function AcceptInvitationPage() {
         );
     }
 
-    if (!invitationId) return <Navigate to="/" replace />;
+    if (!token) return <Navigate to="/" replace />;
 
-    return <InvitationAcceptanceFlow key={JSON.stringify([userId, invitationId])} userId={userId} invitationId={invitationId} />;
+    return <InvitationAcceptanceFlow key={JSON.stringify([userId, token])} userId={userId} token={token} />;
 }

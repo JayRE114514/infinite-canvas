@@ -1,3 +1,6 @@
 // 应用表按模块定义，这里统一导出给 Drizzle 客户端与迁移生成器。
-export * from "../../modules/identity/auth-schema.js";
+// 只引用各模块的公开 schema 入口，不触碰模块私有实现。
+export * from "../../modules/identity/schema.js";
+export * from "../../modules/workspaces/schema.js";
+export * from "../../modules/platform-admin/schema.js";
 export * from "../../modules/canvases/schema.js";

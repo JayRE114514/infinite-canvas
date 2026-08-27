@@ -17,5 +17,5 @@ export function createDatabase(config: DatabaseConfig): DatabaseHandle {
         idleTimeoutMillis: IDLE_TIMEOUT_MS,
     });
 
-    return { db: drizzle(pool, { schema }), pool };
+    return { db: drizzle(pool, { schema }), pool, role: config.expectedRole };
 }

@@ -15,7 +15,9 @@ import {
 import type { FastifyInstance } from "fastify";
 
 import { requireDatabase } from "../../infrastructure/database/plugin.js";
-import { requireWorkspaceMember } from "../workspaces/authorization.js";
+import { withTenantTransaction } from "../../infrastructure/database/transactions.js";
+import { requireSession } from "../identity/session.js";
+import { requireActiveWorkspace } from "../workspaces/authorization.js";
 import { createCanvas, getCanvas, listCanvases, saveCanvas, softDeleteCanvas } from "./service.js";
 
 export const CANVAS_SNAPSHOT_BODY_LIMIT = 10 * 1024 * 1024;
@@ -47,9 +49,16 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
             },
         },
         async (request, reply) => {
-            const access = await requireWorkspaceMember(request, request.params.workspaceId);
+            const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            const canvas = await createCanvas(db, access, request.body);
+            const canvas = await withTenantTransaction(
+                db,
+                { userId, workspaceId: request.params.workspaceId },
+                (tx, access) => {
+                    requireActiveWorkspace(access);
+                    return createCanvas(tx, access, request.body);
+                },
+            );
             return reply.status(201).send({ canvas });
         },
     );
@@ -63,9 +72,12 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
             },
         },
         async (request) => {
-            const access = await requireWorkspaceMember(request, request.params.workspaceId);
+            const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            return { canvases: await listCanvases(db, access) };
+            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
+                requireActiveWorkspace(access);
+                return { canvases: await listCanvases(tx, access) };
+            });
         },
     );
 
@@ -78,9 +90,12 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
             },
         },
         async (request) => {
-            const access = await requireWorkspaceMember(request, request.params.workspaceId);
+            const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            return { canvas: await getCanvas(db, access, request.params.canvasId) };
+            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
+                requireActiveWorkspace(access);
+                return { canvas: await getCanvas(tx, access, request.params.canvasId) };
+            });
         },
     );
 
@@ -95,9 +110,12 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
             },
         },
         async (request) => {
-            const access = await requireWorkspaceMember(request, request.params.workspaceId);
+            const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            return { canvas: await saveCanvas(db, access, request.params.canvasId, request.body) };
+            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
+                requireActiveWorkspace(access);
+                return { canvas: await saveCanvas(tx, access, request.params.canvasId, request.body) };
+            });
         },
     );
 
@@ -110,10 +128,13 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
             },
         },
         async (request) => {
-            const access = await requireWorkspaceMember(request, request.params.workspaceId);
+            const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            await softDeleteCanvas(db, access, request.params.canvasId);
-            return { success: true } as const;
+            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
+                requireActiveWorkspace(access);
+                await softDeleteCanvas(tx, access, request.params.canvasId);
+                return { success: true } as const;
+            });
         },
     );
 }

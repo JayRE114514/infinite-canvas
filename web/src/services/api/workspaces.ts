@@ -18,7 +18,7 @@ export const workspaceKeys = {
     all: workspaceRootKey,
     lists: [...workspaceRootKey, "list"] as const,
     list: (userId: string) => [...workspaceRootKey, "list", userId] as const,
-    acceptedInvitation: (userId: string, invitationId: string) => [...workspaceRootKey, "accepted-invitation", userId, invitationId] as const,
+    acceptedInvitation: (userId: string, token: string) => [...workspaceRootKey, "accepted-invitation", userId, token] as const,
     members: (userId: string, workspaceId: string) => [...workspaceRootKey, workspaceId, "members", userId] as const,
     invitations: (userId: string, workspaceId: string) => [...workspaceRootKey, workspaceId, "invitations", userId] as const,
 };

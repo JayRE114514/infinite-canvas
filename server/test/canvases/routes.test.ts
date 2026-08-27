@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 
 import type { Canvas, CanvasSnapshot, CanvasSummary } from "@infinite-canvas/contracts";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -11,19 +10,15 @@ import {
     type VerifiedUser,
 } from "../helpers/auth.js";
 
-const CANVAS_MIGRATION_URL = new URL("../../migrations/0001_canvases.sql", import.meta.url);
 const CANVAS_BODY_LIMIT = 10 * 1024 * 1024;
 const BELOW_CANVAS_BODY_LIMIT = CANVAS_BODY_LIMIT - 1024;
 const harness = createAuthTestHarness();
-let canvasMigrationSql = "";
 
 type CanvasApp = Awaited<ReturnType<typeof openCanvasApp>>;
 type StoredCanvas = { id: string; title: string; revision: string; snapshot: CanvasSnapshot; deleted: boolean };
 
 async function openCanvasApp() {
-    const opened = await harness.openAuthApp();
-    await opened.database.pool.query(canvasMigrationSql);
-    return opened;
+    return harness.openAuthApp();
 }
 
 async function createTeam(app: AuthApp, owner: VerifiedUser, name: string, slug: string) {
@@ -79,8 +74,8 @@ function deleteCanvas(app: AuthApp, user: VerifiedUser, workspaceId: string, can
 }
 
 /** 直接读库断言存储态，覆盖标题、快照、revision 与软删除标记是否被越权或并发请求改写。 */
-async function storedCanvases(database: CanvasApp["database"], ids: string[]): Promise<Record<string, StoredCanvas>> {
-    const result = await database.pool.query(
+async function storedCanvases(adminPool: CanvasApp["adminPool"], ids: string[]): Promise<Record<string, StoredCanvas>> {
+    const result = await adminPool.query(
         `select "id", "title", "revision"::text as "revision", "snapshot_json" as "snapshot",
                 ("deleted_at" is not null) as "deleted"
          from "canvases" where "id" = any($1::uuid[])`,
@@ -114,7 +109,6 @@ function oversizedSaveBody(baseRevision: number): string {
 }
 
 beforeAll(async () => {
-    canvasMigrationSql = await readFile(CANVAS_MIGRATION_URL, "utf8");
     await harness.start();
 }, 180_000);
 
@@ -225,7 +219,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("rejects bigint-like, undefined-like and other non-JSON wire values", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "invalid-json@example.com" });
         const workspace = await createTeam(app, owner, "非法 JSON 团队", "invalid-json-team");
 
@@ -241,7 +235,7 @@ describe("canvas routes", () => {
             expect(response.json().error.code).toBe("invalid_request");
         }
 
-        const countAfterInvalidCreates = await database.pool.query('select count(*)::int as count from "canvases"');
+        const countAfterInvalidCreates = await adminPool.query('select count(*)::int as count from "canvases"');
         const created = await createCanvas(app, owner, workspace.id, { title: "有效画布", snapshot: {} });
         const invalidSave = await app.inject({
             method: "PUT",
@@ -249,7 +243,7 @@ describe("canvas routes", () => {
             headers: { cookie: owner.cookie, "content-type": "application/json" },
             payload: '{"baseRevision":0,"snapshot":{"line\\u2028key":undefined}}',
         });
-        const stored = await database.pool.query(
+        const stored = await adminPool.query(
             'select "revision"::text, "snapshot_json" from "canvases" where "id" = $1',
             [created.id],
         );
@@ -261,7 +255,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("rejects unknown create and save fields instead of stripping them", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "unknown@example.com" });
         const workspace = await createTeam(app, owner, "严格请求团队", "strict-request-team");
 
@@ -271,7 +265,7 @@ describe("canvas routes", () => {
             headers: { cookie: owner.cookie },
             payload: { title: "未知字段", snapshot: {}, workspaceId: workspace.id },
         });
-        const countAfterCreate = await database.pool.query('select count(*)::int as count from "canvases"');
+        const countAfterCreate = await adminPool.query('select count(*)::int as count from "canvases"');
         const created = await createCanvas(app, owner, workspace.id, { title: "有效画布", snapshot: {} });
         const unknownSave = await app.inject({
             method: "PUT",
@@ -279,7 +273,7 @@ describe("canvas routes", () => {
             headers: { cookie: owner.cookie },
             payload: { baseRevision: 0, snapshot: { changed: true }, force: true },
         });
-        const stored = await database.pool.query(
+        const stored = await adminPool.query(
             'select "revision"::text, "snapshot_json" from "canvases" where "id" = $1',
             [created.id],
         );
@@ -293,7 +287,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("separates a max-safe limit from a stale max-safe base and never overflows", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "max-revision@example.com" });
         const workspace = await createTeam(app, owner, "版本团队", "revision-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "上限画布", snapshot: { stable: true } });
@@ -310,7 +304,7 @@ describe("canvas routes", () => {
             baseRevision: Number.MAX_SAFE_INTEGER,
             snapshot: { overwritten: true },
         });
-        await database.pool.query('update "canvases" set "revision" = $1 where "id" = $2', [
+        await adminPool.query('update "canvases" set "revision" = $1 where "id" = $2', [
             String(Number.MAX_SAFE_INTEGER),
             created.id,
         ]);
@@ -321,7 +315,7 @@ describe("canvas routes", () => {
         });
         const deletedAtLimit = await createCanvas(app, owner, workspace.id, { title: "删除画布", snapshot: { gone: true } });
         await deleteCanvas(app, owner, workspace.id, deletedAtLimit.id);
-        await database.pool.query('update "canvases" set "revision" = $1 where "id" = $2', [
+        await adminPool.query('update "canvases" set "revision" = $1 where "id" = $2', [
             String(Number.MAX_SAFE_INTEGER),
             deletedAtLimit.id,
         ]);
@@ -329,7 +323,7 @@ describe("canvas routes", () => {
             baseRevision: Number.MAX_SAFE_INTEGER,
             snapshot: { overwritten: true },
         });
-        const stored = await storedCanvases(database, [created.id, fresh.id, deletedAtLimit.id]);
+        const stored = await storedCanvases(adminPool, [created.id, fresh.id, deletedAtLimit.id]);
 
         expect(staleMaxBase.statusCode).toBe(409);
         expect(staleMaxBase.json().error.code).toBe("revision_conflict");
@@ -477,7 +471,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("leaves sibling canvases untouched when saving a missing canvas id", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "missing-save@example.com" });
         const workspace = await createTeam(app, owner, "缺失保存团队", "missing-save-team");
         const other = await createTeam(app, owner, "缺失保存旁团队", "missing-save-other");
@@ -486,14 +480,14 @@ describe("canvas routes", () => {
             await createCanvas(app, owner, workspace.id, { title: "同伴二", snapshot: { sibling: 2 } }),
             await createCanvas(app, owner, other.id, { title: "旁团队画布", snapshot: { sibling: 3 } }),
         ];
-        const before = await storedCanvases(database, siblings.map((canvas) => canvas.id));
+        const before = await storedCanvases(adminPool, siblings.map((canvas) => canvas.id));
 
         const response = await saveCanvas(app, owner, workspace.id, randomUUID(), {
             baseRevision: 0,
             title: "越权标题",
             snapshot: { overwritten: true },
         });
-        const after = await storedCanvases(database, siblings.map((canvas) => canvas.id));
+        const after = await storedCanvases(adminPool, siblings.map((canvas) => canvas.id));
 
         expect(response.statusCode).toBe(404);
         expect(response.json().error.code).toBe("canvas_not_found");
@@ -501,19 +495,19 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("refuses to mutate a soft-deleted canvas through save", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "deleted-save@example.com" });
         const workspace = await createTeam(app, owner, "删除保存团队", "deleted-save-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "待删画布", snapshot: { kept: true } });
         expect((await deleteCanvas(app, owner, workspace.id, created.id)).statusCode).toBe(200);
-        const before = await storedCanvases(database, [created.id]);
+        const before = await storedCanvases(adminPool, [created.id]);
 
         const response = await saveCanvas(app, owner, workspace.id, created.id, {
             baseRevision: created.revision,
             title: "删除后标题",
             snapshot: { overwritten: true },
         });
-        const after = await storedCanvases(database, [created.id]);
+        const after = await storedCanvases(adminPool, [created.id]);
 
         expect(response.statusCode).toBe(404);
         expect(response.json().error.code).toBe("canvas_not_found");
@@ -526,7 +520,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("commits exactly one of two concurrent same-base saves", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "race-save@example.com" });
         const workspace = await createTeam(app, owner, "并发保存团队", "race-save-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "并发画布", snapshot: { start: true } });
@@ -545,7 +539,7 @@ describe("canvas routes", () => {
         ]);
         const winner = responses.find((response) => response.statusCode === 200);
         const loser = responses.find((response) => response.statusCode === 409);
-        const stored = await storedCanvases(database, [created.id]);
+        const stored = await storedCanvases(adminPool, [created.id]);
 
         expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
         expect(loser!.json().error.code).toBe("revision_conflict");
@@ -560,7 +554,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("keeps concurrent deletes successful and idempotent", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "race-delete@example.com" });
         const workspace = await createTeam(app, owner, "并发删除团队", "race-delete-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "并发删除画布", snapshot: { keep: true } });
@@ -569,7 +563,7 @@ describe("canvas routes", () => {
             deleteCanvas(app, owner, workspace.id, created.id),
             deleteCanvas(app, owner, workspace.id, created.id),
         ]);
-        const stored = await storedCanvases(database, [created.id]);
+        const stored = await storedCanvases(adminPool, [created.id]);
         const listed = await app.inject({
             method: "GET",
             url: `/api/v1/workspaces/${workspace.id}/canvases`,
@@ -583,7 +577,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("linearizes a concurrent save and delete without resurrecting the canvas", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "race-mixed@example.com" });
         const workspace = await createTeam(app, owner, "并发混合团队", "race-mixed-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "混合画布", snapshot: { start: true } });
@@ -596,7 +590,7 @@ describe("canvas routes", () => {
             }),
             deleteCanvas(app, owner, workspace.id, created.id),
         ]);
-        const stored = await storedCanvases(database, [created.id]);
+        const stored = await storedCanvases(adminPool, [created.id]);
         const loaded = await app.inject({
             method: "GET",
             url: `/api/v1/workspaces/${workspace.id}/canvases/${created.id}`,
@@ -633,7 +627,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("applies the 10 MiB limit and stable error to create without changing the global limit", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "large-create@example.com" });
         const workspace = await createTeam(app, owner, "大创建团队", "large-create-team");
 
@@ -652,7 +646,7 @@ describe("canvas routes", () => {
             headers: { cookie: owner.cookie, "content-type": "application/json" },
             payload: oversizedCreateBody(),
         });
-        const count = await database.pool.query('select count(*)::int as count from "canvases"');
+        const count = await adminPool.query('select count(*)::int as count from "canvases"');
 
         expect(belowCanvasLimit.statusCode).toBe(201);
         expect(belowCanvasLimit.json().canvas.snapshot.content).toHaveLength(BELOW_CANVAS_BODY_LIMIT);
@@ -664,7 +658,7 @@ describe("canvas routes", () => {
     }, 90_000);
 
     it("applies the 10 MiB limit and stable error to save without changing the canvas", async () => {
-        const { app, mailer, database } = await openCanvasApp();
+        const { app, mailer, adminPool } = await openCanvasApp();
         const owner = await registerVerifiedUser(app, mailer, { name: "所有者", email: "large-save@example.com" });
         const workspace = await createTeam(app, owner, "大保存团队", "large-save-team");
         const created = await createCanvas(app, owner, workspace.id, { title: "未修改", snapshot: { stable: true } });
@@ -684,7 +678,7 @@ describe("canvas routes", () => {
             headers: { cookie: owner.cookie, "content-type": "application/json" },
             payload: oversizedSaveBody(1),
         });
-        const stored = await database.pool.query(
+        const stored = await adminPool.query(
             `select "revision"::text, length("snapshot_json"->>'content')::int as "content_length"
              from "canvases" where "id" = $1`,
             [created.id],

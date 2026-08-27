@@ -1,18 +1,16 @@
-import { readFile } from "node:fs/promises";
-
 import { expect } from "vitest";
+import { Pool } from "pg";
 
 import { buildApp, type BuildAppOptions } from "../../src/app.js";
 import { loadConfig, type AppConfig } from "../../src/config.js";
 import { createDatabase } from "../../src/infrastructure/database/client.js";
 import type { DatabaseHandle } from "../../src/infrastructure/database/types.js";
 import type { Mailer } from "../../src/infrastructure/email/mailer.js";
-import { startPostgres, type StartedPostgres } from "./postgres.js";
+import { runMigrations } from "./database.js";
+import { startRoleDatabase, type StartedRoleDatabase } from "./postgres.js";
 
 export const APP_ORIGIN = "http://localhost:3000";
 export const PASSWORD = "correct-horse-battery-staple";
-
-const MIGRATION_URL = new URL("../../migrations/0000_auth_and_workspaces.sql", import.meta.url);
 
 /** 测试注入的内存邮件发送器，不产生真实 SMTP 请求。 */
 export class MemoryMailer implements Mailer {
@@ -72,20 +70,20 @@ export async function registerVerifiedUser(
 
 /** 每个测试文件独享容器，且无论断言或构造在哪一步失败都回收 app、连接池和容器。 */
 export function createAuthTestHarness() {
-    let postgres: StartedPostgres | undefined;
-    let migrationSql = "";
+    let postgres: StartedRoleDatabase | undefined;
     const openApps: AuthApp[] = [];
     const openHandles: DatabaseHandle[] = [];
+    const openPools: Pool[] = [];
 
-    function postgresUrl(): string {
+    function roles(): StartedRoleDatabase {
         if (!postgres) throw new Error("PostgreSQL container is not started");
-        return postgres.url;
+        return postgres;
     }
 
     function config(overrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}): AppConfig {
         return loadConfig({
             NODE_ENV: overrides.nodeEnv ?? "test",
-            DATABASE_URL: postgresUrl(),
+            DATABASE_URL_API: roles().api,
             BETTER_AUTH_SECRET: "t".repeat(32),
             APP_ORIGIN: overrides.appOrigin ?? APP_ORIGIN,
             SMTP_HOST: "localhost",
@@ -101,20 +99,38 @@ export function createAuthTestHarness() {
 
     return {
         async start(): Promise<void> {
-            postgres = await startPostgres();
-            migrationSql = await readFile(MIGRATION_URL, "utf8");
+            postgres = await startRoleDatabase();
         },
 
         openApp,
 
         async openAuthApp(configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}) {
             const mailer = new MemoryMailer();
-            const database = createDatabase({ url: postgresUrl(), poolMax: 8 });
+            const current = roles();
+
+            // 每个 app 实例拿到干净 schema：容器管理员重置后仍由 schema_owner 持有。
+            const setupPool = new Pool({ connectionString: current.admin, max: 1 });
+            try {
+                await setupPool.query("drop schema if exists drizzle cascade");
+                await setupPool.query("drop schema public cascade; create schema public");
+                await setupPool.query("alter schema public owner to schema_owner");
+                await setupPool.query("revoke create on schema public from public");
+                await setupPool.query("grant create, usage on schema public to schema_owner");
+            } finally {
+                await setupPool.end().catch(() => {});
+            }
+
+            // 迁移只以 schema_owner 身份按 _journal.json 顺序执行。
+            await runMigrations(current.schemaOwner);
+
+            // HTTP 与业务行为只通过生产等价的 app_api 登录执行。
+            const database = createDatabase({ url: current.api, poolMax: 8, expectedRole: "app_api" });
             openHandles.push(database);
-            await database.pool.query("drop schema public cascade; create schema public");
-            await database.pool.query(migrationSql);
+            // 测试夹具的播种与提交后断言使用一次性容器管理员，绝不计作 RLS 证据。
+            const adminPool = new Pool({ connectionString: current.admin, max: 4 });
+            openPools.push(adminPool);
             const app = await openApp({ logger: false, config: config(configOverrides), database, mailer });
-            return { app, mailer, database };
+            return { app, mailer, database, adminPool };
         },
 
         async cleanup(): Promise<void> {
@@ -122,6 +138,10 @@ export function createAuthTestHarness() {
             for (const handle of openHandles.splice(0)) {
                 if (handle.pool.ending || handle.pool.ended) continue;
                 await handle.pool.end().catch(() => {});
+            }
+            for (const pool of openPools.splice(0)) {
+                if (pool.ending || pool.ended) continue;
+                await pool.end().catch(() => {});
             }
         },
 

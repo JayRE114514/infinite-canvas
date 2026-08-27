@@ -5,7 +5,7 @@ import { platformRequest } from "@/services/api/platform-client";
 import { workspaceKeys, workspacesQueryOptions } from "@/services/api/workspaces";
 
 export type AcceptedInvitationRecord = {
-    organizationId: string;
+    workspaceId: string;
     generation: number;
 };
 
@@ -62,13 +62,13 @@ export async function clearWorkspaceSessionMemory(queryClient: QueryClient) {
     queryClient.removeQueries({ queryKey: workspaceKeys.all });
 }
 
-export function getAcceptedInvitation(userId: string, invitationId: string) {
-    return acceptedInvitations.get(requestKey(userId, invitationId));
+export function getAcceptedInvitation(userId: string, token: string) {
+    return acceptedInvitations.get(requestKey(userId, token));
 }
 
-export function acceptInvitationOnce(queryClient: QueryClient, userId: string, invitationId: string) {
-    const acceptedKey = workspaceKeys.acceptedInvitation(userId, invitationId);
-    const key = requestKey(userId, invitationId);
+export function acceptInvitationOnce(queryClient: QueryClient, userId: string, token: string) {
+    const acceptedKey = workspaceKeys.acceptedInvitation(userId, token);
+    const key = requestKey(userId, token);
     const accepted = acceptedInvitations.get(key);
     if (accepted) return Promise.resolve(accepted);
 
@@ -78,11 +78,11 @@ export function acceptInvitationOnce(queryClient: QueryClient, userId: string, i
     const generation = lifecycleGeneration;
     const request = (async () => {
         const response = await platformRequest<AcceptWorkspaceInvitationResponse>(
-            `/workspace-invitations/${encodeURIComponent(invitationId)}/accept`,
-            { method: "POST" },
+            "/workspace-invitations/accept",
+            { method: "POST", body: JSON.stringify({ token }) },
         );
         assertActiveLifecycle(generation);
-        const result = { organizationId: response.workspaceId, generation };
+        const result = { workspaceId: response.workspaceId, generation };
         acceptedInvitations.set(key, result);
         queryClient.setQueryData(acceptedKey, result);
         return result;
@@ -95,8 +95,8 @@ export function acceptInvitationOnce(queryClient: QueryClient, userId: string, i
     return request;
 }
 
-export function synchronizeAcceptedWorkspace(queryClient: QueryClient, userId: string, organizationId: string) {
-    const key = requestKey(userId, organizationId);
+export function synchronizeAcceptedWorkspace(queryClient: QueryClient, userId: string, workspaceId: string) {
+    const key = requestKey(userId, workspaceId);
     const activeRequest = synchronizationRequests.get(key);
     if (activeRequest) return activeRequest;
 
@@ -109,7 +109,7 @@ export function synchronizeAcceptedWorkspace(queryClient: QueryClient, userId: s
         assertActiveLifecycle(generation);
         const result = await queryClient.fetchQuery(workspacesQueryOptions(userId));
         assertActiveLifecycle(generation);
-        const workspace = result.workspaces.find((item) => item.id === organizationId);
+        const workspace = result.workspaces.find((item) => item.id === workspaceId);
         if (!workspace) throw new InvitationSynchronizationError();
         return { workspace, generation };
     })();
