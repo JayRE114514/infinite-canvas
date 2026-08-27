@@ -10,4 +10,5 @@ description: Planned follow-up work
 - Add Skill installation from web search, Skill resource-file management, and controlled local-memory persistence.
 - Complete Task 5's server-side object-storage cutover for canvas media and My Assets. Until then, stable local media keys are retained but their bytes are not portable across devices.
 - Add scoped cleanup and usage visibility for orphaned canvas media and obsolete local drafts; partial deletion and cross-device deletion can otherwise leave browser storage growing until the Asset lifecycle owns reference cleanup.
+- Local canvas drafts are only garbage-collected when they are older than six hours and unreferenced, so a same-origin tab that is left open can retain one extra draft per canvas until the Asset lifecycle owns reference cleanup.
 - After the cloud-canvas flow passes manual acceptance, correct the formal Features page to remove the obsolete browser-authoritative/WebDAV canvas persistence and duplicate-action claims; do not promote those descriptions before user confirmation.
