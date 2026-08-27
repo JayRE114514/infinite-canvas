@@ -1,11 +1,11 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ViewportTransform } from "@/types/canvas";
 
 type InfiniteCanvasProps = {
-    containerRef: React.RefObject<HTMLDivElement | null>;
+    containerRef: React.RefCallback<HTMLDivElement>;
     viewport: ViewportTransform;
     tool: "select" | "pan";
     backgroundMode?: CanvasBackgroundMode;
@@ -18,8 +18,16 @@ type InfiniteCanvasProps = {
     children: React.ReactNode;
 };
 
+/** 覆盖层与弹窗内保留原生滚动，画布本身阻止滚动带动页面。 */
+function preventWheelScroll(event: WheelEvent) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest("[data-canvas-no-zoom],.ant-modal,.ant-popover,.ant-dropdown,.ant-select-dropdown,.ant-picker-dropdown")) return;
+    event.preventDefault();
+}
+
 export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = "lines", onViewportChange, onCanvasMouseDown, onCanvasDeselect, onCanvasDoubleClick, onContextMenu, onDrop, children }: InfiniteCanvasProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const nodeRef = useRef<HTMLDivElement | null>(null);
     const panState = useRef({
         isPanning: false,
         startX: 0,
@@ -91,7 +99,7 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
         const delta = -event.deltaY;
         const factor = Math.pow(1.1, delta / 100);
         const newScale = Math.min(Math.max(viewport.k * factor, 0.05), 5);
-        const rect = containerRef.current?.getBoundingClientRect();
+        const rect = nodeRef.current?.getBoundingClientRect();
         if (!rect) return;
 
         const mouseX = event.clientX - rect.left;
@@ -189,19 +197,19 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
         };
     }, [onCanvasDeselect, onViewportChange]);
 
-    useEffect(() => {
-        const container = containerRef.current;
-        if (!container) return;
-
-        // Prevent canvas scrolling from moving the page while preserving native scrolling inside overlays and dialogs.
-        const preventWheelScroll = (event: WheelEvent) => {
-            const target = event.target instanceof Element ? event.target : null;
-            if (target?.closest("[data-canvas-no-zoom],.ant-modal,.ant-popover,.ant-dropdown,.ant-select-dropdown,.ant-picker-dropdown")) return;
-            event.preventDefault();
-        };
-        container.addEventListener("wheel", preventWheelScroll, { passive: false });
-        return () => container.removeEventListener("wheel", preventWheelScroll);
-    }, [containerRef]);
+    const attachContainer = useCallback(
+        (node: HTMLDivElement | null) => {
+            nodeRef.current = node;
+            const detachParent = containerRef(node);
+            node?.addEventListener("wheel", preventWheelScroll, { passive: false });
+            return () => {
+                node?.removeEventListener("wheel", preventWheelScroll);
+                nodeRef.current = null;
+                if (typeof detachParent === "function") detachParent();
+            };
+        },
+        [containerRef],
+    );
 
     const temporaryTool = isControlPressed || isSpacePressed;
     const activeTool = temporaryTool ? (tool === "select" ? "pan" : "select") : tool;
@@ -209,7 +217,7 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
 
     return (
         <div
-            ref={containerRef}
+            ref={attachContainer}
             className="relative h-full w-full select-none overflow-hidden"
             style={{ background: theme.canvas.background, cursor }}
             onPointerDown={handlePointerDown}

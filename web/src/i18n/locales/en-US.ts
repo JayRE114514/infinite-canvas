@@ -388,6 +388,7 @@ export default {
         openFailed: "Could not open the canvas. Try again.",
         notFound: "This canvas no longer exists.",
         retry: "Retry",
+        agent: { notReady: "The canvas is not ready yet. Try again shortly." },
         conflict: {
             title: "Revision conflict",
             description: "The server copy changed, so autosave stopped for this canvas. Reload the server copy, or export your local draft first.",

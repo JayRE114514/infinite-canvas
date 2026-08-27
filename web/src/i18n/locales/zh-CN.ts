@@ -388,6 +388,7 @@ export default {
         openFailed: "打开画布失败，请稍后重试",
         notFound: "画布不存在或已被删除",
         retry: "重试",
+        agent: { notReady: "画布尚未就绪，请稍后再试" },
         conflict: {
             title: "版本冲突",
             description: "服务端画布已被更新，本画布已停止自动保存。请重新载入服务端版本，或先导出本地草稿再决定。",
