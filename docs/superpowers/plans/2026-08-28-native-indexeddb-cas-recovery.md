@@ -1076,10 +1076,10 @@ Create `web/src/services/canvas-recovery/store-draft.test.ts`:
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { freshIndexedDB } from "../../../test/setup-indexeddb";
-import { createRecoveryDatabase, DRAFTS_STORE, EPOCHS_STORE, MARKERS_STORE } from "./database";
+import { createRecoveryDatabase, DRAFTS_STORE, EPOCHS_STORE, MARKERS_STORE, SCOPE_INDEX } from "./database";
 import { buildRecoveryScopeId } from "./scope";
-import { createCanvasRecoveryStore, type CanvasRecoveryStore } from "./store";
-import type { CanvasDraftEnvelope } from "./types";
+import { createCanvasRecoveryStore, type CanvasDraftUpsertInput, type CanvasRecoveryStore } from "./store";
+import type { CanvasDraftEnvelope, CanvasDraftState } from "./types";
 
 const scopeA = buildRecoveryScopeId({ kind: "account", userId: "u1", workspaceId: "w1", canvasId: "c1" })!;
 const scopeB = buildRecoveryScopeId({ kind: "account", userId: "u2", workspaceId: "w1", canvasId: "c1" })!;
@@ -1124,6 +1124,16 @@ describe("draft writeSeq CAS", () => {
         expect(await upsert(store, scopeA, "d1", 7)).toEqual({ status: "written", writeSeq: 7 });
         // d2 starts at 1 and must be accepted even though d1 is already at 7.
         expect(await upsert(store, scopeA, "d2", 1)).toEqual({ status: "written", writeSeq: 1 });
+        /**
+         * The strict canonical-timestamp validator accepts toISOString's expanded-year form.
+         * "+275760-09-13T00:00:00.000Z" is chronologically the newest savedAt here, yet it sorts
+         * before "1970-..." lexicographically, so snapshot order must compare instants.
+         */
+        const farFuture = new Date(8.64e15).toISOString();
+        expect(await store.upsertDraft({ scopeId: scopeA, draftId: "d3", writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope: envelope("newest"), savedAt: farFuture })).toEqual({ status: "written", writeSeq: 1 });
+        const snapshot = await store.readOpenSnapshot(scopeA);
+        if (snapshot.status !== "ok") throw new Error("expected ok");
+        expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["d3", "d1", "d2"]);
     });
 
     it("never advances coordinationRevision on an ordinary draft write", async () => {
@@ -1215,6 +1225,30 @@ describe("draft writeSeq CAS", () => {
         const raw = await database.run("readonly", [DRAFTS_STORE], 2_000, (txn) => txn.req(txn.store(DRAFTS_STORE).get([scopeA, "bad"])));
         if (raw.status !== "ok") throw new Error("expected ok");
         expect((raw.value as { writeSeq: unknown }).writeSeq).toBe("unknown");
+
+        /**
+         * Typed-at-runtime input must be refused by the SAME record boundary that Task 2's
+         * validators enforce on read, so the store can never persist a row it would later skip.
+         */
+        const invalidInputs: Array<Partial<CanvasDraftUpsertInput>> = [
+            { draftId: "fractional-seq", writeSeq: 1.5 },
+            { draftId: "negative-seq", writeSeq: -1 },
+            { draftId: "nan-seq", writeSeq: Number.NaN },
+            { draftId: "unparsable-saved-at", savedAt: "not-a-date" },
+            { draftId: "noncanonical-saved-at", savedAt: "2020-01-01T00:00:00Z" },
+            { draftId: "empty-envelope", envelope: {} as CanvasDraftEnvelope },
+            { draftId: "unusable-viewport", envelope: { ...envelope("bad-viewport"), localUi: { viewport: { x: 0, y: 0, k: 0 } } } },
+            { draftId: "unknown-state", state: "archived" as CanvasDraftState },
+            { draftId: "" },
+        ];
+        for (const override of invalidInputs) {
+            const input: CanvasDraftUpsertInput = { scopeId: scopeA, draftId: "placeholder", writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope: envelope("valid"), savedAt: new Date(1_000).toISOString(), ...override };
+            expect(await guarded.upsertDraft(input)).toEqual({ status: "unavailable", reason: "corrupt" });
+        }
+        const rows = await database.run("readonly", [DRAFTS_STORE], 2_000, (txn) => txn.req(txn.store(DRAFTS_STORE).index(SCOPE_INDEX).getAll(scopeA)));
+        if (rows.status !== "ok") throw new Error("expected ok");
+        // Only the pre-existing corrupt row remains: not one invalid input reached storage.
+        expect((rows.value as Array<{ draftId: string }>).map((row) => row.draftId)).toEqual(["bad"]);
         guarded.close();
     });
 
@@ -1301,7 +1335,13 @@ async function readEpoch(txn: RecoveryTxn, scopeId: RecoveryScopeId): Promise<Ep
 async function readScopeDrafts(txn: RecoveryTxn, scopeId: RecoveryScopeId): Promise<CanvasDraftRecord[]> {
     const rows = await txn.req(txn.store(DRAFTS_STORE).index(SCOPE_INDEX).getAll(scopeId));
     /** Corrupt rows are skipped, never repaired and never allowed to hide a valid draft. */
-    return (rows as unknown[]).map((row) => asDraftRecord(row, scopeId)).filter((row): row is CanvasDraftRecord => row !== null);
+    const drafts = (rows as unknown[]).map((row) => asDraftRecord(row, scopeId)).filter((row): row is CanvasDraftRecord => row !== null);
+    /**
+     * Newest first by INSTANT, not by string order: the canonical-timestamp boundary accepts
+     * toISOString's expanded-year form, whose "+275760-" prefix sorts below "1970-".
+     * draftId breaks ties so the same stored rows always produce the same recovery order.
+     */
+    return drafts.sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt) || a.draftId.localeCompare(b.draftId));
 }
 
 export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRecoveryStore {
@@ -1317,8 +1357,7 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
                 const marker = asMarkerRecord(markerRaw, scopeId);
                 /** A present but invalid marker has unknown ownership; fail closed instead of treating it as absent. */
                 if (markerRaw !== undefined && !marker) return { status: "unavailable", reason: "corrupt" };
-                const drafts = await readScopeDrafts(txn, scopeId);
-                return { status: "ok", snapshot: { epoch, marker, drafts: drafts.sort((a, b) => b.savedAt.localeCompare(a.savedAt)) } };
+                return { status: "ok", snapshot: { epoch, marker, drafts: await readScopeDrafts(txn, scopeId) } };
             }, signal);
             if (run.status !== "ok") return { status: "unavailable", reason: run.reason };
             return run.value;
@@ -1331,28 +1370,27 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
          * another tab's marker activity can never starve this draft.
          */
         upsertDraft: async (input, signal) => {
+            /**
+             * The record is validated by the SAME boundary that rejects rows on read, before any
+             * transaction opens. Typed-at-runtime input can therefore never persist a row that a
+             * later open would skip, and the object put below is the validated object itself.
+             */
+            const record = asDraftRecord({ scopeId: input.scopeId, draftId: input.draftId, writeSeq: input.writeSeq, deletionGeneration: input.expectedDeletionGeneration, state: input.state, envelope: input.envelope, savedAt: input.savedAt }, input.scopeId);
+            if (!record) return { status: "unavailable", reason: "corrupt" };
             const run = await database.run("readwrite", [EPOCHS_STORE, DRAFTS_STORE], RECOVERY_TRANSACTION_TIMEOUT_MS, async (txn): Promise<CanvasDraftWriteOutcome> => {
                 const epochRead = await readEpoch(txn, input.scopeId);
                 if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
                 const epoch = epochRead.epoch;
                 if (epoch.tombstonedAt) return { status: "tombstoned" };
-                if (epoch.deletionGeneration !== input.expectedDeletionGeneration) return { status: "generation-changed", deletionGeneration: epoch.deletionGeneration };
-                const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([input.scopeId, input.draftId]));
+                if (epoch.deletionGeneration !== record.deletionGeneration) return { status: "generation-changed", deletionGeneration: epoch.deletionGeneration };
+                const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([input.scopeId, record.draftId]));
                 const stored = asDraftRecord(storedRaw, input.scopeId);
                 /** Unknown sequence/shape cannot be compared safely. Preserve it until explicit confirmed deletion. */
                 if (storedRaw !== undefined && !stored) return { status: "unavailable", reason: "corrupt" };
-                if (stored && stored.writeSeq >= input.writeSeq) return { status: "superseded", storedWriteSeq: stored.writeSeq };
-                const record: CanvasDraftRecord = {
-                    scopeId: input.scopeId,
-                    draftId: input.draftId,
-                    writeSeq: input.writeSeq,
-                    deletionGeneration: epoch.deletionGeneration,
-                    state: input.state,
-                    envelope: input.envelope,
-                    savedAt: input.savedAt,
-                };
+                if (stored && stored.writeSeq >= record.writeSeq) return { status: "superseded", storedWriteSeq: stored.writeSeq };
+                /** The validated record is stored as-is; a validated record is never mutated in place. */
                 await txn.req(txn.store(DRAFTS_STORE).put(record));
-                return { status: "written", writeSeq: input.writeSeq };
+                return { status: "written", writeSeq: record.writeSeq };
             }, signal);
             return run.status === "ok" ? run.value : { status: "unavailable", reason: run.reason };
         },
@@ -1366,7 +1404,7 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
 
 Run: `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery/store-draft.test.ts` — expected: 12 passed.
 
-Fake-green check: temporarily change the `stored.writeSeq >= input.writeSeq` guard to `>` and rerun. The "accepts an increasing writeSeq" test must fail on the equal-seq case; if it still passes, the test is not exercising the CAS boundary. Restore `>=`.
+Fake-green check: temporarily change the `stored.writeSeq >= record.writeSeq` guard to `>` and rerun. The "accepts an increasing writeSeq" test must fail on the equal-seq case; if it still passes, the test is not exercising the CAS boundary. Restore `>=`.
 
 - [ ] **Step 5: Commit**
 
