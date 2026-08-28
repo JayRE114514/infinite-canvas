@@ -29,7 +29,7 @@ Plan final review cap reached after two independent rounds. The author applied t
 | Task | Implementation | Independent acceptance | Commit |
 |---|---|---|---|
 | 1 | complete (self-tested) | APPROVE round 1/2 — Kimi, C0/I0/M0, 7/7 | `77c2fba` |
-| 2 | pending | pending | — |
+| 2 | complete (self-tested) | pending | Task 2 implementation commit (this change) |
 | 3 | pending | pending | — |
 | 4 | pending | pending | — |
 | 5 | pending | pending | — |
@@ -44,3 +44,6 @@ Plan final review cap reached after two independent rounds. The author applied t
 - Task 1 environment note: `bun` is absent from `PATH`; the install used the already-staged `/tmp/ic-bun-1313/bun-linux-x64/bun`, version `1.3.13`, matching the repo's pinned `packageManager`. A reviewer reproducing the lockfile needs the same binary available.
 - Task 1 open observation for acceptance: `web/tsconfig.json` `include` covers `vite.config.ts` and `src/**` only, so `web/vitest.config.ts` and `web/test/setup-indexeddb.ts` sit outside the typecheck program. No tsconfig change was made because the brief does not request one.
 - Task 1: independent Kimi acceptance round 1/2 APPROVE, C0/I0/M0. The reviewer independently reran `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery/database.test.ts` with 7/7 passing, re-proved late-commit and blocked-upgrade detection using isolated mutants, and verified package/lockfile integrity. See `task-1-review-round-1.md`. No second round is needed.
+- Task 2: implementation complete and self-tested only; acceptance pending. See `.superpowers/sdd/2026-08-28-native-indexeddb-cas-recovery/task-2-report.md`. RED was observed twice as unresolved `./scope` and `./types` imports with each suite already collected by the service-scoped include glob; GREEN is 5/5 on `vitest run src/services/canvas-recovery/scope.test.ts` and 17/17 on `vitest run src/services/canvas-recovery` (database 7, scope 5, types 5). Only these two scoped commands were run.
+- Task 2 fake-green: removing the `value.scopeId !== scopeId` comparison from `asDraftRecord` turned only the "rejects a record whose stored scope differs" assertion red (1 failed | 16 passed), proving that assertion is the load-bearing cross-scope isolation guard. The comparison was restored and the suite returned to 17/17; only the restored version is committed.
+- Task 2 open observations for acceptance: the draft and marker validators return the validated input by cast, so unknown extra keys survive validation; `assets` entry values and `snapshot` internals are not structurally validated; `isIsoDate` uses `Date.parse` rather than a strict ISO-8601 gate. All three follow the brief's specified validator code and are flagged for Task 3 consumers rather than changed here.
