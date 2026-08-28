@@ -28,7 +28,7 @@ Plan final review cap reached after two independent rounds. The author applied t
 
 | Task | Implementation | Independent acceptance | Commit |
 |---|---|---|---|
-| 1 | complete (self-tested) | pending | this commit |
+| 1 | complete (self-tested) | APPROVE round 1/2 — Kimi, C0/I0/M0, 7/7 | `77c2fba` |
 | 2 | pending | pending | — |
 | 3 | pending | pending | — |
 | 4 | pending | pending | — |
@@ -43,3 +43,4 @@ Plan final review cap reached after two independent rounds. The author applied t
 - Task 1: implementation complete and self-tested only; see `.superpowers/sdd/2026-08-28-native-indexeddb-cas-recovery/task-1-report.md`. RED was observed as an unresolved `./database` import with the suite already collected by the service-scoped include glob; GREEN is 7/7 on `vitest run src/services/canvas-recovery/database.test.ts`. Both required fake-green mutations were executed and restored: removing the deadline `transaction.abort()` let the finite request loop commit and turned the rollback assertion red, and removing `db.close()` from `onversionchange` turned the upgrade test red through its `onblocked` branch. Only the restored aborting version is committed.
 - Task 1 environment note: `bun` is absent from `PATH`; the install used the already-staged `/tmp/ic-bun-1313/bun-linux-x64/bun`, version `1.3.13`, matching the repo's pinned `packageManager`. A reviewer reproducing the lockfile needs the same binary available.
 - Task 1 open observation for acceptance: `web/tsconfig.json` `include` covers `vite.config.ts` and `src/**` only, so `web/vitest.config.ts` and `web/test/setup-indexeddb.ts` sit outside the typecheck program. No tsconfig change was made because the brief does not request one.
+- Task 1: independent Kimi acceptance round 1/2 APPROVE, C0/I0/M0. The reviewer independently reran `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery/database.test.ts` with 7/7 passing, re-proved late-commit and blocked-upgrade detection using isolated mutants, and verified package/lockfile integrity. See `task-1-review-round-1.md`. No second round is needed.
