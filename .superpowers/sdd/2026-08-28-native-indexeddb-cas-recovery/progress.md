@@ -30,7 +30,7 @@ Plan final review cap reached after two independent rounds. The author applied t
 |---|---|---|---|
 | 1 | complete (self-tested) | APPROVE round 1/2 — Kimi, C0/I0/M0, 7/7 | `77c2fba` |
 | 2 | complete (fixed/self-tested) | APPROVE final round 2/2 — Kimi, C0/I0/M0, 17/17 | `12197f0` + `33f97dd` |
-| 3 | complete (fixed/self-tested) | final round 2/2 pending — round 1 Kimi C0/I0/M1 | `9a4980d` + this commit |
+| 3 | complete (fixed/self-tested) | APPROVE final round 2/2 — Opus, C0/I0/M0, 12/12 | `9a4980d` + `0b36a53` |
 | 4 | pending | pending | — |
 | 5 | pending | pending | — |
 | 6 | pending | pending | — |
@@ -63,3 +63,4 @@ Plan final review cap reached after two independent rounds. The author applied t
 - Task 3 fix round 1: M1 fixed and self-tested; final independent acceptance round 2/2 pending. `readScopeDrafts` now uses explicit UTF-16 code-unit comparison for equal-`savedAt` draft IDs instead of default-locale `localeCompare`. The existing expanded-year/ordering case remains one of 12 and now pins `"A"` before `"a"` at an identical timestamp.
 - Task 3 fix-round RED/GREEN: with production still using `localeCompare`, the extended mixed-case assertion failed exactly as intended — received `["d3","d1","a","A","d2"]` versus code-unit `["d3","d1","A","a","d2"]` (1 failed / 11 passed). After the one-line comparator fix, `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery/store-draft.test.ts` passed 12/12.
 - Task 3 fix-round mutation: restoring `a.draftId.localeCompare(b.draftId)` turned the same mixed-case assertion red with 1 failed / 11 passed. The explicit `<` / `>` comparator was restored and the focused suite returned to 12/12. Only the restored locale-independent version is committed. No build, typecheck, dev server, browser automation or broader suite was run.
+- Task 3 final independent Opus acceptance round 2/2: APPROVE, C0/I0/M0, 12/12. M1 is closed; the explicit code-unit comparator and mixed-case assertion remained green under en/sv/tr/C environments while a `localeCompare` relapse failed under all four. Transaction, validation and CAS paths were unchanged and control mutants still failed. See `task-3-review-round-2.md`. Review cap reached; no third round exists.
