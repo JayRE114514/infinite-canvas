@@ -222,7 +222,8 @@ describe("workspace mapping", () => {
         expect(created.statusCode).toBe(201);
 
         const workspaces = await adminPool.query(
-            'select "id", "type", "status", "owner_user_id", "slug" from "workspaces"',
+            `select "id", "type", "status", "owner_user_id", "slug"
+             from "workspaces" where "type" = 'team'`,
         );
 
         expect(workspaces.rows).toHaveLength(1);
@@ -234,7 +235,10 @@ describe("workspace mapping", () => {
             owner_user_id: owner.userId,
         });
 
-        const members = await adminPool.query('select "user_id", "role", "workspace_id" from "workspace_members"');
+        const members = await adminPool.query(
+            'select "user_id", "role", "workspace_id" from "workspace_members" where "workspace_id" = $1',
+            [created.json().workspace.id],
+        );
 
         expect(members.rows).toHaveLength(1);
         expect(members.rows[0]).toMatchObject({

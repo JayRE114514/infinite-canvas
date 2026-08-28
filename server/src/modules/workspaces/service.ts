@@ -12,20 +12,26 @@ import type {
 import { and, asc, eq, ne, sql } from "drizzle-orm";
 
 import { AppError } from "../../errors.js";
-import type { AppTransaction } from "../../infrastructure/database/types.js";
+import { withUserTransaction } from "../../infrastructure/database/transactions.js";
+import type { AppDatabase, AppTransaction } from "../../infrastructure/database/types.js";
 import { users } from "../identity/schema.js";
 import { workspaceAuditLogs } from "../platform-admin/schema.js";
 import { parseWorkspaceRole, requireTeamWorkspace, type WorkspaceAccess } from "./authorization.js";
+import { adoptOwnedWorkspaceContext } from "./context.js";
 import { workspaceInvitations, workspaceMembers, workspaces } from "./schema.js";
 
 export const WORKSPACE_SLUG_UNIQUE_INDEX = "workspaces_slug_uidx";
 export const WORKSPACE_INVITATION_PENDING_UNIQUE_INDEX = "workspace_invitations_pending_email_unique";
-const WORKSPACE_PERSONAL_OWNER_UNIQUE_INDEX = "workspaces_owner_personal_unique";
 const WORKSPACE_MEMBER_UNIQUE_INDEX = "workspace_members_workspace_user_unique";
 const DEFAULT_WORKSPACE_MEMBER_LIMIT = 100;
 const INVITATION_TTL_DAYS = 7;
 
 export type PersonalWorkspaceUser = { id: string; name: string };
+export type PersonalWorkspaceProvisioningUser = PersonalWorkspaceUser & { email: string };
+export type PersonalWorkspaceProvisioningEvent = {
+    source: "email_verification" | "explicit_repair";
+    eventId: string;
+};
 export type WorkspaceInvitee = { id: string; email: string };
 export type WorkspaceRow = typeof workspaces.$inferSelect;
 export type WorkspaceInvitationRow = typeof workspaceInvitations.$inferSelect;
@@ -39,6 +45,37 @@ export type ResolvedOwnedWorkspaceId = string & { readonly [resolvedOwnedWorkspa
 
 function brandOwnedWorkspaceId(workspaceId: string): ResolvedOwnedWorkspaceId {
     return workspaceId as ResolvedOwnedWorkspaceId;
+}
+
+export async function provisionPersonalWorkspace(
+    db: AppDatabase,
+    user: PersonalWorkspaceProvisioningUser,
+    event: PersonalWorkspaceProvisioningEvent,
+): Promise<WorkspaceSummary> {
+    return withUserTransaction(db, user.id, async (tx) => {
+        const [persistedUser] = await tx
+            .select({
+                id: users.id,
+                name: users.name,
+                email: users.email,
+                emailVerified: users.emailVerified,
+            })
+            .from(users)
+            .where(eq(users.id, user.id))
+            .limit(1)
+            .for("update");
+        if (!persistedUser?.emailVerified) {
+            throw new AppError("email_verification_required", 403, "请先验证邮箱");
+        }
+
+        const resolved = await resolveLifetimePersonalWorkspace(tx, persistedUser);
+        await adoptOwnedWorkspaceContext(tx, persistedUser.id, resolved.resolvedWorkspaceId);
+        const audit = await tx.execute<{ audit_id: string }>(
+            sql`select public.record_workspace_provisioning(${event.source}, ${resolved.summary.id}, ${event.eventId}) as audit_id`,
+        );
+        if (!audit.rows[0]?.audit_id) throw new Error("Workspace provisioning audit returned no ID");
+        return resolved.summary;
+    });
 }
 
 /** 原始令牌只出现在邮件里；数据库只保存它的 SHA-256 摘要。 */
@@ -106,12 +143,10 @@ export function isPostgresUniqueViolation(error: unknown, constraint: string): b
  * 个人空间：插入或读取当前用户终身唯一的那一行，并返回带品牌的空间 ID。
  * 只有这里与团队创建能生成品牌值。
  */
-export async function resolvePersonalWorkspace(
+async function resolveLifetimePersonalWorkspace(
     tx: AppTransaction,
     user: PersonalWorkspaceUser,
 ): Promise<{ summary: WorkspaceSummary; resolvedWorkspaceId: ResolvedOwnedWorkspaceId }> {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${'personal:' + user.id}, 0))`);
-
     const [existing] = await tx
         .select()
         .from(workspaces)
@@ -121,25 +156,22 @@ export async function resolvePersonalWorkspace(
         return { summary: toWorkspaceSummary(existing, "owner"), resolvedWorkspaceId: brandOwnedWorkspaceId(existing.id) };
     }
 
+    // 外层已锁定持久用户行，合法调用在此串行化。这里不能使用 ON CONFLICT：
+    // owner member 写入前，新 Workspace 按既有 SELECT RLS 不可见，冲突路径会被数据库拒绝。
     const workspaceId = randomUUID();
-    try {
-        const inserted = await tx
-            .insert(workspaces)
-            .values({
-                id: workspaceId,
-                name: `${user.name}的个人空间`,
-                slug: `personal-${user.id}-${randomUUID()}`,
-                type: "personal",
-                status: "active",
-                ownerUserId: user.id,
-            });
-        if (inserted.rowCount !== 1) throw new Error("Personal Workspace insert affected no row");
-    } catch (error) {
-        if (isPostgresUniqueViolation(error, WORKSPACE_PERSONAL_OWNER_UNIQUE_INDEX)) {
-            throw new AppError("personal_workspace_already_exists", 409, "个人空间已存在但当前不可访问");
-        }
-        throw error;
-    }
+    const inserted = await tx
+        .insert(workspaces)
+        .values({
+            id: workspaceId,
+            name: `${user.name}的个人空间`,
+            slug: `personal-${user.id}-${randomUUID()}`,
+            type: "personal",
+            status: "active",
+            ownerUserId: user.id,
+        });
+
+    if (inserted.rowCount !== 1) throw new Error("Personal Workspace insert affected no row");
+
     await tx.insert(workspaceMembers).values({
         id: randomUUID(),
         workspaceId,

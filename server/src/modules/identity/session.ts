@@ -16,5 +16,10 @@ export async function requireSession(request: FastifyRequest): Promise<RequestCo
     const auth = requireAuth(request.server);
     const session = await auth.api.getSession({ headers: fromNodeHeaders(request.headers) });
     if (!session) throw new AppError("unauthenticated", 401, "请先登录");
-    return { requestId: request.id, userId: session.user.id };
+    return {
+        requestId: request.id,
+        userId: session.user.id,
+        name: session.user.name,
+        email: session.user.email,
+    };
 }

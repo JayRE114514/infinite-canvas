@@ -9,7 +9,7 @@ import type { AuthDependencies } from "./types.js";
  * Workspace 的创建、成员与邀请全部由 Workspaces 模块在应用事务中自有，
  * 这里不再挂载 Organization 插件，也没有任何组织业务钩子。
  */
-export function createAuth({ db, config, mailer }: AuthDependencies) {
+export function createAuth({ db, config, mailer, onEmailVerified }: AuthDependencies) {
     return betterAuth({
         basePath: "/api/auth",
         secret: config.betterAuthSecret,
@@ -23,6 +23,9 @@ export function createAuth({ db, config, mailer }: AuthDependencies) {
             sendOnSignUp: true,
             sendVerificationEmail: async ({ user, url }) => {
                 await mailer.sendVerification(user.email, url);
+            },
+            afterEmailVerification: async (user) => {
+                await onEmailVerified({ id: user.id, name: user.name, email: user.email });
             },
         },
         user: { modelName: "users" },

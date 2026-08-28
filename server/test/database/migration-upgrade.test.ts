@@ -132,7 +132,7 @@ describe("immutable migration history", () => {
         }
     });
 
-    it("keeps generated snapshot ancestry and the policy-only 0004 schema exact", async () => {
+    it("keeps generated snapshot ancestry and custom-migration schemas exact", async () => {
         type SnapshotTable = {
             columns: Record<string, unknown>;
             indexes: Record<string, unknown>;
@@ -149,10 +149,11 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
+            readSnapshot("0005"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -160,10 +161,18 @@ describe("immutable migration history", () => {
             { idx: 2, version: "7", when: 1787867556275, tag: "0002_workspace-authority", breakpoints: true },
             { idx: 3, version: "7", when: 1787868758532, tag: "0003_transaction-context", breakpoints: true },
             { idx: 4, version: "7", when: 1787869148642, tag: "0004_tenant-rls", breakpoints: true },
+            {
+                idx: 5,
+                version: "7",
+                when: 1787885037416,
+                tag: "0005_workspace-provisioning-audit-fix",
+                breakpoints: true,
+            },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
         expect(snapshot4.prevId).toBe(snapshot3.id);
+        expect(snapshot5.prevId).toBe(snapshot4.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -190,6 +199,7 @@ describe("immutable migration history", () => {
 
         const normalize = ({ id: _id, prevId: _prevId, ...snapshot }: typeof snapshot3) => snapshot;
         expect(normalize(snapshot4)).toEqual(normalize(snapshot3));
+        expect(normalize(snapshot5)).toEqual(normalize(snapshot4));
     });
 });
 

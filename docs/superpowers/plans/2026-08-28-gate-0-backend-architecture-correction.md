@@ -44,7 +44,7 @@ Tasks 1-4 are one database-security implementation unit and one deployable commi
 | Identity | `server/src/modules/identity/auth-schema.ts`, `auth.ts`, `types.ts` | Better Auth identity tables and verified-email callback only. |
 | Workspaces | `server/src/modules/workspaces/schema.ts`, `service.ts`, `authorization.ts`, `routes.ts` | Workspace/member/invitation schema, business invariants, authorization, and HTTP mapping. |
 | Canvas snapshot | `server/src/modules/canvases/schema.ts`, `service.ts`, `routes.ts`, `packages/contracts/src/canvases.ts` | Snapshot-mode resource contract, revision lock, durable deletion receipt, and stable error ordering. |
-| Database policy | `server/migrations/0002_workspace_authority.sql`, `0003_transaction_context.sql`, `0004_tenant_rls.sql`, `0005_canvas_document_mode.sql` | Final column layout, constraints, helpers, grants, RLS policies, and Canvas mode/receipt fields. |
+| Database policy | `server/migrations/0002_workspace_authority.sql`, `0003_transaction-context.sql`, `0004_tenant-rls.sql`, `0005_workspace-provisioning-audit-fix.sql`, `0006_canvas_document_mode.sql` | Final column layout, constraints, helpers, grants, RLS policies, the function-only provisioning audit correction, and the reserved Canvas mode/receipt migration. |
 | Test database | `server/test/helpers/postgres.ts`, `server/test/helpers/database.ts`, `server/test/helpers/auth.ts` | Bootstrap roles, run migrations in journal order, and expose separate role handles. |
 | Boundary verification | `server/scripts/check-module-boundaries.ts`, `server/test/architecture/module-boundaries.test.ts` | Parse TypeScript imports and fail if Better Auth escapes Identity. |
 
@@ -649,13 +649,19 @@ git commit -m "feat: establish transaction-scoped PostgreSQL tenant security"
 ### Task 5: Verified-Email Personal Workspace Provisioning
 
 **Files:**
+- Create: `server/migrations/0005_workspace-provisioning-audit-fix.sql`
+- Generate: `server/migrations/meta/0005_snapshot.json`
+- Modify: `server/migrations/meta/_journal.json`
 - Modify: `server/src/modules/identity/auth.ts`
+- Modify: `server/src/modules/identity/session.ts`
 - Modify: `server/src/modules/identity/types.ts`
 - Modify: `server/src/modules/workspaces/service.ts`
 - Modify: `server/src/modules/workspaces/routes.ts`
 - Modify: `server/src/app.ts`
+- Modify: `server/test/database/migration-upgrade.test.ts`
 - Modify: `server/test/workspaces/workspaces.test.ts`
 - Modify: `server/test/helpers/auth.ts`
+- Modify: `server/test/identity/auth.test.ts`
 - Modify: `packages/contracts/src/workspaces.ts`
 
 **Interfaces:**
@@ -712,7 +718,9 @@ Identity does not import Workspaces. `app.ts` composes `createAuth` with a callb
 
 - [ ] **Step 4: Implement idempotent provisioning**
 
-Inside `withUserTransaction`: lock the current user row `FOR UPDATE`; verify the persisted `emailVerified` state; select the lifetime-unique personal Workspace; insert when absent with `ON CONFLICT` on `owner_user_id WHERE type = 'personal'`; insert the owner member; resolve the committed row; call `adoptOwnedWorkspaceContext`; append `workspace_provisioning_audits` through its replay-validating `ON CONFLICT` function with trusted `source + eventId`; return the summary from the resolved Workspace row regardless of whether the audit insert was new or a validated replay. Automatic verification and explicit repair converge on this same function. Tests cover concurrent callbacks, repair replay, verification-then-repair, and a deliberately divergent existing audit that must fail and roll back. The GET list route only selects active memberships and cannot mutate.
+Inside `withUserTransaction`: lock the persisted current-user row `FOR UPDATE`; verify its persisted `emailVerified` state; only then select the lifetime-unique personal Workspace. Valid provisioning calls serialize on that user row. When the Workspace is absent, use a plain INSERT followed by the active owner-member INSERT in the same transaction; do not use Workspace `INSERT ... ON CONFLICT`, because under the approved Task 4 RLS the new Workspace is intentionally not SELECT-visible until that owner member exists and PostgreSQL rejects the conflict path with `42501`. The partial unique owner index remains the physical backstop. Resolve the row, call `adoptOwnedWorkspaceContext`, append `workspace_provisioning_audits` through its replay-validating `ON CONFLICT` function with trusted `source + eventId`, and return the summary regardless of whether the audit insert was new or a validated replay. Automatic verification and explicit repair converge on this same function. Tests cover concurrent callbacks, repair replay, verification-then-repair, and a deliberately divergent existing audit that must fail and roll back. The GET list route only selects active memberships and cannot mutate.
+
+The first production call exposed PostgreSQL `42702` in the already-reviewed migration 0003 function: its `source` parameter and `ON CONFLICT (user_id, source)` target were ambiguous. Do not rewrite frozen 0003. Generate the journaled custom migration `0005_workspace-provisioning-audit-fix.sql` and its `0005_snapshot.json`, then replace only the existing function body with `#variable_conflict use_column`. Preserve the exact `record_workspace_provisioning(text, text, text)` signature, `SECURITY DEFINER`, `schema_owner` ownership, fixed `search_path = pg_catalog, public`, source allowlist, `(user_id, source)` conflict key, exact event/Workspace replay validation, PUBLIC revocation, and existing signature-specific `app_api` EXECUTE grant. Migration 0005 is function-only: normalized `0005_snapshot.json` must equal normalized `0004_snapshot.json`, with `0005.prevId = 0004.id`. Extend `migration-upgrade.test.ts` to freeze that journal entry, ancestry, and schema equivalence. Migrations 0000–0004 remain byte-for-byte unchanged.
 
 - [ ] **Step 5: Run provisioning and identity regressions to verify GREEN**
 
@@ -727,7 +735,12 @@ Expected: PASS; verification provisions exactly once, concurrent callbacks conve
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/src/modules/identity server/src/modules/workspaces server/src/app.ts server/test
+git add packages/contracts/src/workspaces.ts \
+  server/migrations/0005_workspace-provisioning-audit-fix.sql \
+  server/migrations/meta/0005_snapshot.json server/migrations/meta/_journal.json \
+  server/src/app.ts server/src/modules/identity server/src/modules/workspaces \
+  server/test/database/migration-upgrade.test.ts server/test/helpers/auth.ts \
+  server/test/identity/auth.test.ts server/test/workspaces/workspaces.test.ts
 git commit -m "feat: provision personal Workspaces on verification"
 ```
 
@@ -736,15 +749,16 @@ git commit -m "feat: provision personal Workspaces on verification"
 ### Task 6: Snapshot `document_mode` Contract and Locked Save Ordering
 
 **Files:**
-- Create: `server/migrations/0005_canvas_document_mode.sql`
+- Create: `server/migrations/0006_canvas_document_mode.sql`
 - Modify: `server/migrations/meta/_journal.json`
-- Generate: `server/migrations/meta/0005_snapshot.json`
+- Generate: `server/migrations/meta/0006_snapshot.json`
 - Modify: `server/src/modules/canvases/schema.ts`
 - Modify: `server/src/modules/canvases/service.ts`
 - Modify: `server/src/modules/canvases/routes.ts`
 - Modify: `packages/contracts/src/canvases.ts`
 - Modify: `server/test/canvases/schema.test.ts`
 - Modify: `server/test/canvases/routes.test.ts`
+- Modify: `server/test/database/migration-upgrade.test.ts`
 - Modify: `server/test/database/tenant-isolation.test.ts`
 
 **Interfaces:**
@@ -814,7 +828,9 @@ ALTER TABLE public.canvases
     ADD CONSTRAINT canvases_deletion_receipt_unique UNIQUE (deletion_receipt_id);
 ```
 
-Update the Drizzle schema and run `bun --cwd server run db:generate -- --name canvas-document-mode` so `0005_canvas_document_mode.sql`, the journal, and snapshot are generated together. Review the generated order: add the columns first; in the same migration transaction temporarily set Canvas `NO FORCE ROW LEVEL SECURITY`, backfill `gen_random_uuid()` only for pre-release rows already having `deleted_at`, assert the affected count equals the pre-count and no deletion-state mismatch remains, then restore `FORCE ROW LEVEL SECURITY` before adding the coherence/unique constraints. Transaction rollback restores the original FORCE state on any failure. The final schema has `document_mode`, nullable unique `deletion_receipt_id uuid`, and a CHECK requiring `deleted_at` and the receipt to be either both null or both non-null.
+Update the Drizzle schema and run `bun --cwd server run db:generate -- --name canvas-document-mode` after the committed 0005 journal entry so Drizzle generates `0006_canvas_document_mode.sql`, `0006_snapshot.json`, and the index-6 journal entry together. Never rename, overwrite, or regenerate committed 0005. Review the generated order: add the columns first; in the same migration transaction temporarily set Canvas `NO FORCE ROW LEVEL SECURITY`, backfill `gen_random_uuid()` only for pre-release rows already having `deleted_at`, assert the affected count equals the pre-count and no deletion-state mismatch remains, then restore `FORCE ROW LEVEL SECURITY` before adding the coherence/unique constraints. Transaction rollback restores the original FORCE state on any failure. The final schema has `document_mode`, nullable unique `deletion_receipt_id uuid`, and a CHECK requiring `deleted_at` and the receipt to be either both null or both non-null.
+
+Extend `migration-upgrade.test.ts` with the exact index-6 journal entry and assert `snapshot6.prevId === snapshot5.id`. Retain the existing `snapshot5.prevId === snapshot4.id` and normalized 0004/0005 schema-equivalence assertions. Assert `document_mode`, `deletion_receipt_id`, `canvases_document_mode_check`, `canvases_deletion_state_check`, and `canvases_deletion_receipt_unique` are absent from 0005 and present with their final definitions only in 0006. Fresh-install and legacy-owner upgrade paths must both apply through 0006 without changing any earlier SQL, snapshot ID, journal timestamp, or tag.
 
 Maintenance receives no Canvas privilege in Gate 0, so `document_mode` does not expand its allowlist. Contracts include `documentMode` in `CanvasSchema` and `CanvasSummarySchema`, but neither `CreateCanvasBodySchema` nor `SaveCanvasRequestSchema` contains it; `additionalProperties: false` rejects attempts to mutate it. The DELETE response alone exposes `deletionReceipt`; normal Canvas summaries/details never do.
 
@@ -917,7 +933,7 @@ git commit -m "docs: record Gate 0 backend verification"
 - **Spec coverage:** Gate 0 backend ordering is fully mapped: role credentials/test connections and existing-object ownership adoption (Task 1); Organization removal, complete snake_case Workspace conversion, final constraints, and same-transaction service signatures (Task 2); transaction context, immutable audit/control tables, and admin binding (Task 3); explicit grants, RLS, user-only Workspace listing, and the owner/admin lifecycle matrix (Task 4); read-only GET plus audited explicit provisioning repair (Task 5); and `document_mode`, exact safe-integer ordering, and durable deletion receipts (Task 6). Native IndexedDB CAS is intentionally excluded into its own spec/plan; Billing, Assets, AI Tasks, and collaboration remain later gates.
 - **Scaffolding scan:** every interface-only `not_implemented` body and Task 3 `it.todo` is an explicitly named RED-stage artifact inside the uncommitted atomic unit; Task 4 requires removing all of them before its green checkpoint and commit. No scaffold, skip, todo, generic error step, or unnamed test may survive a deployable commit.
 - **Type consistency:** `DatabaseLoginRole`, `DatabaseConfig`, `DatabaseHandle.role`, `AppTransaction`, `WorkspaceAccess`, and the four transaction entrypoints are introduced before consumers. Workspace schema exports move once in Task 2; Tasks 3-6 consume only that final location.
-- **Migration consistency:** fixed filenames `0002`, `0003`, `0004`, and `0005` are journaled in order and no later task edits an already-reviewed migration. Schema-changing `0002`, `0003`, and `0005` are generated from the final Drizzle schema and retain snapshots; policy-only `0004` is registered with `drizzle-kit generate --custom`, whose pinned implementation also emits and retains `0004_snapshot.json`. All tests execute the journaled Drizzle migrator as `schema_owner`; no lexical SQL loader remains. Ownership adoption includes both `public` application objects and `drizzle` metadata objects/history. Task 1 establishes roles before any migration references them; Task 2 removes Organization before renamed columns are consumed; Task 3 creates helpers before Task 4 policies call them; Task 6 changes Canvas without expanding the Gate 0 Maintenance allowlist.
+- **Migration consistency:** immutable migration history is append-only: pinned 0000/0001 and reviewed 0002–0005 are never renamed, regenerated, or edited by a later task. Schema-changing 0002, 0003, and reserved 0006 retain their generated snapshots. Policy-only 0004 and function-only `0005_workspace-provisioning-audit-fix.sql` are registered as custom migrations; normalized 0004 equals 0003, normalized 0005 equals 0004, and 0006 alone introduces the final Canvas shape with `0006.prevId = 0005.id`. The 0005 function replacement preserves the exact signature, ACL, `SECURITY DEFINER` with `schema_owner` ownership, fixed search path, and replay protocol established in 0003. All tests execute the journaled Drizzle migrator as `schema_owner`; no lexical SQL loader remains. Ownership adoption includes both `public` application objects and `drizzle` metadata objects/history. Task 1 establishes roles before any migration references them; Task 2 removes Organization before renamed columns are consumed; Task 3 creates helpers before Task 4 policies call them; Task 5 appends only the provisioning function correction; Task 6 appends Canvas schema changes without expanding the Gate 0 Maintenance allowlist.
 - **Failure-path consistency:** missing grants (`42501`) are tested separately from successful empty RLS results; `set_config` is never asserted to be authorization; verification callback failure converges through an explicit verified-user repair path; ordinary Canvas 404 responses never become deletion proof; status audits are written before the final deactivation update.
 - **Deployability consistency:** Tasks 1-4 have one implementer, one review boundary, and one commit only after final routes, grants, policies, and module boundaries are green. No intermediate broad-grant, missing-grant, moved-schema/old-route, or two-connection authorization state is published.
 - **Upgrade consistency:** the real immutable `0000/0001` history is applied as a legacy owner, adopted by a deployment administrator, and continued as `schema_owner`; fresh install and upgrade are independent test paths, and FORCE-RLS fixture mutations use only the isolated container administrator.

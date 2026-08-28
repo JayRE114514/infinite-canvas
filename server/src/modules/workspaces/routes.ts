@@ -4,6 +4,7 @@ import {
     AppErrorResponseSchema,
     CreateWorkspaceBodySchema,
     CreateWorkspaceInvitationBodySchema,
+    PersonalWorkspaceRepairResponseSchema,
     SuccessResponseSchema,
     UpdateWorkspaceBodySchema,
     WorkspaceInvitationPathSchema,
@@ -46,7 +47,7 @@ import {
     listWorkspaceMembers,
     listWorkspaces,
     removeWorkspaceMember,
-    resolvePersonalWorkspace,
+    provisionPersonalWorkspace,
     updateWorkspace,
     WORKSPACE_INVITATION_PENDING_UNIQUE_INDEX,
     WORKSPACE_SLUG_UNIQUE_INDEX,
@@ -85,11 +86,30 @@ export function registerWorkspaceRoutes(app: FastifyInstance, mailer: Mailer): v
             const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
             return withUserTransaction(db, userId, async (tx) => {
-                const user = await requireVerifiedUser(tx, userId);
-                // Task 5 moves this provisioning side effect to verification/repair; Task 4 retains current behavior.
-                await resolvePersonalWorkspace(tx, user);
+                await requireVerifiedUser(tx, userId);
                 return { workspaces: await listWorkspaces(tx, userId) };
             });
+        },
+    );
+
+    app.post(
+        "/api/v1/workspaces/personal/repair",
+        { schema: { response: { 200: PersonalWorkspaceRepairResponseSchema, ...errorResponses } } },
+        async (request) => {
+            const user = await requireSession(request);
+            if (request.body !== undefined) {
+                throw new AppError("invalid_request_body", 400, "此接口不接受请求体");
+            }
+            const { db } = requireDatabase(request.server);
+            const workspace = await provisionPersonalWorkspace(
+                db,
+                { id: user.userId, name: user.name, email: user.email },
+                {
+                    source: "explicit_repair",
+                    eventId: `personal-workspace:explicit-repair:${user.userId}`,
+                },
+            );
+            return { workspace };
         },
     );
 

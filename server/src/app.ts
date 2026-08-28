@@ -14,6 +14,7 @@ import { createAuth } from "./modules/identity/auth.js";
 import { registerAuthRoutes } from "./modules/identity/routes.js";
 import { registerPlatformAdminRoutes } from "./modules/platform-admin/routes.js";
 import { registerWorkspaceRoutes } from "./modules/workspaces/routes.js";
+import { provisionPersonalWorkspace } from "./modules/workspaces/service.js";
 
 const DEV_WEB_ORIGIN = "http://localhost:3000";
 
@@ -59,10 +60,17 @@ export async function buildApp(options: BuildAppOptions = {}) {
         // 认证需要配置与数据库同时存在；纯应用构造保持无数据库、无认证。
         if (options.config && resolved) {
             const mailer = options.mailer ?? createSmtpMailer(options.config);
+            const onEmailVerified = async (user: { id: string; name: string; email: string }): Promise<void> => {
+                await provisionPersonalWorkspace(resolved.database.db, user, {
+                    source: "email_verification",
+                    eventId: `personal-workspace:email-verification:${user.id}`,
+                });
+            };
             const auth = createAuth({
                 db: resolved.database.db,
                 config: options.config,
                 mailer,
+                onEmailVerified,
             });
 
             app.decorate("auth", auth);

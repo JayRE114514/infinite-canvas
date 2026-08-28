@@ -63,6 +63,9 @@ export type WorkspaceListResponse = Static<typeof WorkspaceListResponseSchema>;
 export const WorkspaceResponseSchema = Type.Object({ workspace: WorkspaceSummarySchema });
 export type WorkspaceResponse = Static<typeof WorkspaceResponseSchema>;
 
+export const PersonalWorkspaceRepairResponseSchema = Type.Object({ workspace: WorkspaceSummarySchema });
+export type PersonalWorkspaceRepairResponse = Static<typeof PersonalWorkspaceRepairResponseSchema>;
+
 export const CreateWorkspaceBodySchema = Type.Object(
     {
         name: Type.String({ minLength: 1, maxLength: 120 }),

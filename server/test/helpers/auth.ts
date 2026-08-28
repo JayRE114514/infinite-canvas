@@ -28,10 +28,39 @@ export class MemoryMailer implements Mailer {
 
 export type AuthApp = Awaited<ReturnType<typeof buildApp>>;
 export type VerifiedUser = { cookie: string; userId: string };
+export type UnverifiedUser = { userId: string; verificationUrl: string };
 
 export function cookieHeader(setCookie: string | string[] | undefined): string {
     const cookies = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
     return cookies.map((cookie) => cookie.split(";")[0]).join("; ");
+}
+
+/** 只完成注册并返回最新验证链接，供验证回调与失败恢复用例控制提交时点。 */
+export async function registerUserWithoutVerification(
+    app: AuthApp,
+    mailer: MemoryMailer,
+    user: { name: string; email: string },
+): Promise<UnverifiedUser> {
+    const before = mailer.messages.length;
+    const signUp = await app.inject({
+        method: "POST",
+        url: "/api/auth/sign-up/email",
+        headers: { origin: APP_ORIGIN },
+        payload: { ...user, password: PASSWORD },
+    });
+
+    expect(signUp.statusCode).toBe(200);
+    expect(mailer.messages).toHaveLength(before + 1);
+    return {
+        userId: signUp.json().user.id as string,
+        verificationUrl: mailer.messages[before]!.verificationUrl,
+    };
+}
+
+/** 通过真实 Better Auth GET 端点消费指定验证链接，并把响应交给故障用例断言。 */
+export function verifyLatestEmail(app: AuthApp, user: UnverifiedUser) {
+    const verificationUrl = new URL(user.verificationUrl);
+    return app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
 }
 
 /** 注册、验证并登录真实 Better Auth 用户。 */
@@ -40,19 +69,9 @@ export async function registerVerifiedUser(
     mailer: MemoryMailer,
     user: { name: string; email: string },
 ): Promise<VerifiedUser> {
-    const before = mailer.messages.length;
-    const signUp = await app.inject({
-        method: "POST",
-        url: "/api/auth/sign-up/email",
-        headers: { origin: APP_ORIGIN },
-        payload: { name: user.name, email: user.email, password: PASSWORD },
-    });
-
-    expect(signUp.statusCode).toBe(200);
-    expect(mailer.messages).toHaveLength(before + 1);
-
-    const verificationUrl = new URL(mailer.messages[before]!.verificationUrl);
-    await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
+    const registered = await registerUserWithoutVerification(app, mailer, user);
+    const verified = await verifyLatestEmail(app, registered);
+    expect(verified.statusCode).toBe(302);
 
     const signIn = await app.inject({
         method: "POST",
@@ -65,7 +84,7 @@ export async function registerVerifiedUser(
     const cookie = cookieHeader(signIn.headers["set-cookie"]);
     expect(cookie).not.toBe("");
 
-    return { cookie, userId: signIn.json().user.id as string };
+    return { cookie, userId: registered.userId };
 }
 
 /** 每个测试文件独享容器，且无论断言或构造在哪一步失败都回收 app、连接池和容器。 */

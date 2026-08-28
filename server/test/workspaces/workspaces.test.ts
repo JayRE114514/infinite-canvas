@@ -3,16 +3,31 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 
 import { withUserTransaction } from "../../src/infrastructure/database/transactions.js";
-import { hashInvitationToken, resolvePersonalWorkspace } from "../../src/modules/workspaces/service.js";
+import { hashInvitationToken, provisionPersonalWorkspace } from "../../src/modules/workspaces/service.js";
 import {
+    APP_ORIGIN,
+    PASSWORD,
+    cookieHeader,
     createAuthTestHarness,
+    registerUserWithoutVerification,
     registerVerifiedUser,
+    verifyLatestEmail,
     type AuthApp,
     type MemoryMailer,
     type VerifiedUser,
 } from "../helpers/auth.js";
 
 const harness = createAuthTestHarness();
+
+type VerificationCallback = (user: { id: string; name: string; email: string }) => Promise<void>;
+
+function requireVerificationCallback(app: AuthApp): VerificationCallback {
+    const emailVerification = app.auth?.options.emailVerification as
+        | { afterEmailVerification?: VerificationCallback }
+        | undefined;
+    expect(emailVerification?.afterEmailVerification).toBeTypeOf("function");
+    return emailVerification!.afterEmailVerification!;
+}
 
 function latestInvitationToken(mailer: MemoryMailer): string {
     const url = new URL(mailer.invitations.at(-1)?.invitationUrl ?? "");
@@ -76,99 +91,453 @@ afterAll(async () => {
     await harness.stop();
 }, 60_000);
 
-describe("personal workspace provisioning", () => {
-    it("creates exactly one personal workspace for repeated calls", async () => {
+describe("personal Workspace provisioning", () => {
+    it("concurrent direct provisioning converges on one Workspace, owner member, and audit", async () => {
         const { database, adminPool } = await harness.openAuthApp();
-        const user = { id: "personal-repeated", name: "重复用户" };
+        const user = { id: "personal-concurrent", name: "并发用户", email: "concurrent@example.com" };
         await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
             user.id,
             user.name,
-            "repeated@example.com",
+            user.email,
         ]);
+        const event = {
+            source: "email_verification" as const,
+            eventId: `personal-workspace:email-verification:${user.id}`,
+        };
 
-        const first = await withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user));
-        const second = await withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user));
+        const [first, second] = await Promise.all([
+            provisionPersonalWorkspace(database.db, user, event),
+            provisionPersonalWorkspace(database.db, user, event),
+        ]);
         const stored = await adminPool.query(
-            'select "id", "slug" from "workspaces" where "owner_user_id" = $1 and "type" = \'personal\'',
+            `select w.id, w.status, m.role, m.status as member_status
+             from public.workspaces w
+             join public.workspace_members m on m.workspace_id = w.id
+             where w.owner_user_id = $1 and w.type = 'personal'`,
+            [user.id],
+        );
+        const audits = await adminPool.query(
+            "select source, event_id, workspace_id from public.workspace_provisioning_audits where user_id = $1",
             [user.id],
         );
 
-        expect(second.summary.id).toBe(first.summary.id);
-        expect(stored.rows).toHaveLength(1);
-        expect(stored.rows[0]?.slug).toMatch(new RegExp(`^personal-${user.id}`));
+        expect(second.id).toBe(first.id);
+        expect(stored.rows).toEqual([
+            { id: first.id, status: "active", role: "owner", member_status: "active" },
+        ]);
+        expect(audits.rows).toEqual([
+            { source: event.source, event_id: event.eventId, workspace_id: first.id },
+        ]);
     }, 60_000);
 
-    it("returns the committed winner for concurrent personal creation", async () => {
+    it("direct provisioning rolls back Workspace and audit when owner insertion fails", async () => {
         const { database, adminPool } = await harness.openAuthApp();
-        const user = { id: "personal-concurrent", name: "并发用户" };
+        const user = { id: "personal-rollback", name: "回滚用户", email: "rollback@example.com" };
         await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
             user.id,
             user.name,
-            "concurrent@example.com",
+            user.email,
         ]);
+        await adminPool.query(`
+            create function fail_provisioning_owner_insert() returns trigger language plpgsql as $$
+            begin
+                raise exception 'injected provisioning owner failure' using errcode = 'P5501';
+            end
+            $$;
+            create trigger fail_provisioning_owner_insert before insert on public.workspace_members
+            for each row execute function fail_provisioning_owner_insert();
+        `);
 
-        const results = await Promise.all(
-            Array.from({ length: 8 }, () =>
-                withUserTransaction(database.db, user.id, (tx) => resolvePersonalWorkspace(tx, user)),
-            ),
-        );
-        const stored = await adminPool.query(
-            'select w."id", m."role" from "workspaces" w join "workspace_members" m on m."workspace_id" = w."id" where w."owner_user_id" = $1 and w."type" = \'personal\'',
+        try {
+            await expect(
+                provisionPersonalWorkspace(database.db, user, {
+                    source: "email_verification",
+                    eventId: `personal-workspace:email-verification:${user.id}`,
+                }),
+            ).rejects.toMatchObject({ cause: { code: "P5501" } });
+        } finally {
+            await adminPool.query(`
+                drop trigger fail_provisioning_owner_insert on public.workspace_members;
+                drop function fail_provisioning_owner_insert();
+            `);
+        }
+        const rows = await adminPool.query(
+            `select
+                (select count(*)::int from public.workspaces where owner_user_id = $1 and type = 'personal') as workspaces,
+                (select count(*)::int from public.workspace_members where user_id = $1) as members,
+                (select count(*)::int from public.workspace_provisioning_audits where user_id = $1) as audits`,
             [user.id],
         );
 
-        expect(new Set(results.map((workspace) => workspace.summary.id))).toEqual(
-            new Set([results[0]!.summary.id]),
-        );
-        expect(stored.rows).toEqual([{ id: results[0]!.summary.id, role: "owner" }]);
+        expect(rows.rows).toEqual([{ workspaces: 0, members: 0, audits: 0 }]);
     }, 60_000);
 
-    it("guarantees a personal workspace when a verified user lists workspaces", async () => {
-        const { app, mailer, adminPool } = await harness.openAuthApp();
-        const user = await registerVerifiedUser(app, mailer, { name: "个人用户", email: "personal@example.com" });
-
-        const before = await adminPool.query('select count(*)::int as count from "workspaces"');
-        const response = await app.inject({
-            method: "GET",
-            url: "/api/v1/workspaces",
-            headers: { cookie: user.cookie },
-        });
-
-        expect(before.rows[0]?.count).toBe(0);
-        expect(response.statusCode).toBe(200);
-        expect(response.json().workspaces).toEqual([
-            expect.objectContaining({ type: "personal", ownerUserId: user.userId, role: "owner" }),
+    it("direct provisioning rejects an unverified persisted user", async () => {
+        const { database, adminPool } = await harness.openAuthApp();
+        const user = { id: "personal-unverified", name: "未验证用户", email: "unverified-direct@example.com" };
+        await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, false)', [
+            user.id,
+            user.name,
+            user.email,
         ]);
+
+        await expect(
+            provisionPersonalWorkspace(database.db, user, {
+                source: "explicit_repair",
+                eventId: `personal-workspace:explicit-repair:${user.id}`,
+            }),
+        ).rejects.toMatchObject({ code: "email_verification_required", statusCode: 403 });
+
+        const stored = await adminPool.query(
+            "select count(*)::int as count from public.workspaces where owner_user_id = $1",
+            [user.id],
+        );
+        expect(stored.rows).toEqual([{ count: 0 }]);
     }, 60_000);
 
-    it("maps an invisible lifetime-unique personal Workspace to a stable conflict", async () => {
-        const { app, mailer, adminPool } = await harness.openAuthApp();
-        const user = await registerVerifiedUser(app, mailer, { name: "个人用户", email: "personal@example.com" });
-        const initial = await app.inject({
-            method: "GET",
-            url: "/api/v1/workspaces",
-            headers: { cookie: user.cookie },
-        });
-        const personalId = initial.json().workspaces[0].id as string;
-        await adminPool.query("update public.workspaces set status = 'suspended' where id = $1", [personalId]);
+    it("direct provisioning returns an inactive lifetime personal Workspace without replacing or reactivating it", async () => {
+        const { database, adminPool } = await harness.openAuthApp();
+        const user = { id: "personal-inactive", name: "停用用户", email: "inactive@example.com" };
+        await adminPool.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+            user.id,
+            user.name,
+            user.email,
+        ]);
         await adminPool.query(
-            "update public.workspace_members set status = 'removed' where workspace_id = $1 and user_id = $2",
-            [personalId, user.userId],
+            "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, $2, $3, 'personal', $4, 'suspended')",
+            ["inactive-personal-workspace", "停用个人空间", "inactive-personal-workspace", user.id],
         );
+        await adminPool.query(
+            "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
+            ["inactive-personal-owner", "inactive-personal-workspace", user.id],
+        );
+
+        const workspace = await provisionPersonalWorkspace(database.db, user, {
+            source: "explicit_repair",
+            eventId: `personal-workspace:explicit-repair:${user.id}`,
+        });
+        const stored = await adminPool.query(
+            "select id, status, deleted_at from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.id],
+        );
+
+        expect(workspace).toMatchObject({ id: "inactive-personal-workspace", status: "suspended" });
+        expect(stored.rows).toEqual([{ id: "inactive-personal-workspace", status: "suspended", deleted_at: null }]);
+    }, 60_000);
+
+    it("direct provisioning rejects divergent audit history and rolls back a new personal Workspace", async () => {
+        const { database, adminPool } = await harness.openAuthApp();
+        const user = { id: "personal-divergent", name: "分叉用户", email: "divergent@example.com" };
+        const client = await adminPool.connect();
+        try {
+            await client.query("begin");
+            await client.query(
+                'insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)',
+                [user.id, user.name, user.email],
+            );
+            await client.query(
+                "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, $2, $3, 'team', $4, 'active')",
+                ["divergent-team", "分叉团队", "divergent-team", user.id],
+            );
+            await client.query(
+                "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
+                ["divergent-team-owner", "divergent-team", user.id],
+            );
+            await client.query(
+                "insert into public.workspace_provisioning_audits (user_id, source, event_id, workspace_id, transaction_xid) values ($1, 'email_verification', $2, $3, pg_current_xact_id())",
+                [user.id, "personal-workspace:email-verification:different", "divergent-team"],
+            );
+            await client.query("commit");
+        } catch (error) {
+            await client.query("rollback").catch(() => {});
+            throw error;
+        } finally {
+            client.release();
+        }
+
+        await expect(
+            provisionPersonalWorkspace(database.db, user, {
+                source: "email_verification",
+                eventId: `personal-workspace:email-verification:${user.id}`,
+            }),
+        ).rejects.toMatchObject({ cause: { code: "23514" } });
+        const personal = await adminPool.query(
+            "select id from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.id],
+        );
+        const audits = await adminPool.query(
+            "select event_id, workspace_id from public.workspace_provisioning_audits where user_id = $1",
+            [user.id],
+        );
+
+        expect(personal.rows).toEqual([]);
+        expect(audits.rows).toEqual([
+            { event_id: "personal-workspace:email-verification:different", workspace_id: "divergent-team" },
+        ]);
+    }, 60_000);
+
+    it("concurrent composed verification callbacks converge with the deterministic verification event", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerUserWithoutVerification(app, mailer, {
+            name: "并发回调用户",
+            email: "concurrent-callback@example.com",
+        });
+        await adminPool.query('update public.users set "emailVerified" = true where id = $1', [user.userId]);
+        const callback = requireVerificationCallback(app);
+
+        await Promise.all([
+            callback({ id: user.userId, name: "并发回调用户", email: "concurrent-callback@example.com" }),
+            callback({ id: user.userId, name: "并发回调用户", email: "concurrent-callback@example.com" }),
+        ]);
+        const stored = await adminPool.query(
+            `select w.id, m.role, a.source, a.event_id
+             from public.workspaces w
+             join public.workspace_members m on m.workspace_id = w.id
+             join public.workspace_provisioning_audits a on a.workspace_id = w.id
+             where w.owner_user_id = $1 and w.type = 'personal'`,
+            [user.userId],
+        );
+
+        expect(stored.rows).toEqual([
+            {
+                id: expect.any(String),
+                role: "owner",
+                source: "email_verification",
+                event_id: `personal-workspace:email-verification:${user.userId}`,
+            },
+        ]);
+    }, 60_000);
+
+    it("provisions one personal Workspace when email verification succeeds", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerUserWithoutVerification(app, mailer, {
+            name: "验证开通用户",
+            email: "verification-provisioning@example.com",
+        });
+
+        const before = await adminPool.query(
+            "select count(*)::int as count from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.userId],
+        );
+        const verification = await verifyLatestEmail(app, user);
+        const after = await adminPool.query(
+            "select count(*)::int as count from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.userId],
+        );
+        const audits = await adminPool.query(
+            "select source, event_id from public.workspace_provisioning_audits where user_id = $1",
+            [user.userId],
+        );
+
+        expect(before.rows).toEqual([{ count: 0 }]);
+        expect(verification.statusCode).toBe(302);
+        expect(after.rows).toEqual([{ count: 1 }]);
+        expect(audits.rows).toEqual([
+            {
+                source: "email_verification",
+                event_id: `personal-workspace:email-verification:${user.userId}`,
+            },
+        ]);
+    }, 60_000);
+
+    it("keeps GET workspaces read-only when verified-user provisioning is missing", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerUserWithoutVerification(app, mailer, {
+            name: "缺失空间用户",
+            email: "missing-personal@example.com",
+        });
+        await adminPool.query(`
+            create function fail_personal_owner_insert() returns trigger language plpgsql as $$
+            begin
+                raise exception 'injected owner failure';
+            end
+            $$;
+            create trigger fail_personal_owner_insert before insert on public.workspace_members
+            for each row execute function fail_personal_owner_insert();
+        `);
+        try {
+            await verifyLatestEmail(app, user);
+        } finally {
+            await adminPool.query(`
+                drop trigger fail_personal_owner_insert on public.workspace_members;
+                drop function fail_personal_owner_insert();
+            `);
+        }
+        const signIn = await app.inject({
+            method: "POST",
+            url: "/api/auth/sign-in/email",
+            headers: { origin: APP_ORIGIN },
+            payload: { email: "missing-personal@example.com", password: PASSWORD },
+        });
 
         const response = await app.inject({
             method: "GET",
             url: "/api/v1/workspaces",
-            headers: { cookie: user.cookie },
+            headers: { cookie: cookieHeader(signIn.headers["set-cookie"]) },
         });
         const stored = await adminPool.query(
             "select count(*)::int as count from public.workspaces where owner_user_id = $1 and type = 'personal'",
             [user.userId],
         );
 
-        expect(response.statusCode).toBe(409);
-        expect(response.json().error.code).toBe("personal_workspace_already_exists");
-        expect(stored.rows).toEqual([{ count: 1 }]);
+        expect(signIn.statusCode).toBe(200);
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ workspaces: [] });
+        expect(stored.rows).toEqual([{ count: 0 }]);
+    }, 90_000);
+
+    it("replays explicit repair naturally and records one audit per trusted source", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerVerifiedUser(app, mailer, {
+            name: "修复用户",
+            email: "repair-route@example.com",
+        });
+        const before = await adminPool.query(
+            "select id from public.workspaces where owner_user_id = $1 and type = 'personal'",
+            [user.userId],
+        );
+
+        const first = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie: user.cookie, "idempotency-key": "ignored-first-key" },
+        });
+        const replay = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie: user.cookie, "idempotency-key": "ignored-second-key" },
+        });
+        const audits = await adminPool.query(
+            "select source, event_id, workspace_id from public.workspace_provisioning_audits where user_id = $1 order by source",
+            [user.userId],
+        );
+
+        expect(first.statusCode).toBe(200);
+        expect(replay.statusCode).toBe(200);
+        expect(first.json().workspace).toMatchObject({
+            id: before.rows[0]?.id,
+            type: "personal",
+            ownerUserId: user.userId,
+            role: "owner",
+        });
+        expect(replay.json()).toEqual(first.json());
+        expect(audits.rows).toEqual([
+            {
+                source: "email_verification",
+                event_id: `personal-workspace:email-verification:${user.userId}`,
+                workspace_id: before.rows[0]?.id,
+            },
+            {
+                source: "explicit_repair",
+                event_id: `personal-workspace:explicit-repair:${user.userId}`,
+                workspace_id: before.rows[0]?.id,
+            },
+        ]);
+    }, 90_000);
+
+    it("keeps repair authenticated, bodyless, strict, and verified-only", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const unauthenticated = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+        });
+        const user = await registerVerifiedUser(app, mailer, {
+            name: "严格修复用户",
+            email: "strict-repair@example.com",
+        });
+        const withBody = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie: user.cookie },
+            payload: {
+                source: "email_verification",
+                eventId: "request-controlled-event",
+            },
+        });
+        await adminPool.query('update public.users set "emailVerified" = false where id = $1', [user.userId]);
+        const unverified = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie: user.cookie },
+        });
+        const repairAudits = await adminPool.query(
+            "select count(*)::int as count from public.workspace_provisioning_audits where user_id = $1 and source = 'explicit_repair'",
+            [user.userId],
+        );
+
+        expect(unauthenticated.statusCode).toBe(401);
+        expect(withBody.statusCode).toBe(400);
+        expect(unverified.statusCode).toBe(403);
+        expect(unverified.json().error.code).toBe("email_verification_required");
+        expect(repairAudits.rows).toEqual([{ count: 0 }]);
+    }, 90_000);
+
+    it("repairs after Better Auth commits verification but the callback fails", async () => {
+        const { app, mailer, adminPool } = await harness.openAuthApp();
+        const user = await registerUserWithoutVerification(app, mailer, {
+            name: "回调失败用户",
+            email: "callback-failure@example.com",
+        });
+        const emailVerification = app.auth?.options.emailVerification as
+            | { afterEmailVerification?: VerificationCallback }
+            | undefined;
+        if (!emailVerification) throw new Error("Email verification is not configured");
+        emailVerification.afterEmailVerification = async () => {
+            throw new Error("injected post-commit callback failure");
+        };
+
+        const verification = await verifyLatestEmail(app, user);
+        const afterFailure = await adminPool.query(
+            `select u."emailVerified" as verified,
+                    (select count(*)::int from public.workspaces w where w.owner_user_id = u.id and w.type = 'personal') as workspaces
+             from public.users u where u.id = $1`,
+            [user.userId],
+        );
+        const signIn = await app.inject({
+            method: "POST",
+            url: "/api/auth/sign-in/email",
+            headers: { origin: APP_ORIGIN },
+            payload: { email: "callback-failure@example.com", password: PASSWORD },
+        });
+        const cookie = cookieHeader(signIn.headers["set-cookie"]);
+        const first = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie },
+        });
+        const replay = await app.inject({
+            method: "POST",
+            url: "/api/v1/workspaces/personal/repair",
+            headers: { cookie },
+        });
+        const stored = await adminPool.query(
+            `select w.id,
+                    count(distinct m.id)::int as members,
+                    count(distinct a.id)::int as audits,
+                    min(a.source) as source,
+                    min(a.event_id) as event_id
+             from public.workspaces w
+             join public.workspace_members m on m.workspace_id = w.id and m.role = 'owner' and m.status = 'active'
+             join public.workspace_provisioning_audits a on a.workspace_id = w.id
+             where w.owner_user_id = $1 and w.type = 'personal'
+             group by w.id`,
+            [user.userId],
+        );
+
+        expect(verification.statusCode).toBe(500);
+        expect(afterFailure.rows).toEqual([{ verified: true, workspaces: 0 }]);
+        expect(signIn.statusCode).toBe(200);
+        expect(first.statusCode).toBe(200);
+        expect(replay.json()).toEqual(first.json());
+        expect(stored.rows).toEqual([
+            {
+                id: first.json().workspace.id,
+                members: 1,
+                audits: 1,
+                source: "explicit_repair",
+                event_id: `personal-workspace:explicit-repair:${user.userId}`,
+            },
+        ]);
     }, 90_000);
 });
 
