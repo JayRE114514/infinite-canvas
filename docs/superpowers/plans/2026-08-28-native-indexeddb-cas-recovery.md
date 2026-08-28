@@ -544,7 +544,7 @@ export type RecoveryScopeSource =
     | { kind: "local"; installationId: string; localCanvasId: string }
     | { kind: "account"; userId: string; workspaceId: string; canvasId: string };
 export function buildRecoveryScopeId(source: RecoveryScopeSource): RecoveryScopeId | null;
-export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string;
+export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string | null;
 
 // types.ts
 export const CONFLICT_MARKER_ID = "conflict";
@@ -599,6 +599,7 @@ describe("recovery scope id", () => {
         expect(buildRecoveryScopeId({ kind: "account", userId: "u1", workspaceId: "w:1", canvasId: "c1" })).toBeNull();
         expect(buildRecoveryScopeId({ kind: "account", userId: "", workspaceId: "w1", canvasId: "c1" })).toBeNull();
         expect(buildRecoveryScopeId({ kind: "local", installationId: "inst1", localCanvasId: "c".repeat(129) })).toBeNull();
+        expect(buildRecoveryScopeId({ kind: "unknown", userId: "u1", workspaceId: "w1", canvasId: "c1" } as never)).toBeNull();
     });
 
     it("keeps identities distinct so one scope can never address another", () => {
@@ -614,10 +615,39 @@ describe("recovery scope id", () => {
         expect(calls).toBe(1);
     });
 
-    it("replaces a corrupted stored installation id", () => {
+    it("replaces a corrupted id and contains generation or storage failures", () => {
         const bag = new Map<string, string>([["canvas-recovery-installation", "bad:id"]]);
         const storage = { getItem: (k: string) => bag.get(k) ?? null, setItem: (k: string, v: string) => void bag.set(k, v) };
         expect(readInstallationId(storage, () => "fresh")).toBe("fresh");
+
+        let writes = 0;
+        expect(readInstallationId({ getItem: () => null, setItem: () => void writes++ }, () => "bad:id")).toBeNull();
+        expect(writes).toBe(0);
+
+        let creates = 0;
+        expect(
+            readInstallationId(
+                {
+                    getItem: () => {
+                        throw new Error("get failed");
+                    },
+                    setItem: () => undefined,
+                },
+                () => "generated" + ++creates,
+            ),
+        ).toBeNull();
+        expect(creates).toBe(0);
+        expect(
+            readInstallationId(
+                {
+                    getItem: () => null,
+                    setItem: () => {
+                        throw new Error("set failed");
+                    },
+                },
+                () => "fresh2",
+            ),
+        ).toBeNull();
     });
 });
 ```
@@ -652,16 +682,27 @@ export function buildRecoveryScopeId(source: RecoveryScopeSource): RecoveryScope
         if (!safe(source.installationId) || !safe(source.localCanvasId)) return null;
         return ("local:" + source.installationId + ":" + source.localCanvasId) as RecoveryScopeId;
     }
+    if (source.kind !== "account") return null;
     if (!safe(source.userId) || !safe(source.workspaceId) || !safe(source.canvasId)) return null;
     return ("account:" + source.userId + ":workspace:" + source.workspaceId + ":canvas:" + source.canvasId) as RecoveryScopeId;
 }
 
 /** The installation id is a tiny local value, so localStorage is the correct home for it. */
-export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string {
-    const existing = storage.getItem(INSTALLATION_KEY);
+export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string | null {
+    let existing: string | null;
+    try {
+        existing = storage.getItem(INSTALLATION_KEY);
+    } catch {
+        return null;
+    }
     if (safe(existing)) return existing;
     const created = createId();
-    storage.setItem(INSTALLATION_KEY, created);
+    if (!safe(created)) return null;
+    try {
+        storage.setItem(INSTALLATION_KEY, created);
+    } catch {
+        return null;
+    }
     return created;
 }
 ```
@@ -682,8 +723,21 @@ import { asDraftRecord, asEpoch, asMarkerRecord, CONFLICT_MARKER_ID, initialEpoc
 
 const scopeId = buildRecoveryScopeId({ kind: "local", installationId: "inst1", localCanvasId: "c1" })!;
 const other = buildRecoveryScopeId({ kind: "local", installationId: "inst1", localCanvasId: "c2" })!;
-const envelope = { document: { title: "T", baseRevision: 3, snapshot: { nodes: [], connections: [] } }, localUi: { viewport: { x: 0, y: 0, k: 1 } }, assets: {} };
+const envelope = {
+    document: { title: "T", baseRevision: 3, snapshot: { nodes: [], connections: [] } },
+    localUi: { viewport: { x: 0, y: 0, k: 1 } },
+    assets: {
+        local: { assetId: null, uploadState: "local-only" },
+        uploading: { assetId: "a1", uploadState: "uploading" },
+        ready: { assetId: "a2", uploadState: "ready" },
+        failed: { assetId: "a3", uploadState: "failed" },
+    },
+};
 const draft = { scopeId, draftId: "d1", writeSeq: 5, deletionGeneration: 0, state: "pending", envelope, savedAt: "2020-01-01T00:00:00.000Z" };
+
+const withSnapshot = (snapshot: unknown) => ({ ...draft, envelope: { ...envelope, document: { ...envelope.document, snapshot } } });
+const withViewport = (viewport: unknown) => ({ ...draft, envelope: { ...envelope, localUi: { viewport } } });
+const withAssets = (assets: unknown) => ({ ...draft, envelope: { ...envelope, assets } });
 
 describe("recovery record validators", () => {
     it("starts a scope at generation zero with no tombstone", () => {
@@ -693,7 +747,24 @@ describe("recovery record validators", () => {
     it("accepts well-formed records", () => {
         expect(asEpoch({ scopeId, coordinationRevision: 2, deletionGeneration: 1, tombstonedAt: null }, scopeId)).not.toBeNull();
         expect(asDraftRecord(draft, scopeId)).not.toBeNull();
-        expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: [{ draftId: "d1", baseRevision: 3, savedAt: "2020-01-01T00:00:00.000Z" }] }, scopeId)).not.toBeNull();
+        const extra = { ...draft, unknown: "preserved" };
+        expect(asDraftRecord(extra, scopeId)).toBe(extra);
+        const shared = { value: 1 };
+        expect(asDraftRecord(withSnapshot({ first: shared, second: shared }), scopeId)).not.toBeNull();
+        expect(asDraftRecord({ ...draft, draftId: "internal:opaque" }, scopeId)).not.toBeNull();
+        expect(
+            asMarkerRecord(
+                {
+                    scopeId,
+                    markerId: CONFLICT_MARKER_ID,
+                    entries: [
+                        { draftId: "d1", baseRevision: 3, savedAt: "2020-01-01T00:00:00.000Z" },
+                        { draftId: "d2", baseRevision: 4, savedAt: "2020-01-01T00:00:01.000Z" },
+                    ],
+                },
+                scopeId,
+            ),
+        ).not.toBeNull();
     });
 
     it("rejects a record whose stored scope differs from the requesting scope", () => {
@@ -710,13 +781,53 @@ describe("recovery record validators", () => {
         expect(asDraftRecord({ ...draft, envelope: { document: envelope.document } }, scopeId)).toBeNull();
         expect(asDraftRecord(null, scopeId)).toBeNull();
         expect(asEpoch({ scopeId, coordinationRevision: "1", deletionGeneration: 0, tombstonedAt: null }, scopeId)).toBeNull();
+        expect(asEpoch({ scopeId, coordinationRevision: 1, deletionGeneration: 0, tombstonedAt: "2020" }, scopeId)).toBeNull();
+        expect(asDraftRecord({ ...draft, savedAt: "2020-01-01T00:00:00Z" }, scopeId)).toBeNull();
+        expect(asDraftRecord({ ...draft, savedAt: "2020-01-01T01:00:00.000+01:00" }, scopeId)).toBeNull();
+
+        expect(asDraftRecord(withViewport({ x: Number.NaN, y: 0, k: 1 }), scopeId)).toBeNull();
+        expect(asDraftRecord(withViewport({ x: 0, y: Number.POSITIVE_INFINITY, k: 1 }), scopeId)).toBeNull();
+        expect(asDraftRecord(withViewport({ x: 0, y: 0, k: Number.NaN }), scopeId)).toBeNull();
+        expect(asDraftRecord(withViewport({ x: 0, y: 0, k: Number.POSITIVE_INFINITY }), scopeId)).toBeNull();
+        expect(asDraftRecord(withViewport({ x: 0, y: 0, k: 0 }), scopeId)).toBeNull();
+        expect(asDraftRecord(withViewport({ x: 0, y: 0, k: -1 }), scopeId)).toBeNull();
+
+        expect(asDraftRecord(withAssets({ bad: 42 }), scopeId)).toBeNull();
+        expect(asDraftRecord(withAssets({ bad: { assetId: 7, uploadState: "ready" } }), scopeId)).toBeNull();
+        expect(asDraftRecord(withAssets({ bad: { assetId: null, uploadState: "unknown" } }), scopeId)).toBeNull();
+        expect(asDraftRecord(withAssets(new Date()), scopeId)).toBeNull();
+
+        class SnapshotClass {
+            value = 1;
+        }
+        expect(asDraftRecord(withSnapshot(new Date()), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: new Date() }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: new Map() }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: new SnapshotClass() }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [undefined] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [1n] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [Symbol("bad")] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [() => undefined] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [Number.NaN] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [Number.POSITIVE_INFINITY] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: [Number.NEGATIVE_INFINITY] }), scopeId)).toBeNull();
+        expect(asDraftRecord(withSnapshot({ nested: new Array(1) }), scopeId)).toBeNull();
+        const cyclic: Record<string, unknown> = {};
+        cyclic.self = cyclic;
+        expect(asDraftRecord(withSnapshot(cyclic), scopeId)).toBeNull();
+
         expect(asMarkerRecord({ scopeId, markerId: "other", entries: [] }, scopeId)).toBeNull();
         expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: [{ draftId: "d1" }] }, scopeId)).toBeNull();
+        expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: [{ draftId: "d1", baseRevision: 1, savedAt: "Jan 1 2020" }] }, scopeId)).toBeNull();
     });
 
-    it("caps marker entries at the shared conflict limit", () => {
+    it("caps marker entries and rejects holes or duplicate drafts", () => {
         const entry = { draftId: "d1", baseRevision: 1, savedAt: "2020-01-01T00:00:00.000Z" };
         expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: [entry, entry, entry] }, scopeId)).toBeNull();
+        expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: [entry, { ...entry, savedAt: "2020-01-01T00:00:01.000Z" }] }, scopeId)).toBeNull();
+        const entries = new Array(2);
+        entries[1] = entry;
+        expect(asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries }, scopeId)).toBeNull();
     });
 });
 ```
@@ -792,9 +903,77 @@ export function initialEpoch(scopeId: RecoveryScopeId): CanvasRecoveryEpoch {
     return { scopeId, coordinationRevision: 0, deletionGeneration: 0, tombstonedAt: null };
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+};
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const isIsoDate = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+const isIsoDate = (value: unknown): value is string => {
+    if (typeof value !== "string") return false;
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) && date.toISOString() === value;
+};
+const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+/** CanvasSnapshot is a JSON object, not merely an object-shaped structured-clone value. */
+function isJsonObject(value: unknown): value is CanvasSnapshot {
+    if (!isRecord(value)) return false;
+    const active = new Set<object>();
+    const stack: Array<{ value: unknown; leaving?: boolean }> = [{ value }];
+
+    while (stack.length) {
+        const frame = stack.pop()!;
+        const current = frame.value;
+        if (frame.leaving) {
+            active.delete(current as object);
+            continue;
+        }
+        if (current === null || typeof current === "string" || typeof current === "boolean") continue;
+        if (typeof current === "number") {
+            if (!Number.isFinite(current)) return false;
+            continue;
+        }
+        if (typeof current !== "object") return false;
+        if (active.has(current)) return false;
+
+        let children: unknown[];
+        if (Array.isArray(current)) {
+            if (Object.getPrototypeOf(current) !== Array.prototype) return false;
+            const keys = Reflect.ownKeys(current);
+            if (keys.length !== current.length + 1) return false;
+            for (let index = 0; index < current.length; index++) {
+                if (!Object.hasOwn(current, index)) return false;
+            }
+            children = current;
+        } else {
+            if (!isRecord(current)) return false;
+            const keys = Reflect.ownKeys(current);
+            if (keys.some((key) => typeof key === "symbol")) return false;
+            children = [];
+            for (const key of keys) {
+                const descriptor = Object.getOwnPropertyDescriptor(current, key)!;
+                if (!("value" in descriptor)) return false;
+                children.push(descriptor.value);
+            }
+        }
+
+        active.add(current);
+        stack.push({ value: current, leaving: true });
+        for (const child of children) stack.push({ value: child });
+    }
+    return true;
+}
+
+const isUploadState = (value: unknown): value is CanvasAssetMapping[string]["uploadState"] => value === "local-only" || value === "uploading" || value === "ready" || value === "failed";
+
+function isAssetMapping(value: unknown): value is CanvasAssetMapping {
+    if (!isRecord(value)) return false;
+    return Object.getOwnPropertyNames(value).every((key) => {
+        const entry = value[key];
+        return isRecord(entry) && (entry.assetId === null || typeof entry.assetId === "string") && isUploadState(entry.uploadState);
+    });
+}
 
 export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecoveryEpoch | null {
     if (!isRecord(value) || value.scopeId !== scopeId) return null;
@@ -805,11 +984,11 @@ export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecover
 }
 
 function asEnvelope(value: unknown): CanvasDraftEnvelope | null {
-    if (!isRecord(value) || !isRecord(value.document) || !isRecord(value.localUi) || !isRecord(value.assets)) return null;
+    if (!isRecord(value) || !isRecord(value.document) || !isRecord(value.localUi) || !isAssetMapping(value.assets)) return null;
     const { title, baseRevision, snapshot } = value.document;
-    if (typeof title !== "string" || !isCount(baseRevision) || !isRecord(snapshot)) return null;
+    if (typeof title !== "string" || !isCount(baseRevision) || !isJsonObject(snapshot)) return null;
     const viewport = (value.localUi as { viewport?: unknown }).viewport;
-    if (!isRecord(viewport) || typeof viewport.x !== "number" || typeof viewport.y !== "number" || typeof viewport.k !== "number") return null;
+    if (!isRecord(viewport) || !isFiniteNumber(viewport.x) || !isFiniteNumber(viewport.y) || !isFiniteNumber(viewport.k) || viewport.k <= 0) return null;
     return value as CanvasDraftEnvelope;
 }
 
@@ -825,8 +1004,11 @@ export function asMarkerRecord(value: unknown, scopeId: RecoveryScopeId): Canvas
     if (!isRecord(value) || value.scopeId !== scopeId || value.markerId !== CONFLICT_MARKER_ID) return null;
     const { entries } = value;
     if (!Array.isArray(entries) || entries.length > MAX_CONFLICT_MARKER_ENTRIES) return null;
-    const valid = entries.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isCount(entry.baseRevision) && isIsoDate(entry.savedAt));
-    return valid ? (value as CanvasConflictMarkerRecord) : null;
+    const materialized = Array.from(entries);
+    const valid = materialized.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isCount(entry.baseRevision) && isIsoDate(entry.savedAt));
+    if (!valid) return null;
+    if (new Set(materialized.map((entry) => (entry as CanvasConflictMarkerEntry).draftId)).size !== entries.length) return null;
+    return value as CanvasConflictMarkerRecord;
 }
 ```
 
@@ -835,6 +1017,10 @@ export function asMarkerRecord(value: unknown, scopeId: RecoveryScopeId): Canvas
 Run: `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery` — expected: 17 passed across three files (database 7, scope 5, types 5).
 
 Fake-green check: temporarily drop the `value.scopeId !== scopeId` comparison from `asDraftRecord` and rerun. "rejects a record whose stored scope differs" must fail; that comparison is the scope-isolation guarantee, so a suite that stays green without it proves nothing. Restore it.
+
+Full-JSON fake-green check: temporarily replace `isJsonObject(snapshot)` with `isRecord(snapshot)` in `asEnvelope` and rerun. The nested non-JSON snapshot assertion must fail. Restore it.
+
+Storage-containment fake-green check: temporarily remove the `getItem` catch from `readInstallationId` and rerun. The storage-failure assertion must fail with the injected `get failed` error. Restore it, then rerun the same scoped suite to 17/17.
 
 - [ ] **Step 9: Commit**
 

@@ -13,6 +13,7 @@ describe("recovery scope id", () => {
         expect(buildRecoveryScopeId({ kind: "account", userId: "u1", workspaceId: "w:1", canvasId: "c1" })).toBeNull();
         expect(buildRecoveryScopeId({ kind: "account", userId: "", workspaceId: "w1", canvasId: "c1" })).toBeNull();
         expect(buildRecoveryScopeId({ kind: "local", installationId: "inst1", localCanvasId: "c".repeat(129) })).toBeNull();
+        expect(buildRecoveryScopeId({ kind: "unknown", userId: "u1", workspaceId: "w1", canvasId: "c1" } as never)).toBeNull();
     });
 
     it("keeps identities distinct so one scope can never address another", () => {
@@ -28,9 +29,38 @@ describe("recovery scope id", () => {
         expect(calls).toBe(1);
     });
 
-    it("replaces a corrupted stored installation id", () => {
+    it("replaces a corrupted id and contains generation or storage failures", () => {
         const bag = new Map<string, string>([["canvas-recovery-installation", "bad:id"]]);
         const storage = { getItem: (k: string) => bag.get(k) ?? null, setItem: (k: string, v: string) => void bag.set(k, v) };
         expect(readInstallationId(storage, () => "fresh")).toBe("fresh");
+
+        let writes = 0;
+        expect(readInstallationId({ getItem: () => null, setItem: () => void writes++ }, () => "bad:id")).toBeNull();
+        expect(writes).toBe(0);
+
+        let creates = 0;
+        expect(
+            readInstallationId(
+                {
+                    getItem: () => {
+                        throw new Error("get failed");
+                    },
+                    setItem: () => undefined,
+                },
+                () => "generated" + ++creates,
+            ),
+        ).toBeNull();
+        expect(creates).toBe(0);
+        expect(
+            readInstallationId(
+                {
+                    getItem: () => null,
+                    setItem: () => {
+                        throw new Error("set failed");
+                    },
+                },
+                () => "fresh2",
+            ),
+        ).toBeNull();
     });
 });

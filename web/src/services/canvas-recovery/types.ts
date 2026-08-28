@@ -61,9 +61,77 @@ export function initialEpoch(scopeId: RecoveryScopeId): CanvasRecoveryEpoch {
     return { scopeId, coordinationRevision: 0, deletionGeneration: 0, tombstonedAt: null };
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+};
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const isIsoDate = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+const isIsoDate = (value: unknown): value is string => {
+    if (typeof value !== "string") return false;
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) && date.toISOString() === value;
+};
+const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+/** CanvasSnapshot is a JSON object, not merely an object-shaped structured-clone value. */
+function isJsonObject(value: unknown): value is CanvasSnapshot {
+    if (!isRecord(value)) return false;
+    const active = new Set<object>();
+    const stack: Array<{ value: unknown; leaving?: boolean }> = [{ value }];
+
+    while (stack.length) {
+        const frame = stack.pop()!;
+        const current = frame.value;
+        if (frame.leaving) {
+            active.delete(current as object);
+            continue;
+        }
+        if (current === null || typeof current === "string" || typeof current === "boolean") continue;
+        if (typeof current === "number") {
+            if (!Number.isFinite(current)) return false;
+            continue;
+        }
+        if (typeof current !== "object") return false;
+        if (active.has(current)) return false;
+
+        let children: unknown[];
+        if (Array.isArray(current)) {
+            if (Object.getPrototypeOf(current) !== Array.prototype) return false;
+            const keys = Reflect.ownKeys(current);
+            if (keys.length !== current.length + 1) return false;
+            for (let index = 0; index < current.length; index++) {
+                if (!Object.hasOwn(current, index)) return false;
+            }
+            children = current;
+        } else {
+            if (!isRecord(current)) return false;
+            const keys = Reflect.ownKeys(current);
+            if (keys.some((key) => typeof key === "symbol")) return false;
+            children = [];
+            for (const key of keys) {
+                const descriptor = Object.getOwnPropertyDescriptor(current, key)!;
+                if (!("value" in descriptor)) return false;
+                children.push(descriptor.value);
+            }
+        }
+
+        active.add(current);
+        stack.push({ value: current, leaving: true });
+        for (const child of children) stack.push({ value: child });
+    }
+    return true;
+}
+
+const isUploadState = (value: unknown): value is CanvasAssetMapping[string]["uploadState"] => value === "local-only" || value === "uploading" || value === "ready" || value === "failed";
+
+function isAssetMapping(value: unknown): value is CanvasAssetMapping {
+    if (!isRecord(value)) return false;
+    return Object.getOwnPropertyNames(value).every((key) => {
+        const entry = value[key];
+        return isRecord(entry) && (entry.assetId === null || typeof entry.assetId === "string") && isUploadState(entry.uploadState);
+    });
+}
 
 export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecoveryEpoch | null {
     if (!isRecord(value) || value.scopeId !== scopeId) return null;
@@ -74,11 +142,11 @@ export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecover
 }
 
 function asEnvelope(value: unknown): CanvasDraftEnvelope | null {
-    if (!isRecord(value) || !isRecord(value.document) || !isRecord(value.localUi) || !isRecord(value.assets)) return null;
+    if (!isRecord(value) || !isRecord(value.document) || !isRecord(value.localUi) || !isAssetMapping(value.assets)) return null;
     const { title, baseRevision, snapshot } = value.document;
-    if (typeof title !== "string" || !isCount(baseRevision) || !isRecord(snapshot)) return null;
+    if (typeof title !== "string" || !isCount(baseRevision) || !isJsonObject(snapshot)) return null;
     const viewport = (value.localUi as { viewport?: unknown }).viewport;
-    if (!isRecord(viewport) || typeof viewport.x !== "number" || typeof viewport.y !== "number" || typeof viewport.k !== "number") return null;
+    if (!isRecord(viewport) || !isFiniteNumber(viewport.x) || !isFiniteNumber(viewport.y) || !isFiniteNumber(viewport.k) || viewport.k <= 0) return null;
     return value as CanvasDraftEnvelope;
 }
 
@@ -94,6 +162,9 @@ export function asMarkerRecord(value: unknown, scopeId: RecoveryScopeId): Canvas
     if (!isRecord(value) || value.scopeId !== scopeId || value.markerId !== CONFLICT_MARKER_ID) return null;
     const { entries } = value;
     if (!Array.isArray(entries) || entries.length > MAX_CONFLICT_MARKER_ENTRIES) return null;
-    const valid = entries.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isCount(entry.baseRevision) && isIsoDate(entry.savedAt));
-    return valid ? (value as CanvasConflictMarkerRecord) : null;
+    const materialized = Array.from(entries);
+    const valid = materialized.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isCount(entry.baseRevision) && isIsoDate(entry.savedAt));
+    if (!valid) return null;
+    if (new Set(materialized.map((entry) => (entry as CanvasConflictMarkerEntry).draftId)).size !== entries.length) return null;
+    return value as CanvasConflictMarkerRecord;
 }

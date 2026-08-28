@@ -20,15 +20,26 @@ export function buildRecoveryScopeId(source: RecoveryScopeSource): RecoveryScope
         if (!safe(source.installationId) || !safe(source.localCanvasId)) return null;
         return ("local:" + source.installationId + ":" + source.localCanvasId) as RecoveryScopeId;
     }
+    if (source.kind !== "account") return null;
     if (!safe(source.userId) || !safe(source.workspaceId) || !safe(source.canvasId)) return null;
     return ("account:" + source.userId + ":workspace:" + source.workspaceId + ":canvas:" + source.canvasId) as RecoveryScopeId;
 }
 
 /** The installation id is a tiny local value, so localStorage is the correct home for it. */
-export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string {
-    const existing = storage.getItem(INSTALLATION_KEY);
+export function readInstallationId(storage: Pick<Storage, "getItem" | "setItem">, createId: () => string): string | null {
+    let existing: string | null;
+    try {
+        existing = storage.getItem(INSTALLATION_KEY);
+    } catch {
+        return null;
+    }
     if (safe(existing)) return existing;
     const created = createId();
-    storage.setItem(INSTALLATION_KEY, created);
+    if (!safe(created)) return null;
+    try {
+        storage.setItem(INSTALLATION_KEY, created);
+    } catch {
+        return null;
+    }
     return created;
 }
