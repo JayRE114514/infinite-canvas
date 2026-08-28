@@ -29,7 +29,7 @@ Plan final review cap reached after two independent rounds. The author applied t
 | Task | Implementation | Independent acceptance | Commit |
 |---|---|---|---|
 | 1 | complete (self-tested) | APPROVE round 1/2 — Kimi, C0/I0/M0, 7/7 | `77c2fba` |
-| 2 | fixed (self-tested) | final round 2/2 pending | `12197f0` + fix commit (this change) |
+| 2 | complete (fixed/self-tested) | APPROVE final round 2/2 — Kimi, C0/I0/M0, 17/17 | `12197f0` + `33f97dd` |
 | 3 | pending | pending | — |
 | 4 | pending | pending | — |
 | 5 | pending | pending | — |
@@ -52,3 +52,4 @@ Plan final review cap reached after two independent rounds. The author applied t
 - Task 2 fix round 1: implementation fixed and self-tested; final independent acceptance round 2/2 pending. The existing scope/types files remain 5+5 test cases. RED after extending those cases was 4 failed / 13 passed: unknown discriminant, invalid generated installation id, noncanonical tombstone and duplicate marker were the first exposed failures. The principled boundary now rejects the full non-JSON/cyclic snapshot graph, malformed asset entries, unusable viewport transforms, noncanonical timestamps, marker holes/duplicates and unknown scope kinds; installation reads/writes degrade to `null`. Unknown record properties remain unstripped and no `draftId` policy was added.
 - Task 2 fix-round GREEN: `cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery` passed 17/17 after implementation and after both tracked mutations were restored. Weakening `isJsonObject(snapshot)` to root-only `isRecord(snapshot)` failed at the nested `Date` assertion (1 failed / 16 passed). Removing `getItem` exception containment failed with `Error: get failed` (1 failed / 16 passed). See the appended Fix round 1 section in `task-2-report.md`. No build, typecheck, dev server, browser automation or broader suite was run.
 - Task 2 plan correction: Task 2 now declares `readInstallationId(...): string | null` and its test/implementation samples carry the strict guards. Task 3+ interfaces and test counts are unchanged. Round-1 review evidence is tracked as `task-2-review-round-1.md`.
+- Task 2 final independent Kimi acceptance round 2/2: APPROVE, C0/I0/M0, 17/17. All C1/C2/I1/I2/I3/M1 corrections were independently closed. The reviewer exercised 157 malformed/valid assertions, 11 targeted mutants, thousands of random DAG/cycle cases and 50k-deep acyclic input without finding a load-bearing regression. See `task-2-review-round-2.md`. Review cap reached; no third round exists.
