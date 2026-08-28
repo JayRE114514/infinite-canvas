@@ -43,6 +43,13 @@
       "when": 1787885037416,
       "tag": "0005_workspace-provisioning-audit-fix",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1787900000000,
+      "tag": "0006_canvas_document_mode",
+      "breakpoints": true
     }
   ]
 }

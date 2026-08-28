@@ -1,11 +1,11 @@
 import {
     AppErrorResponseSchema,
+    CanvasDeletionReceiptSchema,
     CanvasListResponseSchema,
     CanvasPathSchema,
     CanvasResponseSchema,
     CreateCanvasBodySchema,
     SaveCanvasRequestSchema,
-    SuccessResponseSchema,
     WorkspacePathSchema,
     type CanvasPath,
     type CreateCanvasBody,
@@ -14,11 +14,20 @@ import {
 } from "@infinite-canvas/contracts";
 import type { FastifyInstance } from "fastify";
 
+import { AppError } from "../../errors.js";
 import { requireDatabase } from "../../infrastructure/database/plugin.js";
 import { withTenantTransaction } from "../../infrastructure/database/transactions.js";
 import { requireSession } from "../identity/session.js";
 import { requireActiveWorkspace } from "../workspaces/authorization.js";
-import { createCanvas, getCanvas, listCanvases, saveCanvas, softDeleteCanvas } from "./service.js";
+import {
+    CanvasDeleteInvariantError,
+    CanvasSaveInvariantError,
+    createCanvas,
+    deleteCanvas,
+    getCanvas,
+    listCanvases,
+    saveCanvas,
+} from "./service.js";
 
 export const CANVAS_SNAPSHOT_BODY_LIMIT = 10 * 1024 * 1024;
 
@@ -112,10 +121,27 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
         async (request) => {
             const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
-                requireActiveWorkspace(access);
-                return { canvas: await saveCanvas(tx, access, request.params.canvasId, request.body) };
-            });
+            try {
+                return await withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
+                    requireActiveWorkspace(access);
+                    return { canvas: await saveCanvas(tx, access, request.params.canvasId, request.body) };
+                });
+            } catch (err) {
+                if (err instanceof CanvasSaveInvariantError) {
+                    request.log.error(
+                        {
+                            requestId: request.id,
+                            canvasId: err.canvasId,
+                            workspaceId: err.workspaceId,
+                            expectedRevision: err.expectedRevision,
+                            err,
+                        },
+                        "canvas save invariant failed",
+                    );
+                    throw new AppError("canvas_save_invariant_failed", 500, "内部错误：画布保存不变量失败");
+                }
+                throw err;
+            }
         },
     );
 
@@ -124,17 +150,38 @@ export function registerCanvasRoutes(app: FastifyInstance): void {
         {
             schema: {
                 params: CanvasPathSchema,
-                response: { 200: SuccessResponseSchema, ...errorResponses },
+                response: { 200: CanvasDeletionReceiptSchema, ...errorResponses },
             },
         },
         async (request) => {
             const { userId } = await requireSession(request);
             const { db } = requireDatabase(request.server);
-            return withTenantTransaction(db, { userId, workspaceId: request.params.workspaceId }, async (tx, access) => {
-                requireActiveWorkspace(access);
-                await softDeleteCanvas(tx, access, request.params.canvasId);
-                return { success: true } as const;
-            });
+            try {
+                return await withTenantTransaction(
+                    db,
+                    { userId, workspaceId: request.params.workspaceId },
+                    async (tx, access) => {
+                        requireActiveWorkspace(access);
+                        return deleteCanvas(tx, access, request.params.canvasId);
+                    },
+                );
+            } catch (err) {
+                // 事务已整体回滚；这里只做结构化诊断与稳定脱敏响应，绝不猜测用户级结果。
+                if (err instanceof CanvasDeleteInvariantError) {
+                    request.log.error(
+                        {
+                            requestId: request.id,
+                            canvasId: err.canvasId,
+                            workspaceId: err.workspaceId,
+                            reason: err.reason,
+                            err,
+                        },
+                        "canvas delete invariant failed",
+                    );
+                    throw new AppError("canvas_delete_invariant_failed", 500, "内部错误：画布删除不变量失败");
+                }
+                throw err;
+            }
         },
     );
 }

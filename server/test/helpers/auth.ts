@@ -123,7 +123,10 @@ export function createAuthTestHarness() {
 
         openApp,
 
-        async openAuthApp(configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}) {
+        async openAuthApp(
+            configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {},
+            appOverrides: Pick<BuildAppOptions, "logger"> = {},
+        ) {
             const mailer = new MemoryMailer();
             const current = roles();
 
@@ -148,7 +151,7 @@ export function createAuthTestHarness() {
             // 测试夹具的播种与提交后断言使用一次性容器管理员，绝不计作 RLS 证据。
             const adminPool = new Pool({ connectionString: current.admin, max: 4 });
             openPools.push(adminPool);
-            const app = await openApp({ logger: false, config: config(configOverrides), database, mailer });
+            const app = await openApp({ logger: appOverrides.logger ?? false, config: config(configOverrides), database, mailer });
             return { app, mailer, database, adminPool };
         },
 

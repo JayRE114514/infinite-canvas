@@ -45,6 +45,7 @@ const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVI
 const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     workspaces: ["name", "slug", "status", "deleted_at", "updated_at"],
     workspace_invitations: ["status"],
+    // document_mode/deletion_receipt_id 不在可写列表：前者只在创建时由服务端写入，后者由触发器生成。
     canvases: ["title", "snapshot_json", "revision", "updated_by", "updated_at", "deleted_at"],
 };
 

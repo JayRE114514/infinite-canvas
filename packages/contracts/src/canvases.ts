@@ -53,12 +53,16 @@ export type CanvasSnapshot = JsonObject;
 export const CanvasRevisionSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 export type CanvasRevision = Static<typeof CanvasRevisionSchema>;
 
+export const CanvasDocumentModeSchema = Type.Union([Type.Literal("snapshot"), Type.Literal("collaborative")]);
+export type CanvasDocumentMode = Static<typeof CanvasDocumentModeSchema>;
+
 /** 列表只返回摘要，不含快照，避免一次请求传输全部画布内容；strict 保证摘要里混入 snapshot 会被判定为非法。 */
 export const CanvasSummarySchema = Type.Object(
     {
         id: CanvasIdSchema,
         workspaceId: WorkspaceIdSchema,
         title: CanvasTitleSchema,
+        documentMode: CanvasDocumentModeSchema,
         revision: CanvasRevisionSchema,
         createdAt: Type.String({ format: "date-time" }),
         updatedAt: Type.String({ format: "date-time" }),
@@ -74,6 +78,7 @@ export const CanvasSchema = Type.Object(
         workspaceId: WorkspaceIdSchema,
         title: CanvasTitleSchema,
         snapshot: CanvasSnapshotSchema,
+        documentMode: CanvasDocumentModeSchema,
         revision: CanvasRevisionSchema,
         createdAt: Type.String({ format: "date-time" }),
         updatedAt: Type.String({ format: "date-time" }),
@@ -81,6 +86,20 @@ export const CanvasSchema = Type.Object(
     { additionalProperties: false },
 );
 export type Canvas = Static<typeof CanvasSchema>;
+
+/**
+ * DELETE 响应：包含持久化的删除回执，允许调用方幂等地确认删除已完成。
+ * 首次删除和授权重放均返回同一字段值。
+ */
+export const CanvasDeletionReceiptSchema = Type.Object(
+    {
+        canvasId: CanvasIdSchema,
+        deletionReceipt: Type.String({ format: "uuid" }),
+        deletedAt: Type.String({ format: "date-time" }),
+    },
+    { additionalProperties: false },
+);
+export type CanvasDeletionReceipt = Static<typeof CanvasDeletionReceiptSchema>;
 
 /** 响应统一用 { canvas } / { canvases } 信封，后续 Task 2、Task 3 按该结构收发。 */
 export const CanvasResponseSchema = Type.Object({ canvas: CanvasSchema }, { additionalProperties: false });

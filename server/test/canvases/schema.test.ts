@@ -93,6 +93,12 @@ describe("canvas snapshot json contract", () => {
 });
 
 describe("canvas create contract", () => {
+    it("rejects a client supplied document mode on create and save", () => {
+        expect(Value.Check(CreateCanvasBodySchema, { title: "我的画布", documentMode: "snapshot" })).toBe(false);
+        expect(Value.Check(CreateCanvasBodySchema, { title: "我的画布", documentMode: "collaborative" })).toBe(false);
+        expect(Value.Check(SaveCanvasRequestSchema, { baseRevision: 0, snapshot: {}, documentMode: "collaborative" })).toBe(false);
+    });
+
     it("accepts a bounded title with an optional snapshot", () => {
         expect(Value.Check(CreateCanvasBodySchema, { title: "我的画布" })).toBe(true);
         expect(Value.Check(CreateCanvasBodySchema, { title: "我的画布", snapshot: { nodes: [] } })).toBe(true);
@@ -110,6 +116,7 @@ describe("canvas response contracts", () => {
         id: canvasId,
         workspaceId: "workspace-opaque-id",
         title: "我的画布",
+        documentMode: "snapshot" as const,
         revision: 2,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -186,6 +193,28 @@ describe("canvases table", () => {
         const checks = config.checks.map((constraint) => constraint.name);
         expect(checks).toEqual(
             expect.arrayContaining(["canvases_revision_non_negative", "canvases_revision_max_safe"]),
+        );
+    });
+
+    it("stores an immutable document mode defaulting to snapshot", () => {
+        expect(columns.get("document_mode")?.getSQLType()).toBe("text");
+        expect(columns.get("document_mode")?.notNull).toBe(true);
+        expect(columns.get("document_mode")?.default).toBe("snapshot");
+    });
+
+    it("stores a nullable unique deletion receipt", () => {
+        expect(columns.get("deletion_receipt_id")?.getSQLType()).toBe("uuid");
+        expect(columns.get("deletion_receipt_id")?.notNull).toBe(false);
+        expect(columns.get("deletion_receipt_id")?.hasDefault).toBe(false);
+
+        const uniques = config.uniqueConstraints.map((constraint) => constraint.name);
+        expect(uniques).toContain("canvases_deletion_receipt_unique");
+    });
+
+    it("constrains the mode enum and the deletion coherence pair", () => {
+        const checks = config.checks.map((constraint) => constraint.name);
+        expect(checks).toEqual(
+            expect.arrayContaining(["canvases_document_mode_check", "canvases_deletion_state_check"]),
         );
     });
 

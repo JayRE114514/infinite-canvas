@@ -27,6 +27,11 @@ const POLICY_PREREQUISITE_TAGS = [
     "0002_workspace-authority",
     "0003_transaction-context",
 ];
+const PRE_CANVAS_MODE_TAGS = [
+    ...POLICY_PREREQUISITE_TAGS,
+    "0004_tenant-rls",
+    "0005_workspace-provisioning-audit-fix",
+];
 
 let postgres: StartedRoleDatabase | undefined;
 const openPools: Pool[] = [];
@@ -107,6 +112,59 @@ async function migrationHistory(pool: Pool): Promise<MigrationHistoryRow[]> {
     return result.rows;
 }
 
+function postgresCode(error: unknown): string | undefined {
+    let current: unknown = error;
+    const seen = new Set<unknown>();
+    while (current && typeof current === "object" && !seen.has(current)) {
+        seen.add(current);
+        const value = current as Record<string, unknown>;
+        if (typeof value.code === "string") return value.code;
+        current = value.cause;
+    }
+    return undefined;
+}
+
+async function seedCanvasBackfillFixture(admin: Pool) {
+    const userId = randomUUID();
+    const workspaceId = randomUUID();
+    const activeCanvasId = randomUUID();
+    const deletedCanvasIds = [randomUUID(), randomUUID()];
+    const deletedAt = [new Date("2026-01-02T03:04:05.000Z"), new Date("2026-02-03T04:05:06.000Z")];
+
+    await admin.query("begin");
+    try {
+        await admin.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+            userId,
+            "canvas migration owner",
+            `canvas-migration-${userId}@example.com`,
+        ]);
+        await admin.query(
+            "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, $2, $3, 'team', $4, 'active')",
+            [workspaceId, "canvas migration workspace", `canvas-migration-${workspaceId}`, userId],
+        );
+        await admin.query(
+            "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
+            [randomUUID(), workspaceId, userId],
+        );
+        await admin.query(
+            "insert into public.canvases (id, workspace_id, title, snapshot_json) values ($1, $2, $3, $4::jsonb)",
+            [activeCanvasId, workspaceId, "active before 0006", JSON.stringify({ active: true })],
+        );
+        for (const [index, canvasId] of deletedCanvasIds.entries()) {
+            await admin.query(
+                "insert into public.canvases (id, workspace_id, title, snapshot_json, deleted_at) values ($1, $2, $3, $4::jsonb, $5)",
+                [canvasId, workspaceId, `deleted before 0006 ${index}`, JSON.stringify({ deleted: index }), deletedAt[index]],
+            );
+        }
+        await admin.query("commit");
+    } catch (error) {
+        await admin.query("rollback").catch(() => {});
+        throw error;
+    }
+
+    return { workspaceId, activeCanvasId, deletedCanvasIds, deletedAt };
+}
+
 beforeAll(async () => {
     postgres = await startRoleDatabase();
 }, 180_000);
@@ -149,11 +207,12 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4, snapshot5] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
             readSnapshot("0005"),
+            readSnapshot("0006"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -168,11 +227,19 @@ describe("immutable migration history", () => {
                 tag: "0005_workspace-provisioning-audit-fix",
                 breakpoints: true,
             },
+            {
+                idx: 6,
+                version: "7",
+                when: 1787900000000,
+                tag: "0006_canvas_document_mode",
+                breakpoints: true,
+            },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
         expect(snapshot4.prevId).toBe(snapshot3.id);
         expect(snapshot5.prevId).toBe(snapshot4.id);
+        expect(snapshot6.prevId).toBe(snapshot5.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -200,6 +267,34 @@ describe("immutable migration history", () => {
         const normalize = ({ id: _id, prevId: _prevId, ...snapshot }: typeof snapshot3) => snapshot;
         expect(normalize(snapshot4)).toEqual(normalize(snapshot3));
         expect(normalize(snapshot5)).toEqual(normalize(snapshot4));
+
+        // Canvas 的模式/回执列只在 0006 出现，0005 之前保持不变。
+        const canvases5 = snapshot5.tables["public.canvases"]!;
+        const canvases6 = snapshot6.tables["public.canvases"]!;
+        expect(Object.keys(canvases5.columns)).not.toContain("document_mode");
+        expect(Object.keys(canvases5.columns)).not.toContain("deletion_receipt_id");
+        expect(Object.keys(canvases5.checkConstraints)).not.toContain("canvases_document_mode_check");
+        expect(Object.keys(canvases5.checkConstraints)).not.toContain("canvases_deletion_state_check");
+        expect(Object.keys(canvases5.uniqueConstraints)).not.toContain("canvases_deletion_receipt_unique");
+        expect(Object.keys(canvases6.columns)).toEqual(expect.arrayContaining(["document_mode", "deletion_receipt_id"]));
+        expect(canvases6.checkConstraints.canvases_document_mode_check!.value).toBe(
+            "document_mode IN ('snapshot', 'collaborative')",
+        );
+        expect(canvases6.checkConstraints.canvases_deletion_state_check!.value).toBe(
+            "(deleted_at IS NULL) = (deletion_receipt_id IS NULL)",
+        );
+        expect(canvases6.uniqueConstraints.canvases_deletion_receipt_unique).toEqual({
+            name: "canvases_deletion_receipt_unique",
+            columns: ["deletion_receipt_id"],
+            nullsNotDistinct: false,
+        });
+
+        // 0006 只改 Canvas 一张表，其余表与 0005 完全一致。
+        const withoutCanvases = ({ id: _id, prevId: _prevId, tables, ...rest }: typeof snapshot5) => ({
+            ...rest,
+            tables: Object.fromEntries(Object.entries(tables).filter(([name]) => name !== "public.canvases")),
+        });
+        expect(withoutCanvases(snapshot6)).toEqual(withoutCanvases(snapshot5));
     });
 });
 
@@ -240,6 +335,191 @@ describe("fresh install as schema_owner", () => {
                 }
             })(),
         ).resolves.toBeUndefined();
+    }, 120_000);
+});
+
+describe("0006 populated Canvas upgrade", () => {
+    it("backfills deleted canvases and installs the final receipt boundary from a real 0005 schema", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_CANVAS_MODE_TAGS);
+        const fixture = await seedCanvasBackfillFixture(admin);
+
+        await runMigrations(roles().schemaOwner);
+
+        const rows = await admin.query<{
+            id: string;
+            document_mode: string;
+            deleted_at: Date | null;
+            deletion_receipt_id: string | null;
+        }>(
+            `select id, document_mode, deleted_at, deletion_receipt_id::text
+             from public.canvases where id = any($1::uuid[]) order by id`,
+            [[fixture.activeCanvasId, ...fixture.deletedCanvasIds]],
+        );
+        const byId = new Map(rows.rows.map((row) => [row.id, row]));
+        expect(byId.get(fixture.activeCanvasId)).toEqual({
+            id: fixture.activeCanvasId,
+            document_mode: "snapshot",
+            deleted_at: null,
+            deletion_receipt_id: null,
+        });
+        for (const [index, canvasId] of fixture.deletedCanvasIds.entries()) {
+            expect(byId.get(canvasId)).toEqual({
+                id: canvasId,
+                document_mode: "snapshot",
+                deleted_at: fixture.deletedAt[index],
+                deletion_receipt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+            });
+        }
+        expect(new Set(fixture.deletedCanvasIds.map((id) => byId.get(id)!.deletion_receipt_id)).size).toBe(2);
+
+        const invalidInsert = (columns: string, values: string, parameters: unknown[]) =>
+            admin.query(
+                `insert into public.canvases (id, workspace_id, title, snapshot_json, ${columns})
+                 values ($1, $2, $3, $4::jsonb, ${values})`,
+                [randomUUID(), fixture.workspaceId, "invalid post-0006 canvas", JSON.stringify({}), ...parameters],
+            );
+        // 隔离验证物理约束本身；应用角色永远没有禁用触发器的权限。
+        await admin.query("alter table public.canvases disable trigger canvases_enforce_deletion_receipt");
+        try {
+            await expect(invalidInsert("deleted_at", "$5", [new Date()])).rejects.toMatchObject({ code: "23514" });
+            await expect(invalidInsert("deletion_receipt_id", "$5", [randomUUID()])).rejects.toMatchObject({ code: "23514" });
+            await expect(invalidInsert("document_mode", "$5", ["invalid"])).rejects.toMatchObject({ code: "23514" });
+
+            const duplicateReceipt = randomUUID();
+            await invalidInsert("deleted_at, deletion_receipt_id", "$5, $6", [new Date(), duplicateReceipt]);
+            await expect(
+                invalidInsert("deleted_at, deletion_receipt_id", "$5, $6", [new Date(), duplicateReceipt]),
+            ).rejects.toMatchObject({ code: "23505" });
+        } finally {
+            await admin.query("alter table public.canvases enable trigger canvases_enforce_deletion_receipt");
+        }
+
+        const catalog = await admin.query(`
+            select c.relrowsecurity, c.relforcerowsecurity,
+                   pg_get_userbyid(p.proowner) as function_owner,
+                   p.prosecdef,
+                   p.proconfig,
+                   has_function_privilege('public', p.oid, 'EXECUTE') as public_execute,
+                   array(
+                       select con.conname::text
+                       from pg_constraint con
+                       where con.conrelid = c.oid
+                         and con.conname = any(array[
+                             'canvases_document_mode_check',
+                             'canvases_deletion_state_check',
+                             'canvases_deletion_receipt_unique'
+                         ])
+                       order by con.conname
+                   ) as constraints,
+                   exists (
+                       select 1 from pg_trigger t
+                       where t.tgrelid = c.oid
+                         and t.tgname = 'canvases_enforce_deletion_receipt'
+                         and t.tgenabled = 'O'
+                         and not t.tgisinternal
+                   ) as trigger_exists,
+                   has_column_privilege('app_api', c.oid, 'deleted_at', 'UPDATE') as can_update_deleted_at,
+                   has_column_privilege('app_api', c.oid, 'deletion_receipt_id', 'UPDATE') as can_update_receipt
+            from pg_class c
+            join pg_proc p on p.oid = 'public.enforce_canvas_deletion_receipt()'::regprocedure
+            where c.oid = 'public.canvases'::regclass
+        `);
+        expect(catalog.rows).toEqual([
+            {
+                relrowsecurity: true,
+                relforcerowsecurity: true,
+                function_owner: "schema_owner",
+                prosecdef: false,
+                proconfig: ["search_path=pg_catalog, public"],
+                public_execute: false,
+                constraints: [
+                    "canvases_deletion_receipt_unique",
+                    "canvases_deletion_state_check",
+                    "canvases_document_mode_check",
+                ],
+                trigger_exists: true,
+                can_update_deleted_at: true,
+                can_update_receipt: false,
+            },
+        ]);
+
+        const history = await migrationHistory(admin);
+        const entry = (await readJournal()).entries.find((candidate) => candidate.tag === "0006_canvas_document_mode")!;
+        expect(history.at(-1)).toMatchObject({
+            hash: migrationHash(await readMigrationSql(entry.tag)),
+            created_at: String(entry.when),
+        });
+    }, 120_000);
+
+    it("rolls the whole migration back on a mid-backfill fault and retries cleanly", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_CANVAS_MODE_TAGS);
+        const fixture = await seedCanvasBackfillFixture(admin);
+        const faultCanvasId = fixture.deletedCanvasIds[0]!;
+
+        await admin.query(`
+            create function public.test_fail_canvas_receipt_backfill()
+            returns trigger language plpgsql set search_path = pg_catalog, public
+            as $function$
+            begin
+                if old.id = '${faultCanvasId}'::uuid then
+                    raise exception 'injected 0006 backfill failure' using errcode = 'P0001';
+                end if;
+                return new;
+            end
+            $function$;
+            create trigger a_test_fail_canvas_receipt_backfill
+            before update on public.canvases
+            for each row execute function public.test_fail_canvas_receipt_backfill();
+        `);
+
+        let failure: unknown;
+        try {
+            await runMigrations(roles().schemaOwner);
+        } catch (error) {
+            failure = error;
+        }
+        expect(postgresCode(failure)).toBe("P0001");
+
+        const rolledBack = await admin.query(`
+            select c.relforcerowsecurity,
+                   array(
+                       select a.attname::text
+                       from pg_attribute a
+                       where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+                         and a.attname in ('document_mode', 'deletion_receipt_id')
+                       order by a.attname
+                   ) as new_columns
+            from pg_class c where c.oid = 'public.canvases'::regclass
+        `);
+        expect(rolledBack.rows).toEqual([{ relforcerowsecurity: true, new_columns: [] }]);
+        expect((await migrationHistory(admin)).at(-1)).toMatchObject({
+            hash: migrationHash(await readMigrationSql("0005_workspace-provisioning-audit-fix")),
+        });
+        const preserved = await admin.query("select deleted_at from public.canvases where id = $1", [faultCanvasId]);
+        expect(preserved.rows).toEqual([{ deleted_at: fixture.deletedAt[0] }]);
+
+        await admin.query("drop trigger a_test_fail_canvas_receipt_backfill on public.canvases");
+        await admin.query("drop function public.test_fail_canvas_receipt_backfill()");
+        await runMigrations(roles().schemaOwner);
+
+        const retried = await admin.query(
+            "select document_mode, deleted_at, deletion_receipt_id::text from public.canvases where id = $1",
+            [faultCanvasId],
+        );
+        expect(retried.rows).toEqual([
+            {
+                document_mode: "snapshot",
+                deleted_at: fixture.deletedAt[0],
+                deletion_receipt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+            },
+        ]);
+        expect((await migrationHistory(admin)).at(-1)).toMatchObject({
+            hash: migrationHash(await readMigrationSql("0006_canvas_document_mode")),
+        });
     }, 120_000);
 });
 

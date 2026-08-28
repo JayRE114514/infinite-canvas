@@ -37,6 +37,12 @@ function pool(candidate: Pool | undefined, name: string): Pool {
     return candidate;
 }
 
+/** 一次性容器管理员连接串，仅供编排型夹具使用。 */
+function adminUrl(): string {
+    if (!postgres) throw new Error("PostgreSQL container is not started");
+    return postgres.admin;
+}
+
 async function withRawApiContext<T>(
     userId: string,
     workspaceId: string | undefined,
@@ -609,5 +615,277 @@ describe("explicit grant matrix", () => {
         );
 
         expect(result.rows[0]).toEqual({ api: false, worker: false, maintenance: false, api_usage: true });
+    });
+});
+
+
+describe("canvas deletion receipt database invariant", () => {
+    // 独立空间与成员，避免提交的软删除画布影响其他用例的可见性断言。
+    const receiptUser = { id: "", email: "" };
+    let receiptWorkspace = "";
+
+    beforeAll(async () => {
+        const admin = new Pool({ connectionString: adminUrl(), max: 1 });
+        const client = await admin.connect();
+        try {
+            receiptUser.id = randomUUID();
+            receiptUser.email = "receipt-" + receiptUser.id.slice(0, 8) + "@example.com";
+            receiptWorkspace = randomUUID();
+            // 空间与其唯一活跃 owner 必须在同一事务内建立，否则触发完整性校验。
+            await client.query("begin");
+            await client.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+                receiptUser.id,
+                "receipt user",
+                receiptUser.email,
+            ]);
+            await client.query(
+                "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, $2, $3, 'team', $4, 'active')",
+                [receiptWorkspace, "receipt ws", "receipt-" + receiptWorkspace.slice(0, 8), receiptUser.id],
+            );
+            await client.query(
+                "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
+                [randomUUID(), receiptWorkspace, receiptUser.id],
+            );
+            await client.query("commit");
+        } catch (error) {
+            await client.query("rollback").catch(() => {});
+            throw error;
+        } finally {
+            client.release();
+            await admin.end().catch(() => {});
+        }
+    }, 60_000);
+
+    /** 编排型夹具走一次性容器管理员；行为断言始终经过真实 app_api。 */
+    async function freshCanvas(): Promise<string> {
+        const admin = new Pool({ connectionString: adminUrl(), max: 1 });
+        try {
+            const inserted = await admin.query(
+                "insert into public.canvases (workspace_id, title, snapshot_json) values ($1, $2, $3::jsonb) returning id",
+                [receiptWorkspace, "receipt-" + randomUUID().slice(0, 8), JSON.stringify({})],
+            );
+            return inserted.rows[0].id as string;
+        } finally {
+            await admin.end().catch(() => {});
+        }
+    }
+
+    /** 提交型上下文：显式 commit，让后续事务能观察已签发的回执。 */
+    async function commitAsApi<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+        const client = await pool(apiPool, "api").connect();
+        try {
+            await client.query("begin");
+            await client.query("select set_config($1, $2, true)", ["app.user_id", receiptUser.id]);
+            await client.query("select set_config($1, $2, true)", ["app.workspace_id", receiptWorkspace]);
+            const result = await work(client);
+            await client.query("commit");
+            return result;
+        } catch (error) {
+            await client.query("rollback").catch(() => {});
+            throw error;
+        } finally {
+            client.release();
+        }
+    }
+
+    async function attemptAsApi(text: string, values: unknown[]): Promise<void> {
+        await commitAsApi((client) => client.query(text, values));
+    }
+
+    async function readRow(canvasId: string) {
+        const admin = new Pool({ connectionString: adminUrl(), max: 1 });
+        try {
+            const r = await admin.query(
+                "select deletion_receipt_id::text as receipt, deleted_at::text as deleted_at, document_mode, revision::text as revision from public.canvases where id = $1",
+                [canvasId],
+            );
+            return r.rows[0];
+        } finally {
+            await admin.end().catch(() => {});
+        }
+    }
+
+    it("allows an active snapshot insert but denies app_api-supplied deletion lifecycle fields", async () => {
+        const activeCanvasId = await commitAsApi(async (client) => {
+            const inserted = await client.query<{ id: string }>(
+                `insert into public.canvases
+                    (workspace_id, title, snapshot_json, document_mode, created_by, updated_by)
+                 values ($1, $2, $3::jsonb, 'snapshot', $4, $4)
+                 returning id`,
+                [receiptWorkspace, "active app_api insert", JSON.stringify({}), receiptUser.id],
+            );
+            return inserted.rows[0]!.id;
+        });
+        expect(await readRow(activeCanvasId)).toMatchObject({ document_mode: "snapshot", receipt: null });
+
+        await expect(
+            commitAsApi((client) =>
+                client.query(
+                    `insert into public.canvases
+                        (id, workspace_id, title, snapshot_json, deleted_at, deletion_receipt_id)
+                     values ($1, $2, $3, $4::jsonb, now(), $5)`,
+                    [randomUUID(), receiptWorkspace, "forged deletion receipt", JSON.stringify({}), randomUUID()],
+                ),
+            ),
+        ).rejects.toMatchObject({ code: "23514" });
+    });
+
+    it("generates the receipt inside the trigger on the sole allowed null to non-null transition", async () => {
+        const canvasId = await freshCanvas();
+
+        // app_api 只写 deleted_at；回执不在其列授权中，只能由触发器签发。
+        const issued = await commitAsApi(async (client) => {
+            const r = await client.query(
+                "update public.canvases set deleted_at = now(), updated_at = now() where id = $1 returning deletion_receipt_id::text as receipt",
+                [canvasId],
+            );
+            return r.rows[0];
+        });
+        const stored = await readRow(canvasId);
+
+        expect(issued.receipt).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(stored.receipt).toBe(issued.receipt);
+        expect(stored.deleted_at).not.toBeNull();
+    });
+
+    it("rejects rewriting the receipt or the deletion timestamp after issuance", async () => {
+        const canvasId = await freshCanvas();
+        await attemptAsApi("update public.canvases set deleted_at = now() where id = $1", [canvasId]);
+        const issued = await readRow(canvasId);
+
+        await expect(
+            attemptAsApi("update public.canvases set deletion_receipt_id = gen_random_uuid() where id = $1", [canvasId]),
+        ).rejects.toMatchObject({ code: "42501" });
+        await expect(
+            attemptAsApi("update public.canvases set deleted_at = deleted_at + interval '1 second' where id = $1", [canvasId]),
+        ).rejects.toMatchObject({ code: "23514" });
+
+        // 两次拒绝之后存储态必须逐字节保持首次签发结果。
+        expect(await readRow(canvasId)).toEqual(issued);
+    });
+
+    it("rejects clearing the deletion pair so a deleted canvas cannot be resurrected", async () => {
+        const canvasId = await freshCanvas();
+        await attemptAsApi("update public.canvases set deleted_at = now() where id = $1", [canvasId]);
+        const issued = await readRow(canvasId);
+
+        await expect(
+            attemptAsApi("update public.canvases set deleted_at = null, deletion_receipt_id = null where id = $1", [canvasId]),
+        ).rejects.toMatchObject({ code: "42501" });
+
+        expect(await readRow(canvasId)).toEqual(issued);
+    });
+
+    // 管理员探针绕过 RLS/列授权，只验证触发器启用时的直接 DML；不声称能约束可修改触发器的超级用户。
+    it("enforces receipt immutability for privileged direct DML while the trigger remains enabled", async () => {
+        const canvasId = await freshCanvas();
+        await attemptAsApi("update public.canvases set deleted_at = now() where id = $1", [canvasId]);
+        const issued = await readRow(canvasId);
+
+        const admin = new Pool({ connectionString: adminUrl(), max: 1 });
+        try {
+            await expect(
+                admin.query("update public.canvases set deletion_receipt_id = gen_random_uuid() where id = $1", [canvasId]),
+            ).rejects.toMatchObject({ code: "23514" });
+            await expect(
+                admin.query("update public.canvases set deleted_at = null, deletion_receipt_id = null where id = $1", [canvasId]),
+            ).rejects.toMatchObject({ code: "23514" });
+            await expect(
+                admin.query("update public.canvases set deleted_at = now() + interval '1 day' where id = $1", [canvasId]),
+            ).rejects.toMatchObject({ code: "23514" });
+        } finally {
+            await admin.end().catch(() => {});
+        }
+
+        expect(await readRow(canvasId)).toEqual(issued);
+    });
+
+    it("overrides a caller-supplied first receipt so the database remains the sole issuer", async () => {
+        const canvasId = await freshCanvas();
+        const suppliedReceipt = randomUUID();
+        const admin = new Pool({ connectionString: adminUrl(), max: 1 });
+        try {
+            const result = await admin.query(
+                `update public.canvases
+                 set deleted_at = now(), deletion_receipt_id = $2
+                 where id = $1 returning deletion_receipt_id::text as receipt`,
+                [canvasId, suppliedReceipt],
+            );
+            expect(result.rows[0]?.receipt).toMatch(/^[0-9a-f-]{36}$/);
+            expect(result.rows[0]?.receipt).not.toBe(suppliedReceipt);
+        } finally {
+            await admin.end().catch(() => {});
+        }
+    });
+
+    it("still allows ordinary active canvas saves without inventing a receipt", async () => {
+        const canvasId = await freshCanvas();
+
+        const saved = await commitAsApi(async (client) => {
+            const r = await client.query(
+                "update public.canvases set title = $2, revision = revision + 1, updated_at = now() where id = $1 returning revision::text as revision, deletion_receipt_id is null as no_receipt",
+                [canvasId, "renamed"],
+            );
+            return r.rows[0];
+        });
+
+        expect(saved).toEqual({ revision: "1", no_receipt: true });
+    });
+
+    it("keeps document_mode and workspace_id denied and hard delete unavailable to app_api", async () => {
+        const canvasId = await freshCanvas();
+
+        await expect(
+            attemptAsApi("update public.canvases set document_mode = 'collaborative' where id = $1", [canvasId]),
+        ).rejects.toMatchObject({ code: "42501" });
+        await expect(
+            attemptAsApi("update public.canvases set workspace_id = $2 where id = $1", [canvasId, workspaceB]),
+        ).rejects.toMatchObject({ code: "42501" });
+        await expect(attemptAsApi("delete from public.canvases where id = $1", [canvasId])).rejects.toMatchObject({
+            code: "42501",
+        });
+
+        expect(await readRow(canvasId)).toMatchObject({ document_mode: "snapshot", receipt: null });
+    });
+
+    it("owns the trigger function by schema_owner with a fixed search path and no PUBLIC execute", async () => {
+        const result = await pool(apiPool, "api").query(`
+            select pg_get_userbyid(p.proowner) as owner,
+                   p.prosecdef,
+                   p.proconfig,
+                   has_function_privilege('public', p.oid, 'EXECUTE') as public_execute,
+                   t.tgname,
+                   t.tgtype
+            from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+            left join pg_trigger t on t.tgfoid = p.oid and not t.tgisinternal
+            where n.nspname = 'public' and p.proname = 'enforce_canvas_deletion_receipt'
+        `);
+
+        expect(result.rows).toEqual([
+            {
+                owner: "schema_owner",
+                prosecdef: false,
+                proconfig: ["search_path=pg_catalog, public"],
+                public_execute: false,
+                tgname: "canvases_enforce_deletion_receipt",
+                // BEFORE(2) + ROW(1) + INSERT(4) + UPDATE(16) = 23
+                tgtype: 23,
+            },
+        ]);
+    });
+
+    it("keeps canvases FORCE RLS and grants no app_api UPDATE on the receipt column", async () => {
+        const [rls, grant] = await Promise.all([
+            pool(apiPool, "api").query(
+                "select relrowsecurity, relforcerowsecurity from pg_class where oid = 'public.canvases'::regclass",
+            ),
+            pool(apiPool, "api").query(
+                "select has_column_privilege('app_api', 'public.canvases', 'deletion_receipt_id', 'UPDATE') as can_update",
+            ),
+        ]);
+
+        expect(rls.rows).toEqual([{ relrowsecurity: true, relforcerowsecurity: true }]);
+        expect(grant.rows).toEqual([{ can_update: false }]);
     });
 });

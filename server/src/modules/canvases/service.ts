@@ -1,5 +1,6 @@
 import type {
     Canvas,
+    CanvasDeletionReceipt,
     CanvasSnapshot,
     CanvasSummary,
     CreateCanvasBody,
@@ -13,7 +14,34 @@ import type { WorkspaceAccess } from "../workspaces/authorization.js";
 import { canvases } from "./schema.js";
 
 type CanvasRow = typeof canvases.$inferSelect;
-type CanvasSummaryRow = Pick<CanvasRow, "id" | "workspaceId" | "title" | "revision" | "createdAt" | "updatedAt">;
+type CanvasSummaryRow = Pick<CanvasRow, "id" | "workspaceId" | "title" | "documentMode" | "revision" | "createdAt" | "updatedAt">;
+
+/** 内部不变量错误：锁定后条件更新返回零行，属于实现错误而非用户请求错误。 */
+export class CanvasSaveInvariantError extends Error {
+    constructor(
+        readonly canvasId: string,
+        readonly workspaceId: string,
+        readonly expectedRevision: number,
+    ) {
+        super(`Canvas save invariant failed: id=${canvasId} workspace=${workspaceId} rev=${expectedRevision}`);
+        this.name = "CanvasSaveInvariantError";
+    }
+}
+
+/**
+ * 删除路径的内部不变量错误：锁定活跃行后条件更新仍返回零行或缺少触发器回执，
+ * 属于实现错误而非用户请求错误。诊断字段不复用 revision 语义。
+ */
+export class CanvasDeleteInvariantError extends Error {
+    constructor(
+        readonly canvasId: string,
+        readonly workspaceId: string,
+        readonly reason: "zero_row_update" | "missing_receipt",
+    ) {
+        super(`Canvas delete invariant failed: id=${canvasId} workspace=${workspaceId} reason=${reason}`);
+        this.name = "CanvasDeleteInvariantError";
+    }
+}
 
 function toCanvas(row: CanvasRow): Canvas {
     return {
@@ -21,6 +49,7 @@ function toCanvas(row: CanvasRow): Canvas {
         workspaceId: row.workspaceId,
         title: row.title,
         snapshot: row.snapshotJson as CanvasSnapshot,
+        documentMode: row.documentMode as "snapshot" | "collaborative",
         revision: row.revision,
         createdAt: row.createdAt.toISOString(),
         updatedAt: row.updatedAt.toISOString(),
@@ -32,6 +61,7 @@ function toCanvasSummary(row: CanvasSummaryRow): CanvasSummary {
         id: row.id,
         workspaceId: row.workspaceId,
         title: row.title,
+        documentMode: row.documentMode as "snapshot" | "collaborative",
         revision: row.revision,
         createdAt: row.createdAt.toISOString(),
         updatedAt: row.updatedAt.toISOString(),
@@ -44,6 +74,24 @@ function canvasNotFound(): AppError {
 
 function revisionConflict(): AppError {
     return new AppError("revision_conflict", 409, "画布已在其他位置更新");
+}
+
+/**
+ * 在同一 FOR UPDATE 锁下读行（含已删除行），不可见/跨租户返回 undefined。
+ * 已删除行由调用方根据需要处理。
+ */
+async function lockCanvas(
+    tx: AppTransaction,
+    access: WorkspaceAccess,
+    canvasId: string,
+): Promise<CanvasRow | undefined> {
+    const [row] = await tx
+        .select()
+        .from(canvases)
+        .where(and(eq(canvases.id, canvasId), eq(canvases.workspaceId, access.workspaceId)))
+        .for("update")
+        .limit(1);
+    return row;
 }
 
 async function findActiveCanvas(tx: AppTransaction, access: WorkspaceAccess, canvasId: string): Promise<CanvasRow> {
@@ -73,6 +121,7 @@ export async function createCanvas(
             workspaceId: access.workspaceId,
             title: input.title,
             snapshotJson: input.snapshot ?? {},
+            documentMode: "snapshot",
             createdBy: access.userId,
             updatedBy: access.userId,
         })
@@ -87,6 +136,7 @@ export async function listCanvases(tx: AppTransaction, access: WorkspaceAccess):
             id: canvases.id,
             workspaceId: canvases.workspaceId,
             title: canvases.title,
+            documentMode: canvases.documentMode,
             revision: canvases.revision,
             createdAt: canvases.createdAt,
             updatedAt: canvases.updatedAt,
@@ -102,16 +152,36 @@ export async function getCanvas(tx: AppTransaction, access: WorkspaceAccess, can
     return toCanvas(await findActiveCanvas(tx, access, canvasId));
 }
 
+/**
+ * saveCanvas 排他锁实现（Task 6 锁定顺序）：
+ * 1. FOR UPDATE 锁行（含已删除行）——不存在/跨租户 → 404
+ * 2. 已删除 → 404
+ * 3. mode 不是 snapshot → 409 canvas_document_mode_mismatch
+ * 4. revision 不匹配 → 409 revision_conflict（含 base=MAX 但存储非 MAX）
+ * 5. base=MAX 且存储=MAX → 409 canvas_revision_limit_reached
+ * 6. 条件更新含 id/workspace/mode/revision/not-deleted；零行 → CanvasSaveInvariantError
+ */
 export async function saveCanvas(
     tx: AppTransaction,
     access: WorkspaceAccess,
     canvasId: string,
     input: SaveCanvasRequest,
 ): Promise<Canvas> {
+    const locked = await lockCanvas(tx, access, canvasId);
+
+    // 不存在、跨租户不可见、或已软删除 → 404
+    if (!locked || locked.deletedAt !== null) throw canvasNotFound();
+
+    // mode 检查先于 revision 检查
+    if (locked.documentMode !== "snapshot") {
+        throw new AppError("canvas_document_mode_mismatch", 409, "画布文档模式不支持此操作");
+    }
+
+    if (locked.revision !== input.baseRevision) {
+        throw revisionConflict();
+    }
+
     if (input.baseRevision === Number.MAX_SAFE_INTEGER) {
-        // 上限只能由“已存到上限的活跃画布”触发；base 是上限但存储不是，仍属过期写入。
-        const current = await findActiveCanvas(tx, access, canvasId);
-        if (current.revision !== Number.MAX_SAFE_INTEGER) throw revisionConflict();
         throw new AppError("canvas_revision_limit_reached", 409, "画布版本已达到上限");
     }
 
@@ -128,6 +198,7 @@ export async function saveCanvas(
             and(
                 eq(canvases.id, canvasId),
                 eq(canvases.workspaceId, access.workspaceId),
+                sql`${canvases.documentMode} = 'snapshot'`,
                 eq(canvases.revision, input.baseRevision),
                 isNull(canvases.deletedAt),
             ),
@@ -136,15 +207,43 @@ export async function saveCanvas(
 
     if (saved) return toCanvas(saved);
 
-    await findActiveCanvas(tx, access, canvasId);
-    throw revisionConflict();
+    // 锁定后条件更新零行是内部不变量错误，不是用户冲突。
+    throw new CanvasSaveInvariantError(canvasId, access.workspaceId, input.baseRevision);
 }
 
-export async function softDeleteCanvas(tx: AppTransaction, access: WorkspaceAccess, canvasId: string): Promise<void> {
+/**
+ * deleteCanvas 返回持久化的删除回执（Task 6）：
+ * - 锁定 id+workspace 行（含已删除行）——不可见行 → 404
+ * - 活跃行：只写 deleted_at，回执由 BEFORE UPDATE 触发器生成并经 RETURNING 返回
+ * - 已删除行：幂等返回持久化回执，无第二次状态变更
+ * - 锁定后零行更新或缺少回执 → CanvasDeleteInvariantError
+ */
+export async function deleteCanvas(
+    tx: AppTransaction,
+    access: WorkspaceAccess,
+    canvasId: string,
+): Promise<CanvasDeletionReceipt> {
+    // 锁定行（含已删除）；不存在/跨租户 → 404。
+    const locked = await lockCanvas(tx, access, canvasId);
+    if (!locked) throw canvasNotFound();
+
+    // 已删除：幂等返回持久化回执。
+    if (locked.deletedAt !== null && locked.deletionReceiptId !== null) {
+        return {
+            canvasId: locked.id,
+            deletionReceipt: locked.deletionReceiptId,
+            deletedAt: locked.deletedAt.toISOString(),
+        };
+    }
+
     const now = new Date();
     const [deleted] = await tx
         .update(canvases)
-        .set({ deletedAt: now, updatedAt: now, updatedBy: access.userId })
+        .set({
+            deletedAt: now,
+            updatedAt: now,
+            updatedBy: access.userId,
+        })
         .where(
             and(
                 eq(canvases.id, canvasId),
@@ -152,13 +251,17 @@ export async function softDeleteCanvas(tx: AppTransaction, access: WorkspaceAcce
                 isNull(canvases.deletedAt),
             ),
         )
-        .returning({ id: canvases.id });
-    if (deleted) return;
+        .returning({ id: canvases.id, deletedAt: canvases.deletedAt, deletionReceiptId: canvases.deletionReceiptId });
 
-    const [existing] = await tx
-        .select({ id: canvases.id })
-        .from(canvases)
-        .where(and(eq(canvases.id, canvasId), eq(canvases.workspaceId, access.workspaceId)))
-        .limit(1);
-    if (!existing) throw canvasNotFound();
+    // 回执由 BEFORE UPDATE 触发器生成，这里只通过 RETURNING 接收权威值。
+    if (!deleted) throw new CanvasDeleteInvariantError(canvasId, access.workspaceId, "zero_row_update");
+    if (deleted.deletedAt === null || deleted.deletionReceiptId === null) {
+        throw new CanvasDeleteInvariantError(canvasId, access.workspaceId, "missing_receipt");
+    }
+
+    return {
+        canvasId: deleted.id,
+        deletionReceipt: deleted.deletionReceiptId,
+        deletedAt: deleted.deletedAt.toISOString(),
+    };
 }
