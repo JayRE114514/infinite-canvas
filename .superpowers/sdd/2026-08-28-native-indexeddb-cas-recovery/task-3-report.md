@@ -147,3 +147,48 @@ Public types, outcome shapes and the 12-case count are unchanged.
   fail-closed contract and the per-draft CAS must not be relaxed to make those easier.
 - `store.ts` sits inside `src/**` and so inside the `web/tsconfig.json` program, but no typecheck
   was run here by instruction.
+
+## Fix round 1 — locale-independent draftId tiebreak
+
+Independent acceptance round 1/2 returned NOT APPROVED with C0/I0/M1. M1 identified that the
+default-locale `draftId.localeCompare` tiebreak could order identical stored rows differently
+across browsers, OS locales or locale changes. No other correction was authorized or made.
+
+The existing expanded-year/ordering `it` case remains one of 12 and now writes `"A"` and
+`"a"` with the same `savedAt`. The literal expected order puts `"A"` before `"a"`, as
+required by UTF-16 code-unit comparison. Under the current `en-US` runtime, default collation
+instead puts `"a"` first, so the regression is observable rather than theoretical.
+
+### Fix-round RED
+
+After extending the existing test and before changing production, the required focused command
+failed exactly the ordering case:
+
+```
+ Test Files  1 failed (1)
+      Tests  1 failed | 11 passed (12)
+AssertionError: expected [ 'd3', 'd1', 'a', 'A', 'd2' ]
+            to deeply equal [ 'd3', 'd1', 'A', 'a', 'd2' ]
+```
+
+### Fix-round GREEN
+
+`readScopeDrafts` now uses the explicit locale-independent comparator
+`a.draftId < b.draftId ? -1 : a.draftId > b.draftId ? 1 : 0` after the chronological
+`savedAt` comparison. The same focused command then passed:
+
+```
+ Test Files  1 passed (1)
+      Tests  12 passed (12)
+```
+
+### Restored mutation evidence
+
+Temporarily changing the tiebreak back to `a.draftId.localeCompare(b.draftId)` made the same
+mixed-case assertion red with 1 failed / 11 passed and the received `["d3", "d1", "a", "A",
+"d2"]`. The UTF-16 code-unit comparator was restored and the focused suite returned to 12/12.
+Only the restored comparator is committed.
+
+The only test command run in this fix pass was:
+`cd web && ./node_modules/.bin/vitest run src/services/canvas-recovery/store-draft.test.ts`.
+No build, typecheck, dev server, browser automation or broader suite was run.

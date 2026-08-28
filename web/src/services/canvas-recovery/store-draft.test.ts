@@ -59,9 +59,17 @@ describe("draft writeSeq CAS", () => {
             status: "written",
             writeSeq: 1,
         });
+        const tiedSavedAt = new Date(5_000).toISOString();
+        for (const draftId of ["A", "a"]) {
+            expect(await store.upsertDraft({ scopeId: scopeA, draftId, writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope: envelope(draftId), savedAt: tiedSavedAt })).toEqual({
+                status: "written",
+                writeSeq: 1,
+            });
+        }
         const snapshot = await store.readOpenSnapshot(scopeA);
         if (snapshot.status !== "ok") throw new Error("expected ok");
-        expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["d3", "d1", "d2"]);
+        // Equal instants use locale-independent UTF-16 code-unit order: "A" precedes "a".
+        expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["d3", "d1", "A", "a", "d2"]);
     });
 
     it("never advances coordinationRevision on an ordinary draft write", async () => {

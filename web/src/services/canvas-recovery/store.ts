@@ -61,9 +61,9 @@ async function readScopeDrafts(txn: RecoveryTxn, scopeId: RecoveryScopeId): Prom
     /**
      * Newest first by INSTANT, not by string order: the canonical-timestamp boundary accepts
      * toISOString's expanded-year form, whose "+275760-" prefix sorts below "1970-".
-     * draftId breaks ties so the same stored rows always produce the same recovery order.
+     * UTF-16 code-unit draftId order breaks ties identically across runtimes and locales.
      */
-    return drafts.sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt) || a.draftId.localeCompare(b.draftId));
+    return drafts.sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt) || (a.draftId < b.draftId ? -1 : a.draftId > b.draftId ? 1 : 0));
 }
 
 export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRecoveryStore {
