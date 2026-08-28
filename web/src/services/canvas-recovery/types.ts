@@ -66,7 +66,8 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
 };
-const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+/** The single safe-count boundary: epochs, revisions, generations and writeSeq all use it. */
+export const isRecoveryCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const isIsoDate = (value: unknown): value is string => {
     if (typeof value !== "string") return false;
     const date = new Date(value);
@@ -136,7 +137,7 @@ function isAssetMapping(value: unknown): value is CanvasAssetMapping {
 export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecoveryEpoch | null {
     if (!isRecord(value) || value.scopeId !== scopeId) return null;
     const { coordinationRevision, deletionGeneration, tombstonedAt } = value;
-    if (!isCount(coordinationRevision) || !isCount(deletionGeneration)) return null;
+    if (!isRecoveryCount(coordinationRevision) || !isRecoveryCount(deletionGeneration)) return null;
     if (tombstonedAt !== null && !isIsoDate(tombstonedAt)) return null;
     return { scopeId, coordinationRevision, deletionGeneration, tombstonedAt: tombstonedAt as string | null };
 }
@@ -144,7 +145,7 @@ export function asEpoch(value: unknown, scopeId: RecoveryScopeId): CanvasRecover
 function asEnvelope(value: unknown): CanvasDraftEnvelope | null {
     if (!isRecord(value) || !isRecord(value.document) || !isRecord(value.localUi) || !isAssetMapping(value.assets)) return null;
     const { title, baseRevision, snapshot } = value.document;
-    if (typeof title !== "string" || !isCount(baseRevision) || !isJsonObject(snapshot)) return null;
+    if (typeof title !== "string" || !isRecoveryCount(baseRevision) || !isJsonObject(snapshot)) return null;
     const viewport = (value.localUi as { viewport?: unknown }).viewport;
     if (!isRecord(viewport) || !isFiniteNumber(viewport.x) || !isFiniteNumber(viewport.y) || !isFiniteNumber(viewport.k) || viewport.k <= 0) return null;
     return value as CanvasDraftEnvelope;
@@ -153,7 +154,7 @@ function asEnvelope(value: unknown): CanvasDraftEnvelope | null {
 export function asDraftRecord(value: unknown, scopeId: RecoveryScopeId): CanvasDraftRecord | null {
     if (!isRecord(value) || value.scopeId !== scopeId) return null;
     const { draftId, writeSeq, deletionGeneration, state, savedAt } = value;
-    if (typeof draftId !== "string" || !draftId || !isCount(writeSeq) || !isCount(deletionGeneration)) return null;
+    if (typeof draftId !== "string" || !draftId || !isRecoveryCount(writeSeq) || !isRecoveryCount(deletionGeneration)) return null;
     if ((state !== "pending" && state !== "synced") || !isIsoDate(savedAt) || !asEnvelope(value.envelope)) return null;
     return value as CanvasDraftRecord;
 }
@@ -163,7 +164,7 @@ export function asMarkerRecord(value: unknown, scopeId: RecoveryScopeId): Canvas
     const { entries } = value;
     if (!Array.isArray(entries) || entries.length > MAX_CONFLICT_MARKER_ENTRIES) return null;
     const materialized = Array.from(entries);
-    const valid = materialized.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isCount(entry.baseRevision) && isIsoDate(entry.savedAt));
+    const valid = materialized.every((entry) => isRecord(entry) && typeof entry.draftId === "string" && Boolean(entry.draftId) && isRecoveryCount(entry.baseRevision) && isIsoDate(entry.savedAt));
     if (!valid) return null;
     if (new Set(materialized.map((entry) => (entry as CanvasConflictMarkerEntry).draftId)).size !== entries.length) return null;
     return value as CanvasConflictMarkerRecord;

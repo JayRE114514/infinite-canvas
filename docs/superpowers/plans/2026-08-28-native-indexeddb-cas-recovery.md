@@ -1472,20 +1472,26 @@ Create `web/src/services/canvas-recovery/store-coordination.test.ts`:
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { freshIndexedDB } from "../../../test/setup-indexeddb";
-import { createRecoveryDatabase, DRAFTS_STORE, MARKERS_STORE } from "./database";
+import { createRecoveryDatabase, DRAFTS_STORE, EPOCHS_STORE, MARKERS_STORE, SCOPE_INDEX } from "./database";
 import { buildRecoveryScopeId } from "./scope";
 import { createCanvasRecoveryStore, createLazyBrowserRecoveryStore, type CanvasRecoveryStore } from "./store";
-import { CONFLICT_MARKER_ID, type CanvasDraftEnvelope } from "./types";
+import { CONFLICT_MARKER_ID, type CanvasConflictMarkerEntry, type CanvasDraftEnvelope } from "./types";
 
 const scopeA = buildRecoveryScopeId({ kind: "account", userId: "u1", workspaceId: "w1", canvasId: "c1" })!;
 const scopeB = buildRecoveryScopeId({ kind: "account", userId: "u2", workspaceId: "w1", canvasId: "c1" })!;
 const DAY = 24 * 60 * 60 * 1_000;
 const SIX_HOURS = 6 * 60 * 60 * 1_000;
 
-const envelope: CanvasDraftEnvelope = { document: { title: "T", baseRevision: 1, snapshot: { nodes: [], connections: [] } as never }, localUi: { viewport: { x: 0, y: 0, k: 1 } }, assets: {} };
+const makeEnvelope = (title = "T"): CanvasDraftEnvelope => ({
+    document: { title, baseRevision: 1, snapshot: { nodes: [], connections: [] } as never },
+    localUi: { viewport: { x: 0, y: 0, k: 1 } },
+    assets: {},
+});
+const envelope: CanvasDraftEnvelope = makeEnvelope();
 const write = (store: CanvasRecoveryStore, scopeId: typeof scopeA, draftId: string, writeSeq: number, savedAtMs: number) =>
     store.upsertDraft({ scopeId, draftId, writeSeq, expectedDeletionGeneration: 0, state: "pending", envelope, savedAt: new Date(savedAtMs).toISOString() });
-const entry = (draftId: string) => ({ draftId, baseRevision: 1, savedAt: new Date(0).toISOString() });
+const entry = (draftId: string): CanvasConflictMarkerEntry => ({ draftId, baseRevision: 1, savedAt: new Date(0).toISOString() });
+const corrupt = { status: "unavailable", reason: "corrupt" } as const;
 
 describe("coordination, deletion and gc CAS", () => {
     let factory: IDBFactory;
@@ -1499,11 +1505,26 @@ describe("coordination, deletion and gc CAS", () => {
     it("writes the marker and deletes drafts atomically, advancing coordinationRevision by one", async () => {
         await write(store, scopeA, "d1", 1, 0);
         await write(store, scopeA, "d2", 1, 0);
-        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("d1")], deleteDraftIds: ["d2"] })).toEqual({ status: "committed", coordinationRevision: 1 });
+        /**
+         * The caller keeps references to both arrays. Everything is detached synchronously before
+         * the first await, so these post-call mutations cannot reach storage while the open and
+         * epoch requests are still pending.
+         */
+        const markerInput = [entry("d1")];
+        const deleteInput = ["d2"];
+        const pending = store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: markerInput, deleteDraftIds: deleteInput });
+        markerInput.push(entry("hijack"));
+        markerInput[0].draftId = "hijacked";
+        markerInput[0].baseRevision = 999;
+        deleteInput.push("d1");
+        await Promise.resolve();
+        markerInput[0].savedAt = "not-a-date";
+        deleteInput.push("d1");
+        expect(await pending).toEqual({ status: "committed", coordinationRevision: 1 });
 
         const snapshot = await store.readOpenSnapshot(scopeA);
         if (snapshot.status !== "ok") throw new Error("expected ok");
-        expect(snapshot.snapshot.marker?.entries.map((item) => item.draftId)).toEqual(["d1"]);
+        expect(snapshot.snapshot.marker?.entries).toEqual([entry("d1")]);
         expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["d1"]);
         expect(snapshot.snapshot.epoch.coordinationRevision).toBe(1);
         // Coordination must never write a tombstone or touch the deletion generation.
@@ -1534,12 +1555,20 @@ describe("coordination, deletion and gc CAS", () => {
             return 0;
         });
 
-        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, marker: null, deleteDraftIds: ["d1", "bad"] })).toEqual({ status: "unavailable", reason: "corrupt" });
+        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, marker: null, deleteDraftIds: ["d1", "bad"] })).toEqual(corrupt);
+        // Unusable delete targets are refused before the transaction opens, so no write happens either.
+        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, marker: null, deleteDraftIds: [""] })).toEqual(corrupt);
+        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, marker: null, deleteDraftIds: [7 as never] })).toEqual(corrupt);
+
         const after = await store.readOpenSnapshot(scopeA);
         if (after.status !== "ok") throw new Error("expected ok");
         expect(after.snapshot.marker?.entries[0].draftId).toBe("d1");
         expect(after.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["d1"]);
         expect(after.snapshot.epoch.coordinationRevision).toBe(1);
+        const raw = await database.run("readonly", [DRAFTS_STORE], 2_000, (txn) => txn.req(txn.store(DRAFTS_STORE).get([scopeA, "bad"])));
+        if (raw.status !== "ok") throw new Error("expected ok");
+        // The corrupt row is preserved: only confirmed deletion may clear it.
+        expect((raw.value as { writeSeq: unknown }).writeSeq).toBe("unknown");
         database.close();
     });
 
@@ -1550,6 +1579,26 @@ describe("coordination, deletion and gc CAS", () => {
         }
         // The private write carries no coordination expectation, so it is not starved.
         expect(await write(store, scopeA, "mine", 2, 1_000)).toEqual({ status: "written", writeSeq: 2 });
+
+        /**
+         * The envelope is detached and validated synchronously before the first await, so a caller
+         * mutating it while the write is in flight cannot persist a row a later open would skip.
+         */
+        const mutable = makeEnvelope("original");
+        const pending = store.upsertDraft({ scopeId: scopeA, draftId: "mine", writeSeq: 3, expectedDeletionGeneration: 0, state: "pending", envelope: mutable, savedAt: new Date(2_000).toISOString() });
+        mutable.document.title = "MUTATED";
+        mutable.document.baseRevision = -5;
+        mutable.assets = "not-an-asset-map" as never;
+        await Promise.resolve();
+        mutable.localUi.viewport.k = 0;
+        expect(await pending).toEqual({ status: "written", writeSeq: 3 });
+
+        const snapshot = await store.readOpenSnapshot(scopeA);
+        if (snapshot.status !== "ok") throw new Error("expected ok");
+        const stored = snapshot.snapshot.drafts.find((draft) => draft.draftId === "mine");
+        expect(stored?.envelope).toEqual(makeEnvelope("original"));
+        // An uncloneable envelope is a controlled corrupt outcome, never a thrown DataCloneError.
+        expect(await store.upsertDraft({ scopeId: scopeA, draftId: "mine", writeSeq: 4, expectedDeletionGeneration: 0, state: "pending", envelope: { ...makeEnvelope(), onSave: () => undefined } as never, savedAt: new Date(3_000).toISOString() })).toEqual(corrupt);
     });
 
     it("confirms deletion in one transaction: generation bump, tombstone, drafts and markers gone", async () => {
@@ -1559,6 +1608,8 @@ describe("coordination, deletion and gc CAS", () => {
         await database.run("readwrite", [DRAFTS_STORE, MARKERS_STORE], 2_000, async (txn) => {
             await txn.req(txn.store(DRAFTS_STORE).put({ scopeId: scopeA, draftId: "corrupt", writeSeq: "unknown", deletionGeneration: 0, state: "pending", envelope: {}, savedAt: "broken" }));
             await txn.req(txn.store(MARKERS_STORE).put({ scopeId: scopeA, markerId: CONFLICT_MARKER_ID, entries: [{ draftId: "missing-fields" }] }));
+            /** A corrupt row under a noncanonical marker id must not survive a confirmed deletion. */
+            await txn.req(txn.store(MARKERS_STORE).put({ scopeId: scopeA, markerId: "legacy-residue", entries: "broken" }));
             return 0;
         });
         expect(await store.confirmDeletion(scopeA, 0, 1_000)).toEqual({ status: "tombstoned", deletionGeneration: 1 });
@@ -1574,8 +1625,21 @@ describe("coordination, deletion and gc CAS", () => {
 
     it("keeps the tombstone idempotent and blocks a late write from resurrecting the canvas", async () => {
         await write(store, scopeA, "d1", 1, 0);
+        /**
+         * A generation mismatch on a NON-tombstoned epoch cannot happen under valid state, because
+         * only this operation advances the generation and it always writes the tombstone with it.
+         * It is therefore corrupt state and must not delete anything.
+         */
+        expect(await store.confirmDeletion(scopeA, 1, 500)).toEqual(corrupt);
+        const intact = await store.readOpenSnapshot(scopeA);
+        if (intact.status !== "ok") throw new Error("expected ok");
+        expect(intact.snapshot.drafts).toHaveLength(1);
+        expect(intact.snapshot.epoch).toEqual({ scopeId: scopeA, coordinationRevision: 0, deletionGeneration: 0, tombstonedAt: null });
+
         expect(await store.confirmDeletion(scopeA, 0, 1_000)).toEqual({ status: "tombstoned", deletionGeneration: 1 });
+        // A present tombstone alone means already-tombstoned, whatever generation the caller expected.
         expect(await store.confirmDeletion(scopeA, 0, 2_000)).toEqual({ status: "already-tombstoned" });
+        expect(await store.confirmDeletion(scopeA, 1, 2_000)).toEqual({ status: "already-tombstoned" });
         // A session that captured generation 0 before the delete must be refused.
         expect(await write(store, scopeA, "d1", 50, 5_000)).toEqual({ status: "tombstoned" });
         expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, marker: [entry("d1")] })).toEqual({ status: "tombstoned" });
@@ -1589,7 +1653,13 @@ describe("coordination, deletion and gc CAS", () => {
         await write(store, scopeA, "recent", 1, now - 60_000);
         await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("referenced")] });
 
-        expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, keepDraftIds: ["live"], now, minAgeMs: SIX_HOURS })).toEqual({ status: "committed", coordinationRevision: 2 });
+        /** The keep list is snapshotted before the first await, so a later mutation cannot widen GC. */
+        const keepInput = ["live"];
+        const pending = store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, keepDraftIds: keepInput, now, minAgeMs: SIX_HOURS });
+        keepInput.length = 0;
+        await Promise.resolve();
+        keepInput.push("stale");
+        expect(await pending).toEqual({ status: "committed", coordinationRevision: 2 });
 
         const snapshot = await store.readOpenSnapshot(scopeA);
         if (snapshot.status !== "ok") throw new Error("expected ok");
@@ -1622,22 +1692,62 @@ describe("coordination, deletion and gc CAS", () => {
         expect(otherIdentity.snapshot.epoch).toEqual({ scopeId: scopeB, coordinationRevision: 0, deletionGeneration: 0, tombstonedAt: null });
     });
 
-    it("rejects a marker that would exceed the shared entry cap", async () => {
+    it("refuses marker overflow, unsafe epoch increments and invalid primitive input without any write", async () => {
         await write(store, scopeA, "d1", 1, 0);
-        const result = await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("d1"), entry("d2"), entry("d3")] });
-        expect(result).toEqual({ status: "unavailable", reason: "corrupt" });
+        const capped = await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("d1"), entry("d2"), entry("d3")] });
+        expect(capped).toEqual(corrupt);
+        // An uncloneable marker entry is contained as corrupt, never thrown.
+        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [{ ...entry("d1"), onWrite: () => undefined } as never] })).toEqual(corrupt);
         const snapshot = await store.readOpenSnapshot(scopeA);
         if (snapshot.status !== "ok") throw new Error("expected ok");
         expect(snapshot.snapshot.marker).toBeNull();
         expect(snapshot.snapshot.epoch.coordinationRevision).toBe(0);
+
+        /** An epoch parked at the safe-integer ceiling must never be advanced past what asEpoch accepts. */
+        const database = createRecoveryDatabase(factory);
+        const ceiling = { scopeId: scopeA, coordinationRevision: Number.MAX_SAFE_INTEGER, deletionGeneration: Number.MAX_SAFE_INTEGER, tombstonedAt: null };
+        await database.run("readwrite", [EPOCHS_STORE], 2_000, async (txn) => txn.req(txn.store(EPOCHS_STORE).put(ceiling)));
+        const atCeiling = { scopeId: scopeA, expectedCoordinationRevision: Number.MAX_SAFE_INTEGER, expectedDeletionGeneration: Number.MAX_SAFE_INTEGER } as const;
+        expect(await store.commitCoordination({ ...atCeiling, marker: [entry("d1")] })).toEqual(corrupt);
+        expect(await store.collectGarbage({ ...atCeiling, keepDraftIds: [], now: 10 * DAY, minAgeMs: SIX_HOURS })).toEqual(corrupt);
+        expect(await store.confirmDeletion(scopeA, Number.MAX_SAFE_INTEGER, 1_000)).toEqual(corrupt);
+
+        /** Primitive inputs that steer destructive behaviour are refused before any transaction opens. */
+        for (const revision of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
+            expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: revision, expectedDeletionGeneration: 0, marker: null })).toEqual(corrupt);
+            expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: revision, keepDraftIds: [], now: 0, minAgeMs: 0 })).toEqual(corrupt);
+            expect(await store.confirmDeletion(scopeA, revision, 1_000)).toEqual(corrupt);
+        }
+        for (const bad of [{ now: -1, minAgeMs: 0 }, { now: Number.NaN, minAgeMs: 0 }, { now: 0, minAgeMs: Number.NaN }, { now: 0, minAgeMs: -1 }, { now: Number.POSITIVE_INFINITY, minAgeMs: 0 }]) {
+            expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, keepDraftIds: [], ...bad })).toEqual(corrupt);
+        }
+        for (const now of [Number.NaN, 9e15, -9e15, Number.POSITIVE_INFINITY]) expect(await store.confirmDeletion(scopeA, 0, now)).toEqual(corrupt);
+        expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, keepDraftIds: ["" as string], now: 0, minAgeMs: 0 })).toEqual(corrupt);
+
+        const epochRow = await database.run("readonly", [EPOCHS_STORE], 2_000, (txn) => txn.req(txn.store(EPOCHS_STORE).get(scopeA)));
+        const rows = await database.run("readonly", [DRAFTS_STORE], 2_000, (txn) => txn.req(txn.store(DRAFTS_STORE).index(SCOPE_INDEX).getAll(scopeA)));
+        if (epochRow.status !== "ok" || rows.status !== "ok") throw new Error("expected ok");
+        // No partial write anywhere: the epoch and the draft are exactly as they were.
+        expect(epochRow.value).toEqual(ceiling);
+        expect((rows.value as Array<{ draftId: string }>).map((row) => row.draftId)).toEqual(["d1"]);
+        database.close();
     });
 
     it("imports safely without ambient IndexedDB and fails only when the lazy browser store is called", async () => {
         expect(globalThis.indexedDB).toBeUndefined();
         const lazy = createLazyBrowserRecoveryStore();
-        expect(await lazy.readOpenSnapshot(scopeA)).toEqual({ status: "unavailable", reason: "unsupported" });
+        const unsupported = { status: "unavailable", reason: "unsupported" } as const;
+        expect(await lazy.readOpenSnapshot(scopeA)).toEqual(unsupported);
+        expect(await lazy.upsertDraft({ scopeId: scopeA, draftId: "d1", writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope, savedAt: new Date(0).toISOString() })).toEqual(unsupported);
+        expect(await lazy.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: null })).toEqual(unsupported);
+        expect(await lazy.confirmDeletion(scopeA, 0, 0)).toEqual(unsupported);
+        expect(await lazy.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, keepDraftIds: [], now: 0, minAgeMs: 0 })).toEqual(unsupported);
         // Construction and import are side-effect free; close is safe even when no database was created.
         expect(() => lazy.close()).not.toThrow();
+        // An injected factory makes the same lazy store fully functional.
+        const injected = createLazyBrowserRecoveryStore(() => factory);
+        expect(await injected.upsertDraft({ scopeId: scopeA, draftId: "d1", writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope, savedAt: new Date(0).toISOString() })).toEqual({ status: "written", writeSeq: 1 });
+        injected.close();
     });
 });
 ```
@@ -1649,7 +1759,44 @@ Expected: FAIL with "commitCoordination is not a function" (and the same for `co
 
 - [ ] **Step 3: Add the three operations to store.ts**
 
-Extend the imports at the top of `web/src/services/canvas-recovery/store.ts`: `DRAFT_GC_MIN_AGE_MS` is *not* needed here because the caller passes `minAgeMs`; import `MAX_CONFLICT_MARKER_ENTRIES` and the `CanvasConflictMarkerEntry` / `CanvasCoordinationOutcome` / `CanvasDeletionOutcome` types from `./types`. Do not import marker limits from canvas-sync. Then add these types and the three members:
+Extend the imports at the top of `web/src/services/canvas-recovery/store.ts`: `DRAFT_GC_MIN_AGE_MS` is *not* needed here because the caller passes `minAgeMs`; import `MAX_CONFLICT_MARKER_ENTRIES`, the shared `isRecoveryCount` count predicate and the `CanvasConflictMarkerEntry` / `CanvasCoordinationOutcome` / `CanvasDeletionOutcome` types from `./types`, plus `createRecoveryDatabase` and `SCOPE_INDEX` from `./database`. Do not import marker limits from canvas-sync, and do not redefine a local count/date validator: Task 2's boundary is the single source.
+
+First add the shared destructive-write guards. `detach` is what makes every operation caller-race-proof, and `nextEpoch` is what makes every increment overflow-proof:
+
+```ts
+const CORRUPT = { status: "unavailable", reason: "corrupt" } as const;
+/** The widest instant Date can represent; anything beyond it has no canonical ISO form. */
+const MAX_TIME_VALUE_MS = 8.64e15;
+
+/**
+ * Caller-owned data is detached HERE, synchronously, before the first await. A caller that keeps a
+ * reference and mutates it while an open or epoch request is still pending therefore cannot change
+ * what this transaction validates or stores. An uncloneable value is a controlled corrupt outcome,
+ * never an escaping DataCloneError.
+ */
+function detach<T>(value: T): T | null {
+    try {
+        return structuredClone(value);
+    } catch {
+        return null;
+    }
+}
+
+const isDraftId = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+/** Milliseconds that steer destructive age comparisons must be real, nonnegative and usable. */
+const isElapsedMs = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+/**
+ * Every epoch this store writes passes the SAME validator that rejects epochs on read, so an
+ * increment at the safe-integer ceiling is refused instead of persisting a row a later open would
+ * treat as corrupt. Callers must run this before their first write to stay all-or-nothing.
+ */
+function nextEpoch(epoch: CanvasRecoveryEpoch, changes: Partial<CanvasRecoveryEpoch>): CanvasRecoveryEpoch | null {
+    return asEpoch({ ...epoch, ...changes }, epoch.scopeId);
+}
+```
+
+Task 3's `upsertDraft` must also detach: wrap its candidate object in `detach(...)` and validate that clone (`const record = candidate && asDraftRecord(candidate, input.scopeId)`), so a caller mutating the envelope while the epoch read is pending cannot persist a row a later open would skip. Then add these types and the three members:
 
 ```ts
 export type CanvasCoordinationInput = {
@@ -1680,11 +1827,18 @@ Add to the object returned by `createCanvasRecoveryStore`:
  * It never writes a tombstone and never touches deletionGeneration.
  */
 commitCoordination: async (input, signal) => {
+    if (!isRecoveryCount(input.expectedCoordinationRevision) || !isRecoveryCount(input.expectedDeletionGeneration)) return CORRUPT;
+    /** Detached and validated BEFORE the first await: the caller cannot mutate what gets stored. */
+    let marker: CanvasConflictMarkerRecord | null = null;
+    if (input.marker) {
+        const cloned = detach(input.marker);
+        const candidate = cloned && asMarkerRecord({ scopeId: input.scopeId, markerId: CONFLICT_MARKER_ID, entries: cloned }, input.scopeId);
+        if (!candidate || candidate.entries.length > MAX_CONFLICT_MARKER_ENTRIES) return CORRUPT;
+        marker = candidate;
+    }
+    const deleteDraftIds = detach(input.deleteDraftIds ?? []);
+    if (!deleteDraftIds || !deleteDraftIds.every(isDraftId)) return CORRUPT;
     const run = await database.run("readwrite", [EPOCHS_STORE, MARKERS_STORE, DRAFTS_STORE], RECOVERY_TRANSACTION_TIMEOUT_MS, async (txn): Promise<CanvasCoordinationOutcome> => {
-        if (input.marker) {
-            const candidate = asMarkerRecord({ scopeId: input.scopeId, markerId: CONFLICT_MARKER_ID, entries: input.marker }, input.scopeId);
-            if (!candidate || input.marker.length > MAX_CONFLICT_MARKER_ENTRIES) return { status: "unavailable", reason: "corrupt" };
-        }
         const epochRead = await readEpoch(txn, input.scopeId);
         if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
         const epoch = epochRead.epoch;
@@ -1692,8 +1846,11 @@ commitCoordination: async (input, signal) => {
         if (epoch.coordinationRevision !== input.expectedCoordinationRevision || epoch.deletionGeneration !== input.expectedDeletionGeneration) {
             return { status: "stale", coordinationRevision: epoch.coordinationRevision, deletionGeneration: epoch.deletionGeneration };
         }
+        /** Refuse an unrepresentable increment BEFORE any write, so overflow cannot leave a partial commit. */
+        const next = nextEpoch(epoch, { coordinationRevision: epoch.coordinationRevision + 1 });
+        if (!next) return CORRUPT;
         const draftIdsToDelete: string[] = [];
-        for (const draftId of input.deleteDraftIds ?? []) {
+        for (const draftId of deleteDraftIds) {
             /** Re-read and validate every target before the first write, preserving all-or-nothing semantics. */
             const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([input.scopeId, draftId]));
             const stored = asDraftRecord(storedRaw, input.scopeId);
@@ -1702,11 +1859,11 @@ commitCoordination: async (input, signal) => {
             if (stored) draftIdsToDelete.push(draftId);
         }
         if (input.marker !== undefined) {
-            if (input.marker === null) await txn.req(txn.store(MARKERS_STORE).delete([input.scopeId, CONFLICT_MARKER_ID]));
-            else await txn.req(txn.store(MARKERS_STORE).put({ scopeId: input.scopeId, markerId: CONFLICT_MARKER_ID, entries: input.marker }));
+            if (marker === null) await txn.req(txn.store(MARKERS_STORE).delete([input.scopeId, CONFLICT_MARKER_ID]));
+            /** The detached validated candidate is stored, never the caller's live array. */
+            else await txn.req(txn.store(MARKERS_STORE).put(marker));
         }
         for (const draftId of draftIdsToDelete) await txn.req(txn.store(DRAFTS_STORE).delete([input.scopeId, draftId]));
-        const next = { ...epoch, coordinationRevision: epoch.coordinationRevision + 1 };
         await txn.req(txn.store(EPOCHS_STORE).put(next));
         return { status: "committed", coordinationRevision: next.coordinationRevision };
     }, signal);
@@ -1720,24 +1877,36 @@ commitCoordination: async (input, signal) => {
  * so a late write from an older session can never resurrect the canvas.
  */
 confirmDeletion: async (scopeId, expectedDeletionGeneration, now, signal) => {
+    /** A tombstone timestamp must be canonical, so refuse an instant Date cannot represent. */
+    if (!isRecoveryCount(expectedDeletionGeneration) || !Number.isFinite(now) || Math.abs(now) > MAX_TIME_VALUE_MS) return CORRUPT;
     const run = await database.run("readwrite", [EPOCHS_STORE, MARKERS_STORE, DRAFTS_STORE], RECOVERY_TRANSACTION_TIMEOUT_MS, async (txn): Promise<CanvasDeletionOutcome> => {
         const epochRead = await readEpoch(txn, scopeId);
         if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
         const epoch = epochRead.epoch;
+        /** A present tombstone alone is proof the deletion already happened, whatever the caller expected. */
         if (epoch.tombstonedAt) return { status: "already-tombstoned" };
-        if (epoch.deletionGeneration !== expectedDeletionGeneration) return { status: "already-tombstoned" };
-        /** Delete every key in this scope, including corrupt rows; exact equality needs no ambient IDBKeyRange constructor. */
-        const draftKeys = await txn.req(txn.store(DRAFTS_STORE).index(SCOPE_INDEX).getAllKeys(scopeId));
-        for (const key of draftKeys) await txn.req(txn.store(DRAFTS_STORE).delete(key));
-        /** Delete by scope-owned key so a corrupt marker row goes too. */
-        await txn.req(txn.store(MARKERS_STORE).delete([scopeId, CONFLICT_MARKER_ID]));
-        const next = {
-            ...epoch,
+        /**
+         * Only this operation advances the generation, and it always writes the tombstone in the same
+         * transaction, so a mismatch WITHOUT a tombstone is impossible under valid state. Fail closed
+         * instead of deleting data on an unexplained generation.
+         */
+        if (epoch.deletionGeneration !== expectedDeletionGeneration) return CORRUPT;
+        const next = nextEpoch(epoch, {
             coordinationRevision: epoch.coordinationRevision + 1,
             deletionGeneration: epoch.deletionGeneration + 1,
             /** Retained long term: this canvas id is never restored in the first version. */
             tombstonedAt: new Date(now).toISOString(),
-        };
+        });
+        if (!next) return CORRUPT;
+        /**
+         * Enumerate BOTH stores by SCOPE_INDEX and delete every key, including corrupt rows and a
+         * marker parked under a noncanonical markerId, so no durable residue outlives the confirmed
+         * deletion. Exact equality needs no ambient IDBKeyRange constructor.
+         */
+        for (const name of [DRAFTS_STORE, MARKERS_STORE] as const) {
+            const keys = await txn.req(txn.store(name).index(SCOPE_INDEX).getAllKeys(scopeId));
+            for (const key of keys) await txn.req(txn.store(name).delete(key));
+        }
         await txn.req(txn.store(EPOCHS_STORE).put(next));
         return { status: "tombstoned", deletionGeneration: next.deletionGeneration };
     }, signal);
@@ -1746,6 +1915,12 @@ confirmDeletion: async (scopeId, expectedDeletionGeneration, now, signal) => {
 
 /** GC is a coordination step: it re-verifies age, marker references and epoch inside the deleting transaction. */
 collectGarbage: async (input, signal) => {
+    if (!isRecoveryCount(input.expectedCoordinationRevision) || !isRecoveryCount(input.expectedDeletionGeneration)) return CORRUPT;
+    /** Age arithmetic decides what is destroyed, so both operands must be real and nonnegative. */
+    if (!isElapsedMs(input.now) || !isElapsedMs(input.minAgeMs)) return CORRUPT;
+    /** Snapshotted before the first await: a later mutation of the caller's array cannot widen GC. */
+    const keepDraftIds = detach(input.keepDraftIds);
+    if (!keepDraftIds || !keepDraftIds.every(isDraftId)) return CORRUPT;
     const run = await database.run("readwrite", [EPOCHS_STORE, MARKERS_STORE, DRAFTS_STORE], RECOVERY_TRANSACTION_TIMEOUT_MS, async (txn): Promise<CanvasCoordinationOutcome> => {
         const epochRead = await readEpoch(txn, input.scopeId);
         if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
@@ -1754,18 +1929,19 @@ collectGarbage: async (input, signal) => {
         if (epoch.coordinationRevision !== input.expectedCoordinationRevision || epoch.deletionGeneration !== input.expectedDeletionGeneration) {
             return { status: "stale", coordinationRevision: epoch.coordinationRevision, deletionGeneration: epoch.deletionGeneration };
         }
+        const next = nextEpoch(epoch, { coordinationRevision: epoch.coordinationRevision + 1 });
+        if (!next) return CORRUPT;
         const markerRaw = await txn.req(txn.store(MARKERS_STORE).get([input.scopeId, CONFLICT_MARKER_ID]));
         const marker = asMarkerRecord(markerRaw, input.scopeId);
         if (markerRaw !== undefined && !marker) return { status: "unavailable", reason: "corrupt" };
         /** Re-read marker references here: a draft another tab just published must not be collected. */
-        const keep = new Set([...input.keepDraftIds, ...(marker ? marker.entries.map((entry) => entry.draftId) : [])]);
+        const keep = new Set([...keepDraftIds, ...(marker ? marker.entries.map((entry) => entry.draftId) : [])]);
         for (const draft of await readScopeDrafts(txn, input.scopeId)) {
             if (keep.has(draft.draftId)) continue;
             const savedAt = Date.parse(draft.savedAt);
             if (!Number.isFinite(savedAt) || input.now - savedAt <= input.minAgeMs) continue;
             await txn.req(txn.store(DRAFTS_STORE).delete([input.scopeId, draft.draftId]));
         }
-        const next = { ...epoch, coordinationRevision: epoch.coordinationRevision + 1 };
         await txn.req(txn.store(EPOCHS_STORE).put(next));
         return { status: "committed", coordinationRevision: next.coordinationRevision };
     }, signal);
@@ -1848,6 +2024,20 @@ describe("explicit legacy recovery upgrade", () => {
         expect(await upgradeRecoveryStorage({ storage, dropLegacy })).toBe("already-upgraded");
         // Never a second drop: the upgrade is an explicit one-time action.
         expect(dropLegacy).toHaveBeenCalledTimes(1);
+
+        /**
+         * A storage that refuses reads (disabled cookies, private mode, quota policy) is contained in
+         * the declared union. Nothing is dropped, because an unreadable flag cannot prove the state.
+         */
+        const unreadable = {
+            getItem: () => {
+                throw new Error("blocked");
+            },
+            setItem: () => undefined,
+        };
+        const untouched = vi.fn(async () => undefined);
+        expect(await upgradeRecoveryStorage({ storage: unreadable, dropLegacy: untouched })).toBe("failed");
+        expect(untouched).not.toHaveBeenCalled();
     });
 
     it("does not record success when the drop fails, so it can be retried", async () => {
@@ -1857,6 +2047,18 @@ describe("explicit legacy recovery upgrade", () => {
         });
         expect(await upgradeRecoveryStorage({ storage, dropLegacy })).toBe("failed");
         expect(storage.getItem("canvas-recovery-upgrade")).toBeNull();
+
+        /**
+         * A successful drop whose receipt cannot be persisted is still "failed" and still retryable,
+         * so the next explicit run drops again. dropLegacy MUST therefore be idempotent: dropping an
+         * already-absent legacy store has to succeed rather than throw.
+         */
+        const unwritable = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
+        const dropped = vi.fn(async () => undefined);
+        expect(await upgradeRecoveryStorage({ storage: unwritable, dropLegacy: dropped })).toBe("failed");
+        expect(dropped).toHaveBeenCalledTimes(1);
+        expect(await upgradeRecoveryStorage({ storage: unwritable, dropLegacy: dropped })).toBe("failed");
+        expect(dropped).toHaveBeenCalledTimes(2);
     });
 
     it("never reads legacy data: the upgrade only drops", async () => {
@@ -1888,16 +2090,32 @@ export type LegacyUpgradeOutcome = "upgraded" | "already-upgraded" | "failed";
  * never uploads it and never runs at module import. The project is unreleased, so no legacy data
  * is migrated: a user who wants old test drafts must export them before upgrading.
  * Called once from the app entry point, never from the recovery store.
+ *
+ * Every failure mode stays inside the declared union, including a storage that throws on read or
+ * write. Because a dropped store whose receipt could not be persisted reports "failed" and will be
+ * retried, `dropLegacy` MUST be idempotent: dropping an absent legacy store has to resolve, not throw.
  */
 export async function upgradeRecoveryStorage(deps: { storage: Pick<Storage, "getItem" | "setItem">; dropLegacy: () => Promise<void> }): Promise<LegacyUpgradeOutcome> {
-    if (deps.storage.getItem(UPGRADE_KEY) === UPGRADE_VALUE) return "already-upgraded";
+    let recorded: string | null;
+    try {
+        recorded = deps.storage.getItem(UPGRADE_KEY);
+    } catch {
+        /** An unreadable flag cannot prove the upgrade state, so nothing is dropped. */
+        return "failed";
+    }
+    if (recorded === UPGRADE_VALUE) return "already-upgraded";
     try {
         await deps.dropLegacy();
     } catch {
         /** Not recorded: a failed drop must remain retryable on the next explicit run. */
         return "failed";
     }
-    deps.storage.setItem(UPGRADE_KEY, UPGRADE_VALUE);
+    try {
+        deps.storage.setItem(UPGRADE_KEY, UPGRADE_VALUE);
+    } catch {
+        /** The drop succeeded but is unproven; report failure so the idempotent drop runs again. */
+        return "failed";
+    }
     return "upgraded";
 }
 ```
