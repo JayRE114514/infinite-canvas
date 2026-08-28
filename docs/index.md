@@ -34,6 +34,8 @@
 ## Project Progress
 
 - [Changelog](/docs/progress/changelog)
+- [Gate 0 Backend Verification](/docs/progress/gate-0-backend-verification)
+- [Gate 0 后端验证记录](/zh-CN/docs/progress/gate-0-backend-verification)
 - [Pending Tests](/docs/progress/pending-test)
 - [TODO](/docs/progress/todo)
 

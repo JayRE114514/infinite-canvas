@@ -5,7 +5,8 @@ description: Planned follow-up work
 
 # TODO
 
-- Implement the PostgreSQL ledger, object storage, durable AI-task queue, and owner-maintained Provider Adapter platform described in the [Backend Platform Architecture Design](../../../superpowers/specs/2026-08-26-backend-platform-architecture-design.md).
+- Close Gate 0. The backend half is done as recorded in the [Gate 0 Backend Verification Record](/docs/progress/gate-0-backend-verification), but Gate 0 itself is still open: native IndexedDB transactional/CAS local canvas storage is unimplemented, and real Chrome/Firefox/Safari acceptance evidence is missing. `web` typecheck and build verification stay with the user, and `server` still reports 15 pre-existing strict TypeScript errors (3 in `src/error-handler.ts`, 12 in tests and test helpers).
+- Implement the PostgreSQL credit wallet and ledger, object storage with an asset lifecycle, the durable AI-task queue, and the owner-maintained Provider Adapter described in the [Backend Platform Architecture Design](../../../superpowers/specs/2026-08-26-backend-platform-architecture-design.md). Yjs real-time collaboration currently exists only as architecture, with no implementation.
 - Replace the Claude Code CLI adapter with a Claude Agent SDK adapter and improve the tool queue, following the [Local Agent Integration Plan](/docs/progress/local-agent-integration-plan).
 - Add Skill installation from web search, Skill resource-file management, and controlled local-memory persistence.
 - Complete Task 5's server-side object-storage cutover for canvas media and My Assets. Until then, stable local media keys are retained but their bytes are not portable across devices.

@@ -1,0 +1,136 @@
+---
+title: Gate 0 Backend Verification
+description: Commit boundaries, database boundaries, and test evidence for the Gate 0 backend correction
+---
+
+# Gate 0 Backend Verification Record
+
+This page records what Tasks 1–6 of the [Gate 0 Backend Architecture Correction Plan](../../../superpowers/plans/2026-08-28-gate-0-backend-architecture-correction.md) actually landed, and the automated evidence behind each item. The governing spec is the [Backend Platform Architecture Design](../../../superpowers/specs/2026-08-26-backend-platform-architecture-design.md).
+
+**Gate 0 is not closed.** Native IndexedDB CAS, the Chrome/Firefox/Safari matrix, and user-owned typecheck evidence are still outstanding. This page covers only the backend half of Gate 0 and does not claim a verified production deployment.
+
+## Commit boundaries
+
+| Unit | Commit | What landed |
+| --- | --- | --- |
+| Baseline | `2d78c24` | Plan and integration contracts frozen; Tasks 1–6 all build on this baseline |
+| Tasks 1–4 (one atomic unit) | `57d82b0` | Four PostgreSQL login roles, role-specific pools with readiness assertions, transaction-scoped context, a closed grant matrix, and default-deny RLS |
+| Task 5 | `47be7a2` | Personal Workspace provisioning on email verification, plus an explicit repair entry point and immutable provisioning audits |
+| Task 6 | `542efd7` | Canvas `snapshot` document mode, fixed save decision order, and a database-issued deletion receipt |
+| Task 7 | this documentation commit | Changelog entry, pending-test items, and this verification record |
+
+Tasks 1–4 form one indivisible deployable unit: there is no published state with missing grants, broad pre-RLS grants, or moved schema still served by old routes. Tasks 5 and 6 are one commit each, and Task 6 modified no earlier migration (`git diff 47be7a2..542efd7 -- server/migrations/0000..0005` is empty).
+
+## Database roles and least privilege
+
+`server/database/bootstrap/roles.sql` idempotently creates four fixed login roles and reasserts their attributes: `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`. `schema_owner` is used only by the release migration job, and no runtime role owns business objects. At startup `server/src/infrastructure/database/role-assertions.ts` verifies the effective role, object ownership, and BYPASSRLS attribute, and refuses readiness on any mismatch.
+
+`0004_tenant-rls.sql` first revokes every table, sequence, and function privilege plus `CREATE ON SCHEMA public` from `PUBLIC` and the three runtime roles, then grants item by item:
+
+| Object | app_api | app_worker | app_maintenance |
+| --- | --- | --- | --- |
+| `users` / `sessions` / `accounts` / `verifications` | SELECT, INSERT, UPDATE, DELETE | none | none |
+| `workspaces` | SELECT, INSERT, UPDATE(`name`, `slug`, `status`, `deleted_at`, `updated_at`) | none | SELECT(`id`, `status`) |
+| `workspace_members` | SELECT, INSERT, DELETE | none | none |
+| `workspace_invitations` | SELECT, INSERT, UPDATE(`status`) | none | none |
+| `canvases` | SELECT, INSERT, UPDATE(`title`, `snapshot_json`, `revision`, `updated_by`, `updated_at`, `deleted_at`) | none | none |
+| `workspace_audit_logs` | INSERT | none | none |
+| schema `public` | USAGE (no CREATE) | USAGE (no CREATE) | USAGE (no CREATE) |
+| schema `drizzle` | none | none | none |
+
+Canvas UPDATE is a column-level grant, so Task 6's new `document_mode` and `deletion_receipt_id` columns never fall into the old grant and need no extra REVOKE: `app_api` writing either column gets `42501`. `app_api` also has no DELETE on `canvases`, so a hard delete is `42501` as well.
+
+Function execution is revoked wholesale and restored for exactly eight signatures: `is_active_workspace_member`, `is_workspace_manager`, `is_current_verified_email`, `has_accepted_workspace_invitation`, `begin_admin_operation`, `is_current_admin_operation`, `execute_workspace_admin_operation`, and `record_workspace_provisioning`.
+
+## Transaction-scoped context and row-level security
+
+Tenant context uses only transaction-local `set_config(key, value, true)`, which expires on commit or rollback and leaves no application variable on a pooled connection. Policies read it through `nullif(current_setting('app.user_id', true), '')`, so a missing context evaluates to NULL, the policy is false, and the result is zero rows rather than an error.
+
+`server/src/infrastructure/database/transactions.ts` is the only business transaction entry point and exposes four functions: `withUserTransaction`, `withTenantTransaction`, `withWorkerTransaction`, and `withPlatformAdminTransaction`. Membership verification and business SQL run on the same transaction and connection.
+
+`workspaces`, `workspace_members`, `workspace_invitations`, `canvases`, and `workspace_audit_logs` all have `ENABLE ROW LEVEL SECURITY`; `workspace_invitations`, `canvases`, and `workspace_audit_logs` additionally `FORCE` it so the table owner cannot bypass policies.
+
+| Table | Key policies | Condition |
+| --- | --- | --- |
+| `workspaces` | `workspaces_api_select_member` | User-scoped read that needs no Workspace context, used by `GET /api/v1/workspaces` |
+| `workspaces` | `workspaces_api_update_manager`, `workspaces_api_update_owner_deactivate` | Requires both the exact Workspace context and a manager role; owner self-service deactivation is limited to active → deactivated |
+| `workspace_members` | `_select_self`, `_select_workspace`, `_delete_manager` | Self-reads compare `user_id` without recursion; listing and removal need the exact context and a manager role, and owners cannot be removed |
+| `workspace_invitations` | `_select_manager`, `_select_recipient`, `_update_manager`, `_update_recipient` | Managers may only move pending → canceled; recipients may only move pending → accepted/rejected before expiry |
+| `canvases` | `_select_member`, `_insert_member`, `_update_member` | Requires both the exact Workspace context and active membership |
+| `workspace_audit_logs` | `_api_insert_owner`, `_schema_owner_insert_admin` | Append-only; administrator audits can only be produced by the xid-bound narrow function inside the same transaction |
+
+The canvas SELECT policy deliberately does not use `deleted_at` as a predicate. Soft deletion is filtered in the service layer, which is what lets an authorized member replay a deletion, lock the already-deleted row, and read back the durable receipt.
+
+## Workspace lifecycle
+
+The platform-admin surface is `GET /api/v1/admin/workspaces/:workspaceId` plus the `suspend`, `deactivate`, and `restore` actions, all executed through the narrow `SECURITY DEFINER` function `execute_workspace_admin_operation()` inside one transaction.
+
+| Purpose | Allowed source status | Target status |
+| --- | --- | --- |
+| `workspace_read` | any | no status change |
+| `workspace_suspend` | active | suspended |
+| `workspace_deactivate` | active, suspended | deactivated |
+| `workspace_restore` | suspended, deactivated | active |
+| Team owner self-service deactivation | active | deactivated |
+
+An invalid transition raises `P4091`, a concurrent status change raises `P4092` and maps to `workspace_status_transition_conflict`, and a non-administrator caller receives `42501` mapped to `platform_admin_forbidden`. Every operation writes exactly one immutable audit row carrying `operation_id` and `pg_current_xact_id()`, and the audit is written before the final status update.
+
+## Personal Workspace provisioning and explicit repair
+
+Provisioning sources are fixed to two values: `email_verification` (the verification callback) and `explicit_repair`. Both write an immutable provisioning audit through `record_workspace_provisioning(source, workspace_id, event_id)`, which pins its `search_path`, requires transaction-local `app.user_id` (raising `42501` when it is missing), and raises `22023` for any source outside the vocabulary.
+
+The repair entry point is `POST /api/v1/workspaces/personal/repair`. Its event ID is derived from the user ID, so replays converge idempotently on the same personal Workspace and add no extra audit row. The route accepts no request body and returns `invalid_request_body` when one is sent.
+
+## Canvas snapshot mode, save, and deletion receipt
+
+`0006_canvas_document_mode.sql` adds `document_mode` (default `snapshot`) and a nullable unique `deletion_receipt_id`, together with three constraints: `canvases_document_mode_check`, `canvases_deletion_state_check` (`deleted_at` and the receipt must be both null or both non-null), and `canvases_deletion_receipt_unique`. The backfill only touches pre-release rows that were already soft-deleted, temporarily drops `FORCE` inside the same migration transaction and restores it immediately, and rolls the whole migration back if the affected count does not match.
+
+`document_mode` is read-only to clients: `documentMode` appears only in response contracts, while the create and save bodies are `additionalProperties: false` and do not contain the field.
+
+Save keeps this decision order under one row lock:
+
+1. Row invisible, missing, or soft-deleted → 404 `canvas_not_found`
+2. Mode is not `snapshot` → 409 `canvas_document_mode_mismatch`
+3. `revision` does not match `baseRevision` → 409 `revision_conflict`
+4. Stored revision and `baseRevision` are both 9007199254740991 → 409 `canvas_revision_limit_reached`
+5. Conditional update still returns zero rows after every locked check passed → roll back and return the sanitized non-retryable 500 `canvas_save_invariant_failed`, logging `requestId`, `canvasId`, `workspaceId`, and the expected revision
+
+The deletion receipt is issued by the database. A `BEFORE INSERT OR UPDATE` trigger covers three cases: INSERT may not forge a deleted state; the first active → deleted transition forces a database-generated receipt and overrides any caller-supplied value; and once issued, `deleted_at` and `deletion_receipt_id` are byte-for-byte immutable, so rewriting, shifting, or clearing the pair to resurrect a canvas fails. An active row written with a receipt has it forced back to NULL. Replaying a deletion reads the persisted receipt with no second state change, and ordinary GET or list 404 responses never carry one. A broken invariant surfaces as the sanitized non-retryable 500 `canvas_delete_invariant_failed`.
+
+## Migration chain
+
+| idx | tag | Kind |
+| --- | --- | --- |
+| 0 | `0000_auth_and_workspaces` | baseline, untouched |
+| 1 | `0001_canvases` | baseline, untouched |
+| 2 | `0002_workspace-authority` | schema change with snapshot |
+| 3 | `0003_transaction-context` | schema change plus context/audit functions, with snapshot |
+| 4 | `0004_tenant-rls` | grants and policies only, custom migration |
+| 5 | `0005_workspace-provisioning-audit-fix` | function replacement only, custom migration |
+| 6 | `0006_canvas_document_mode` | canvas mode and deletion receipt, with snapshot |
+
+All tests run the journaled Drizzle migrator as `schema_owner`; no lexical SQL loader remains. `0006_snapshot.json`'s `prevId` equals `0005_snapshot.json`'s `id`, and the new columns and three constraints appear only in 0006. Fresh install and legacy-owner upgrade are independent test paths.
+
+## Test evidence
+
+Run directly for Task 7 on Node v22.23.2, with Testcontainers starting `postgres:18-alpine` and all RLS evidence using production-equivalent `app_api` / `app_worker` / `app_maintenance` connections:
+
+| Command | Result |
+| --- | --- |
+| `bun --cwd server run test` | 17 files, 317 tests passed |
+| `bun --cwd server run check:boundaries` | `module boundaries: ok` |
+| `git diff --check` | clean |
+
+Task 6 independent acceptance (round 1/2, run by a separate acceptance agent) returned APPROVE with Critical 0, Important 0, and Minor 3 (all non-blocking). Evidence produced independently in that round: full server suite 17 files 317/317; `test/canvases/schema.test.ts` 24/24; `test/canvases/routes.test.ts` 24/24; `test/database/tenant-isolation.test.ts` 49/49; `test/database/migration-upgrade.test.ts` 7/7; plus 29/29 adversarial PostgreSQL probes on an independent container covering receipt forgery, rewrite, and resurrection, cross-tenant and grant boundaries, and 0005 → 0006 migration fault rollback and retry.
+
+Implementation-agent self-tests count as development evidence only and do not contribute to the acceptance verdict.
+
+## Residual risks
+
+- **Gate 0 is still open.** Native IndexedDB transactional/CAS storage is unimplemented, real Chrome/Firefox/Safari evidence has not been collected, and `web` typecheck and build verification remain with the user.
+- **Runtime version gap.** Local verification ran on Node v22.23.2 while the intended production baseline is Node 24 LTS; the suite must be rerun on the target version before release.
+- **Pre-existing type errors.** Strict TypeScript on `server` currently reports 15 errors (3 in `src/error-handler.ts`, 12 in tests and test helpers). They are outside this plan's scope and remain unfixed.
+- **Superuser boundary.** A database superuser can still disable the trigger or change the replication role to bypass the deletion-receipt invariant; none of the four runtime roles can.
+- **Frontend reality.** Web canvases and My Assets are still primarily browser-local, and the AI API key still lives in the browser and calls upstream providers directly. This page does not claim cloud sync or managed keys.
+- **Later gates not started.** The credit wallet and ledger, object storage with an asset lifecycle, the durable AI-task queue, the Provider Adapter, and Yjs real-time collaboration are all unimplemented.
+- **Deployment unverified.** Every result here comes from local automated tests and includes no production deployment, capacity, or failure-drill conclusion.
