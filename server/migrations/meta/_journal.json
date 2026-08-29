@@ -64,6 +64,13 @@
       "when": 1788010528238,
       "tag": "0008_assets",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788020000000,
+      "tag": "0009_artbox_video_generations",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,386 @@
+import { randomUUID } from "node:crypto";
+
+import type { CreateArtBoxVideoGenerationBody } from "@infinite-canvas/contracts";
+import { Pool } from "pg";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createDatabase } from "../../src/infrastructure/database/client.js";
+import type { DatabaseHandle } from "../../src/infrastructure/database/types.js";
+import type { ObjectStorage, StoredObject } from "../../src/infrastructure/object-storage/types.js";
+import type { ArtBoxAdapter } from "../../src/modules/artbox/adapter.js";
+import {
+    createArtBoxVideoGeneration,
+    downloadArtBoxResult,
+    pollArtBoxVideoGeneration,
+    type ArtBoxServiceDependencies,
+} from "../../src/modules/artbox/service.js";
+import { runMigrations } from "../helpers/database.js";
+import { startRoleDatabase, type StartedRoleDatabase } from "../helpers/postgres.js";
+
+const downloadConfig = {
+    requestTimeoutMs: 250,
+    resultMaxBytes: 8,
+    resultAllowedHosts: ["results.artbox.test"],
+};
+
+function videoResponse(bytes: number[], headers: Record<string, string> = {}): Response {
+    return new Response(Uint8Array.from(bytes), {
+        status: 200,
+        headers: { "content-type": "video/mp4", ...headers },
+    });
+}
+
+describe("ArtBox result ingestion boundary", () => {
+    it("fetches an allowlisted credential-free HTTPS result with redirects disabled", async () => {
+        const fetchImpl = vi.fn(async () => videoResponse([1, 2, 3]));
+
+        await expect(
+            downloadArtBoxResult("https://results.artbox.test/video.mp4?transport=ephemeral", downloadConfig, fetchImpl),
+        ).resolves.toEqual({ bytes: Uint8Array.from([1, 2, 3]), contentType: "video/mp4" });
+        expect(fetchImpl).toHaveBeenCalledWith(
+            "https://results.artbox.test/video.mp4?transport=ephemeral",
+            expect.objectContaining({ method: "GET", redirect: "error", signal: expect.any(AbortSignal) }),
+        );
+    });
+
+    it.each([
+        "http://results.artbox.test/video.mp4",
+        "https://user:pass@results.artbox.test/video.mp4",
+        "https://untrusted.test/video.mp4",
+        "not-a-url",
+    ])("rejects unsafe result URL %s before fetch", async (url) => {
+        const fetchImpl = vi.fn(async () => videoResponse([1]));
+        await expect(downloadArtBoxResult(url, downloadConfig, fetchImpl)).rejects.toMatchObject({
+            code: "provider_result_rejected",
+            retryable: false,
+        });
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("rejects declared and streamed bodies over the configured maximum", async () => {
+        await expect(
+            downloadArtBoxResult(
+                "https://results.artbox.test/declared.mp4",
+                downloadConfig,
+                async () => videoResponse([1], { "content-length": "9" }),
+            ),
+        ).rejects.toMatchObject({ code: "provider_result_too_large" });
+
+        await expect(
+            downloadArtBoxResult(
+                "https://results.artbox.test/streamed.mp4",
+                downloadConfig,
+                async () => videoResponse([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            ),
+        ).rejects.toMatchObject({ code: "provider_result_too_large" });
+    });
+
+    it("rejects redirects, non-video content, and upstream failures without leaking the URL", async () => {
+        for (const response of [
+            new Response(null, { status: 302, headers: { location: "https://secret.test/signed" } }),
+            new Response("not video", { status: 200, headers: { "content-type": "text/plain" } }),
+            new Response("raw secret", { status: 503 }),
+        ]) {
+            const error = await downloadArtBoxResult(
+                "https://results.artbox.test/video.mp4?token=secret",
+                downloadConfig,
+                async () => response,
+            ).catch((caught: unknown) => caught);
+            expect(error).toMatchObject({ retryable: expect.any(Boolean) });
+            expect(JSON.stringify(error)).not.toContain("token=secret");
+            expect(JSON.stringify(error)).not.toContain("raw secret");
+        }
+    });
+});
+
+class FakeStorage implements ObjectStorage {
+    readonly readUrls: string[] = [];
+    readonly results: { key: string; contentType: string; bytes: Uint8Array }[] = [];
+    beforeNetwork: () => Promise<void> = async () => {};
+
+    async createUpload(): Promise<never> {
+        throw new Error("not used");
+    }
+    async completeUpload(): Promise<never> {
+        throw new Error("not used");
+    }
+    async createReadUrl(input: { key: string }): Promise<string> {
+        await this.beforeNetwork();
+        const url = `https://media.test/${encodeURIComponent(input.key)}?transport=ephemeral`;
+        this.readUrls.push(url);
+        return url;
+    }
+    async putResult(input: { key: string; contentType: string; bytes: Uint8Array }): Promise<StoredObject> {
+        await this.beforeNetwork();
+        this.results.push(input);
+        return { key: input.key, contentType: input.contentType, byteSize: input.bytes.byteLength, etag: "result-etag" };
+    }
+}
+
+describe("ArtBox Workspace lifecycle", () => {
+    let postgres: StartedRoleDatabase | undefined;
+    let admin: Pool;
+    let database: DatabaseHandle;
+    let userId: string;
+    let workspaceId: string;
+    let otherWorkspaceId: string;
+    let readyImageId: string;
+    let stagingImageId: string;
+
+    const body = (): CreateArtBoxVideoGenerationBody => ({
+        model: "Artdance 2 Mini-480p",
+        promptTemplate: "参考 @[node:image-1]",
+        bindings: [{ nodeId: "image-1", kind: "image", assetId: readyImageId }],
+        seconds: "5",
+        generateAudio: true,
+    });
+
+    function dependencies(adapter: ArtBoxAdapter, storage = new FakeStorage(), fetchImpl: typeof fetch = fetch) {
+        return {
+            adapter,
+            storage,
+            signedUrlTtlSeconds: 300,
+            requestTimeoutMs: 250,
+            resultMaxBytes: 8,
+            resultAllowedHosts: ["results.artbox.test"],
+            pollLeaseSeconds: 20,
+            fetchImpl,
+        } satisfies ArtBoxServiceDependencies;
+    }
+
+    beforeAll(async () => {
+        postgres = await startRoleDatabase();
+    }, 180_000);
+
+    beforeEach(async () => {
+        if (!postgres) throw new Error("PostgreSQL container is not started");
+        await database?.pool.end().catch(() => {});
+        await admin?.end().catch(() => {});
+        admin = new Pool({ connectionString: postgres.admin, max: 4 });
+        await admin.query("drop schema if exists drizzle cascade");
+        await admin.query("drop schema if exists public cascade; create schema public");
+        await admin.query("alter schema public owner to schema_owner");
+        await admin.query("revoke create on schema public from public");
+        await admin.query("grant create, usage on schema public to schema_owner");
+        await runMigrations(postgres.schemaOwner);
+        database = createDatabase({ url: postgres.api, poolMax: 4, expectedRole: "app_api" });
+
+        userId = randomUUID();
+        workspaceId = randomUUID();
+        otherWorkspaceId = randomUUID();
+        readyImageId = randomUUID();
+        stagingImageId = randomUUID();
+        await admin.query('insert into public.users (id, name, email, "emailVerified") values ($1, $2, $3, true)', [
+            userId,
+            "artbox owner",
+            `artbox-${userId}@example.com`,
+        ]);
+        for (const id of [workspaceId, otherWorkspaceId]) {
+            await admin.query(
+                "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, 'ArtBox', $2, 'team', $3, 'active')",
+                [id, `artbox-${id}`, userId],
+            );
+            await admin.query(
+                "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
+                [randomUUID(), id, userId],
+            );
+        }
+        await admin.query(
+            `insert into public.assets
+                (id, workspace_id, kind, status, file_name, content_type, byte_size, final_object_key, created_by)
+             values ($1, $2, 'image', 'ready', 'reference.png', 'image/png', 3, $3, $4)`,
+            [readyImageId, workspaceId, `assets/final/${readyImageId}`, userId],
+        );
+        await admin.query(
+            `insert into public.assets
+                (id, workspace_id, kind, status, file_name, content_type, staging_object_key, final_object_key, created_by)
+             values ($1, $2, 'image', 'staging', 'staging.png', 'image/png', $3, $4, $5)`,
+            [stagingImageId, workspaceId, `assets/staging/${stagingImageId}`, `assets/final/${stagingImageId}`, userId],
+        );
+    }, 120_000);
+
+    afterAll(async () => {
+        await database?.pool.end().catch(() => {});
+        await admin?.end().catch(() => {});
+        await postgres?.stop().catch(() => {});
+    }, 60_000);
+
+    it("replays the same canonical request without a second Provider POST and rejects conflicting hashes", async () => {
+        const storage = new FakeStorage();
+        const create = vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-task-1" }) as const);
+        storage.beforeNetwork = async () => {
+            const active = await admin.query<{ count: number }>(`
+                select count(*)::int as count from pg_stat_activity
+                where usename = 'app_api' and state <> 'idle' and xact_start is not null
+            `);
+            expect(active.rows[0]?.count).toBe(0);
+        };
+        const adapter: ArtBoxAdapter = { create, poll: vi.fn() };
+        const deps = dependencies(adapter, storage);
+
+        const first = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "same-key",
+            deps,
+        );
+        const replay = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "same-key",
+            deps,
+        );
+        expect(replay).toEqual(first);
+        expect(first).toMatchObject({ workspaceId, status: "queued", resultAssetId: null, error: null });
+        expect(JSON.stringify(first)).not.toContain("remote-task-1");
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(storage.readUrls).toHaveLength(1);
+
+        await expect(
+            createArtBoxVideoGeneration(
+                database.db,
+                { userId, workspaceId },
+                { ...body(), seconds: "10" },
+                "same-key",
+                deps,
+            ),
+        ).rejects.toMatchObject({ code: "idempotency_conflict", statusCode: 409 });
+
+        const stored = await admin.query(
+            "select remote_task_id, normalized_input::text from artbox_video_generations where id = $1",
+            [first.id],
+        );
+        expect(stored.rows[0]?.remote_task_id).toBe("remote-task-1");
+        expect(stored.rows[0]?.normalized_input).not.toMatch(/https?:|storageKey|object_key|remote-task-1/);
+    }, 90_000);
+
+    it("hides cross-tenant assets and distinguishes kind and readiness failures", async () => {
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "never" }) as const),
+            poll: vi.fn(),
+        };
+        const deps = dependencies(adapter);
+
+        await expect(
+            createArtBoxVideoGeneration(database.db, { userId, workspaceId: otherWorkspaceId }, body(), "cross", deps),
+        ).rejects.toMatchObject({ code: "asset_not_found", statusCode: 404 });
+        await expect(
+            createArtBoxVideoGeneration(
+                database.db,
+                { userId, workspaceId },
+                { ...body(), bindings: [{ ...body().bindings[0]!, kind: "video" }] },
+                "kind",
+                deps,
+            ),
+        ).rejects.toMatchObject({ code: "asset_kind_mismatch", statusCode: 422 });
+        await expect(
+            createArtBoxVideoGeneration(
+                database.db,
+                { userId, workspaceId },
+                { ...body(), bindings: [{ ...body().bindings[0]!, assetId: stagingImageId }] },
+                "staging",
+                deps,
+            ),
+        ).rejects.toMatchObject({ code: "asset_not_ready", statusCode: 409 });
+        expect(adapter.create).not.toHaveBeenCalled();
+    }, 90_000);
+
+    it("persists ambiguous creates without resubmission and imports a successful result before success", async () => {
+        const uncertainAdapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({
+                kind: "reconciling",
+                error: { code: "provider_submission_uncertain", message: "uncertain", retryable: false },
+            }) as const),
+            poll: vi.fn(),
+        };
+        const uncertainDeps = dependencies(uncertainAdapter);
+        const uncertain = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "uncertain-key",
+            uncertainDeps,
+        );
+        const uncertainReplay = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "uncertain-key",
+            uncertainDeps,
+        );
+        expect(uncertain.status).toBe("reconciling");
+        expect(uncertainReplay).toEqual(uncertain);
+        expect(uncertainAdapter.create).toHaveBeenCalledTimes(1);
+
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-success" }) as const),
+            poll: vi.fn(
+                async () =>
+                    ({ kind: "succeeded", resultUrl: "https://results.artbox.test/video.mp4?token=secret" }) as const,
+            ),
+        };
+        const storage = new FakeStorage();
+        const deps = dependencies(adapter, storage, async () => videoResponse([1, 2, 3]));
+        const queued = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "success-key",
+            deps,
+        );
+        const succeeded = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        const replay = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+
+        expect(succeeded).toMatchObject({ id: queued.id, status: "succeeded", resultAssetId: expect.any(String) });
+        expect(replay).toEqual(succeeded);
+        expect(adapter.poll).toHaveBeenCalledTimes(1);
+        expect(storage.results).toHaveLength(1);
+        const stored = await admin.query(
+            `select g.status, g.result_asset_id, g.normalized_input::text,
+                    a.status as asset_status, a.kind as asset_kind, a.byte_size
+             from artbox_video_generations g join assets a on a.id = g.result_asset_id where g.id = $1`,
+            [queued.id],
+        );
+        expect(stored.rows[0]).toMatchObject({
+            status: "succeeded",
+            result_asset_id: succeeded.resultAssetId,
+            asset_status: "ready",
+            asset_kind: "video",
+            byte_size: "3",
+        });
+        expect(JSON.stringify(stored.rows[0])).not.toContain("token=secret");
+    }, 90_000);
+
+    it("leases concurrent polls so only one Provider request runs", async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const started = new Promise<void>((resolve) => (entered = resolve));
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-concurrent" }) as const),
+            poll: vi.fn(async () => {
+                entered();
+                await gate;
+                return { kind: "queued" } as const;
+            }),
+        };
+        const deps = dependencies(adapter);
+        const queued = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "concurrent-key",
+            deps,
+        );
+
+        const first = pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        await started;
+        const second = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        expect(second.status).toBe("queued");
+        expect(adapter.poll).toHaveBeenCalledTimes(1);
+        release();
+        await expect(first).resolves.toMatchObject({ status: "queued" });
+    }, 90_000);
+});

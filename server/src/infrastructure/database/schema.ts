@@ -5,3 +5,4 @@ export * from "../../modules/workspaces/schema.js";
 export * from "../../modules/platform-admin/schema.js";
 export * from "../../modules/canvases/schema.js";
 export * from "../../modules/assets/schema.js";
+export * from "../../modules/artbox/schema.js";

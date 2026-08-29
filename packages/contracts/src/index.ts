@@ -2,3 +2,4 @@ export { HealthResponseSchema, UnavailableResponseSchema, type HealthResponse, t
 export * from "./workspaces.js";
 export * from "./canvases.js";
 export * from "./assets.js";
+export * from "./artbox.js";
