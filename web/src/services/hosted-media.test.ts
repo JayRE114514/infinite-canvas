@@ -743,7 +743,7 @@ describe("hosted Canvas integration helpers", () => {
         expect(persistTrace).toContain("attempt:durable:DDDDDDDDDDDDDDDDDDDDD");
     });
 
-    it("does not invalidate keys for other retryable terminal failures", async () => {
+    it("invalidates every proven terminal failed generation before rethrow", async () => {
         const request: CreateArtBoxVideoGenerationBody = { model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: "saved", bindings: [], seconds: "5", generateAudio: true };
         const invalidate = vi.fn(async () => undefined);
         await expect(
@@ -771,6 +771,29 @@ describe("hosted Canvas integration helpers", () => {
                 generateLocal: async () => undefined,
             }),
         ).rejects.toMatchObject({ code: "hosted_generation_failed", message: "稍后再试" });
+        expect(invalidate).toHaveBeenCalledOnce();
+        expect(invalidate).toHaveBeenCalledWith(request);
+    });
+
+    it("keeps the saved key when hosted configuration fails before a terminal generation response", async () => {
+        const request: CreateArtBoxVideoGenerationBody = { model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: "saved", bindings: [], seconds: "5", generateAudio: true };
+        const invalidate = vi.fn(async () => undefined);
+        await expect(
+            runCanvasVideoGeneration({
+                model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+                savedAttempt: null,
+                savedRequest: null,
+                createIdempotencyKey: () => "OOOOOOOOOOOOOOOOOOOOO",
+                prepareHostedRequest: async () => request,
+                persistHostedAttempt: async () => undefined,
+                invalidateHostedAttempt: invalidate,
+                generateHosted: async () => {
+                    throw new HostedMediaError("hosted_provider_configuration", "视频生成服务未配置，请联系管理员");
+                },
+                applyHostedResult: async () => undefined,
+                generateLocal: async () => undefined,
+            }),
+        ).rejects.toMatchObject({ code: "hosted_provider_configuration" });
         expect(invalidate).not.toHaveBeenCalled();
     });
 

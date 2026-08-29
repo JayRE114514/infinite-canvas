@@ -207,7 +207,7 @@ export async function runCanvasVideoGeneration(operations: CanvasVideoGeneration
     try {
         result = await operations.generateHosted(attempt);
     } catch (error) {
-        if (error instanceof HostedMediaError && error.code === "hosted_generation_safe_new_attempt") await operations.invalidateHostedAttempt(attempt.request);
+        if (error instanceof HostedMediaError && (error.code === "hosted_generation_safe_new_attempt" || error.code === "hosted_generation_failed")) await operations.invalidateHostedAttempt(attempt.request);
         throw error;
     }
     await operations.applyHostedResult(result, attempt);
