@@ -14,7 +14,7 @@ FROM deps AS web-build
 COPY VERSION CHANGELOG.md ./
 COPY packages/contracts packages/contracts
 COPY web web
-RUN bun --cwd web run build
+RUN cd web && bun run build
 
 # Fastify API；Bun 原生运行 TypeScript，迁移任务也复用此 target。
 FROM deps AS api
