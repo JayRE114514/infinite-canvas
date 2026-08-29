@@ -50,7 +50,6 @@ describe("ArtBox result ingestion boundary", () => {
         "http://results.artbox.test/video.mp4",
         "https://user:pass@results.artbox.test/video.mp4",
         "https://results.artbox.test:8443/video.mp4",
-        "https://untrusted.test/video.mp4",
         "not-a-url",
     ])("rejects unsafe result URL %s before fetch", async (url) => {
         const fetchImpl = vi.fn(async () => videoResponse([1]));
@@ -58,6 +57,23 @@ describe("ArtBox result ingestion boundary", () => {
             code: "provider_result_rejected",
             retryable: false,
         });
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("reports a safe but unconfigured result host as retryable without fetching or leaking it", async () => {
+        const fetchImpl = vi.fn(async () => videoResponse([1]));
+        const error = await downloadArtBoxResult(
+            "https://unconfigured-secret-host.test/video.mp4?token=secret",
+            downloadConfig,
+            fetchImpl,
+        ).catch((caught: unknown) => caught);
+
+        expect(error).toMatchObject({
+            code: "provider_result_host_unconfigured",
+            statusCode: 503,
+            retryable: true,
+        });
+        expect(JSON.stringify(error)).not.toMatch(/unconfigured-secret-host|token=secret/);
         expect(fetchImpl).not.toHaveBeenCalled();
     });
 
@@ -466,6 +482,99 @@ describe("ArtBox Workspace lifecycle", () => {
             byte_size: "3",
         });
         expect(JSON.stringify(stored.rows[0])).not.toContain("token=secret");
+    }, 90_000);
+
+    it("keeps a completed task recoverable until its safe result host is configured", async () => {
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-new-result-host" }) as const),
+            poll: vi.fn(
+                async () =>
+                    ({
+                        kind: "succeeded",
+                        resultUrl: "https://new-results.artbox.test/video.mp4?token=secret",
+                    }) as const,
+            ),
+        };
+        const storage = new FakeStorage();
+        const blockedFetch = vi.fn(async () => videoResponse([1, 2, 3]));
+        const deps = dependencies(adapter, storage, blockedFetch);
+        const queued = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "new-result-host-key",
+            deps,
+        );
+
+        const blocked = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        expect(blocked).toMatchObject({
+            status: "queued",
+            resultAssetId: null,
+            error: { code: "provider_result_host_unconfigured", retryable: true },
+        });
+        expect(blockedFetch).not.toHaveBeenCalled();
+        expect(storage.results).toEqual([]);
+
+        const allowedFetch = vi.fn(async () => videoResponse([1, 2, 3]));
+        const recovered = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, {
+            ...deps,
+            resultAllowedHosts: ["new-results.artbox.test"],
+            fetchImpl: allowedFetch,
+        });
+        expect(recovered).toMatchObject({ status: "succeeded", resultAssetId: expect.any(String), error: null });
+        expect(allowedFetch).toHaveBeenCalledTimes(1);
+        expect(storage.results).toHaveLength(1);
+        expect(adapter.create).toHaveBeenCalledTimes(1);
+        expect(adapter.poll).toHaveBeenCalledTimes(2);
+    }, 90_000);
+
+    it("marks pre-submit COS signing failure retryable without reusing the idempotency key", async () => {
+        const storage = new FakeStorage();
+        storage.beforeNetwork = async () => {
+            throw new Error("raw COS signing secret");
+        };
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-after-signing-recovery" }) as const),
+            poll: vi.fn(),
+        };
+        const deps = dependencies(adapter, storage);
+
+        const failed = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "signing-failure-key",
+            deps,
+        );
+        expect(failed).toMatchObject({
+            status: "failed",
+            error: { code: "asset_transport_error", retryable: true },
+        });
+        expect(JSON.stringify(failed)).not.toContain("raw COS signing secret");
+        expect(adapter.create).not.toHaveBeenCalled();
+
+        storage.beforeNetwork = async () => {};
+        const sameKeyReplay = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "signing-failure-key",
+            deps,
+        );
+        expect(sameKeyReplay).toEqual(failed);
+        expect(storage.readUrls).toEqual([]);
+        expect(adapter.create).not.toHaveBeenCalled();
+
+        const newKeyRetry = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "signing-retry-key",
+            deps,
+        );
+        expect(newKeyRetry).toMatchObject({ status: "queued", error: null });
+        expect(storage.readUrls).toHaveLength(1);
+        expect(adapter.create).toHaveBeenCalledTimes(1);
     }, 90_000);
 
     it("leases concurrent polls so only one Provider request runs", async () => {

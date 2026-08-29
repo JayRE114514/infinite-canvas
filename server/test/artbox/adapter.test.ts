@@ -24,7 +24,9 @@ function input(bindings: ArtBoxCreateInput["bindings"]): ArtBoxCreateInput {
     return {
         model: "Artdance 2 Mini-480p",
         promptTemplate:
-            "人物 @[node:image-1] 重复 @[node:image-1]，运镜 @[node:video-1]，节奏 @[node:audio-1]，补图 @[node:image-6]",
+            bindings.length === 0
+                ? "无参考素材"
+                : "人物 @[node:image-1] 重复 @[node:image-1]，运镜 @[node:video-1]，节奏 @[node:audio-1]，补图 @[node:image-6]",
         bindings,
         seconds: "5",
         aspectRatio: "16:9",
@@ -72,7 +74,7 @@ describe("fixed ArtBox adapter", () => {
         });
     });
 
-    it("omits empty URL arrays and accepts a top-level task id", async () => {
+    it("matches the canonical request by omitting optional fields and empty URL arrays", async () => {
         const fetchImpl = vi.fn(async () => response({ task_id: "top-level-task" }));
         const adapter = createArtBoxAdapter(config, fetchImpl);
 
@@ -87,13 +89,16 @@ describe("fixed ArtBox adapter", () => {
         ).resolves.toEqual({ kind: "submitted", remoteTaskId: "top-level-task" });
 
         const [, init] = fetchImpl.mock.calls[0]! as unknown as Parameters<typeof fetch>;
-        expect(JSON.parse(String(init?.body))).toEqual({
+        const body = JSON.parse(String(init?.body));
+        expect(body).toEqual({
             model: "Artdance 2 Mini-480p",
             prompt: "人物 @图片1",
             seconds: "5",
             image_urls: ["https://media.test/image-1"],
             generate_audio: false,
         });
+        expect(body).not.toHaveProperty("aspect_ratio");
+        expect(body).not.toHaveProperty("resolution");
     });
 
     it("URL-encodes polling ids and normalizes provider envelopes", async () => {
@@ -197,6 +202,42 @@ describe("fixed ArtBox adapter", () => {
             error: { code: "duplicate_media_binding", retryable: false },
         });
         expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unresolved internal node token before network with a sanitized input error", async () => {
+        const fetchImpl = vi.fn(async () => response({ task_id: "must-not-run" }));
+        const adapter = createArtBoxAdapter(config, fetchImpl);
+
+        const outcome = await adapter.create({
+            ...input([]),
+            promptTemplate: "参考 @[node:bound] 与 @[node:missing-secret-node]",
+            bindings: [{ nodeId: "bound", kind: "image", url: "https://media.test/image-1?token=secret" }],
+        });
+
+        expect(outcome).toMatchObject({
+            kind: "failed",
+            error: { code: "unresolved_media_binding", retryable: false },
+        });
+        expect(JSON.stringify(outcome)).not.toMatch(/missing-secret-node|token=secret/);
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("keeps unused bindings in Provider arrays without requiring a prompt token", async () => {
+        const fetchImpl = vi.fn(async () => response({ task_id: "unused-binding-task" }));
+        const adapter = createArtBoxAdapter(config, fetchImpl);
+
+        await expect(
+            adapter.create({
+                ...input([]),
+                promptTemplate: "无需显式引用素材",
+                bindings: [{ nodeId: "unused", kind: "image", url: "https://media.test/unused" }],
+            }),
+        ).resolves.toEqual({ kind: "submitted", remoteTaskId: "unused-binding-task" });
+        const [, init] = fetchImpl.mock.calls[0]! as unknown as Parameters<typeof fetch>;
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+            prompt: "无需显式引用素材",
+            image_urls: ["https://media.test/unused"],
+        });
     });
 
     it.each([

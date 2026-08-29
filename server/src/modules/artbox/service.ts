@@ -85,7 +85,7 @@ function terminal(row: GenerationRow): boolean {
 }
 
 function storageFailure(): ArtBoxGenerationError {
-    return { code: "asset_transport_error", message: "素材传输暂时失败", retryable: false };
+    return { code: "asset_transport_error", message: "素材传输暂时失败", retryable: true };
 }
 
 async function persistCreateOutcome(
@@ -242,14 +242,11 @@ function validateResultUrl(rawUrl: string, allowedHosts: readonly string[]): URL
     } catch {
         throw resultError("provider_result_rejected", "生成结果地址不安全", false);
     }
-    if (
-        url.protocol !== "https:" ||
-        url.username ||
-        url.password ||
-        url.port !== "" ||
-        !allowedHosts.includes(url.hostname.toLowerCase())
-    ) {
+    if (url.protocol !== "https:" || url.username || url.password || url.port !== "") {
         throw resultError("provider_result_rejected", "生成结果地址不安全", false);
+    }
+    if (!allowedHosts.includes(url.hostname.toLowerCase())) {
+        throw resultError("provider_result_host_unconfigured", "生成结果域名尚未配置", true);
     }
     return url;
 }

@@ -74,6 +74,11 @@ const errors = {
         message: "同一节点不能重复绑定素材",
         retryable: false,
     }),
+    unresolvedBinding: (): ArtBoxGenerationError => ({
+        code: "unresolved_media_binding",
+        message: "提示词包含未绑定素材",
+        retryable: false,
+    }),
 };
 
 function hasDuplicateNodeIds(bindings: ArtBoxCreateInput["bindings"]): boolean {
@@ -179,6 +184,10 @@ export function createArtBoxAdapter(config: ArtBoxAdapterConfig, fetchImpl: type
         async create(input) {
             if (hasDuplicateNodeIds(input.bindings)) return { kind: "failed", error: errors.duplicateBinding() };
             if (!config.videoModels.includes(input.model)) return { kind: "failed", error: errors.model() };
+            const body = providerBody(input);
+            if (/@\[node:[^\]]*\]/.test(String(body.prompt))) {
+                return { kind: "failed", error: errors.unresolvedBinding() };
+            }
             try {
                 const { response, payload } = await requestJson(
                     fetchImpl,
@@ -186,7 +195,7 @@ export function createArtBoxAdapter(config: ArtBoxAdapterConfig, fetchImpl: type
                     {
                         method: "POST",
                         headers: { Authorization: authorization, "Content-Type": "application/json" },
-                        body: JSON.stringify(providerBody(input)),
+                        body: JSON.stringify(body),
                     },
                     config.requestTimeoutMs,
                 );
