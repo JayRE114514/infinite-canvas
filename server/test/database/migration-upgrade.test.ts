@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createDatabase } from "../../src/infrastructure/database/client.js";
+import { inspectDatabaseRole } from "../../src/infrastructure/database/role-assertions.js";
 import { withUserTransaction } from "../../src/infrastructure/database/transactions.js";
 import { listWorkspaces } from "../../src/modules/workspaces/service.js";
 import {
@@ -32,6 +33,9 @@ const PRE_CANVAS_MODE_TAGS = [
     "0004_tenant-rls",
     "0005_workspace-provisioning-audit-fix",
 ];
+const PRE_ASSETS_TAGS = [...PRE_CANVAS_MODE_TAGS, "0006_canvas_document_mode", "0007_admin-purpose-closed-world"];
+const PRE_ARTBOX_TAGS = [...PRE_ASSETS_TAGS, "0008_assets"];
+const PRE_ARTBOX_FINALIZER_TAGS = [...PRE_ARTBOX_TAGS, "0009_artbox_video_generations"];
 
 let postgres: StartedRoleDatabase | undefined;
 const openPools: Pool[] = [];
@@ -208,13 +212,16 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7, snapshot8, snapshot9, snapshot10] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
             readSnapshot("0005"),
             readSnapshot("0006"),
             readSnapshot("0007"),
+            readSnapshot("0008"),
+            readSnapshot("0009"),
+            readSnapshot("0010"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -243,6 +250,27 @@ describe("immutable migration history", () => {
                 tag: "0007_admin-purpose-closed-world",
                 breakpoints: true,
             },
+            {
+                idx: 8,
+                version: "7",
+                when: 1788010528238,
+                tag: "0008_assets",
+                breakpoints: true,
+            },
+            {
+                idx: 9,
+                version: "7",
+                when: 1788020000000,
+                tag: "0009_artbox_video_generations",
+                breakpoints: true,
+            },
+            {
+                idx: 10,
+                version: "7",
+                when: 1788025000000,
+                tag: "0010_artbox_create_outcome_finalizer",
+                breakpoints: true,
+            },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
@@ -250,6 +278,9 @@ describe("immutable migration history", () => {
         expect(snapshot5.prevId).toBe(snapshot4.id);
         expect(snapshot6.prevId).toBe(snapshot5.id);
         expect(snapshot7.prevId).toBe(snapshot6.id);
+        expect(snapshot8.prevId).toBe(snapshot7.id);
+        expect(snapshot9.prevId).toBe(snapshot8.id);
+        expect(snapshot10.prevId).toBe(snapshot9.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -308,6 +339,65 @@ describe("immutable migration history", () => {
 
         // 0007 只替换 begin_admin_operation 的用途判定，不触碰任何表结构。
         expect(normalize(snapshot7)).toEqual(normalize(snapshot6));
+
+        const assetTable = snapshot8.tables["public.assets"]!;
+        expect(Object.keys(assetTable.columns)).toEqual([
+            "id",
+            "workspace_id",
+            "kind",
+            "status",
+            "file_name",
+            "content_type",
+            "byte_size",
+            "staging_object_key",
+            "final_object_key",
+            "etag",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]);
+        expect(Object.keys(assetTable.checkConstraints)).toEqual(
+            expect.arrayContaining(["assets_kind_check", "assets_status_check", "assets_state_coherent"]),
+        );
+
+        const withoutAssets = ({ id: _id, prevId: _prevId, tables, ...rest }: typeof snapshot8) => ({
+            ...rest,
+            tables: Object.fromEntries(Object.entries(tables).filter(([name]) => name !== "public.assets")),
+        });
+        expect(withoutAssets(snapshot8)).toEqual(normalize(snapshot7));
+
+        const generationTable = snapshot9.tables["public.artbox_video_generations"]!;
+        expect(Object.keys(generationTable.columns)).toEqual([
+            "id",
+            "workspace_id",
+            "idempotency_key",
+            "request_hash",
+            "normalized_input",
+            "status",
+            "remote_task_id",
+            "result_asset_id",
+            "public_error",
+            "poll_lease_epoch",
+            "poll_lease_until",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]);
+        expect(Object.keys(generationTable.checkConstraints)).toEqual(
+            expect.arrayContaining([
+                "artbox_video_generations_status_check",
+                "artbox_video_generations_request_hash_check",
+                "artbox_video_generations_result_state_check",
+            ]),
+        );
+        const withoutGenerations = ({ id: _id, prevId: _prevId, tables, ...rest }: typeof snapshot9) => ({
+            ...rest,
+            tables: Object.fromEntries(
+                Object.entries(tables).filter(([name]) => name !== "public.artbox_video_generations"),
+            ),
+        });
+        expect(withoutGenerations(snapshot9)).toEqual(normalize(snapshot8));
+        expect(normalize(snapshot10)).toEqual(normalize(snapshot9));
     });
 });
 
@@ -348,6 +438,138 @@ describe("fresh install as schema_owner", () => {
                 }
             })(),
         ).resolves.toBeUndefined();
+    }, 120_000);
+});
+
+describe("0008 Asset upgrade", () => {
+    it("upgrades a real 0007 schema with a forced-RLS Asset table and explicit API grants", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_ASSETS_TAGS);
+
+        await expect(admin.query("select 1 from public.assets")).rejects.toMatchObject({ code: "42P01" });
+        await runMigrations(roles().schemaOwner);
+
+        const boundary = await admin.query(`
+            select c.relrowsecurity, c.relforcerowsecurity,
+                   has_table_privilege('app_api', c.oid, 'SELECT') as api_select,
+                   has_table_privilege('app_api', c.oid, 'INSERT') as api_insert,
+                   has_table_privilege('app_worker', c.oid, 'SELECT') as worker_select
+            from pg_class c where c.oid = 'public.assets'::regclass
+        `);
+        expect(boundary.rows).toEqual([{
+            relrowsecurity: true,
+            relforcerowsecurity: true,
+            api_select: true,
+            api_insert: true,
+            worker_select: false,
+        }]);
+    }, 120_000);
+});
+
+describe("0009 ArtBox generation upgrade", () => {
+    it("upgrades a real 0008 schema with forced RLS, narrow API grants, and role assertions", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_ARTBOX_TAGS);
+
+        await expect(admin.query("select 1 from public.artbox_video_generations")).rejects.toMatchObject({ code: "42P01" });
+        await runMigrations(roles().schemaOwner);
+
+        const boundary = await admin.query(`
+            select c.relrowsecurity, c.relforcerowsecurity,
+                   has_table_privilege('app_api', c.oid, 'SELECT') as api_select,
+                   has_table_privilege('app_api', c.oid, 'INSERT') as api_insert,
+                   has_table_privilege('app_api', c.oid, 'DELETE') as api_delete,
+                   has_table_privilege('app_worker', c.oid, 'SELECT') as worker_select
+            from pg_class c where c.oid = 'public.artbox_video_generations'::regclass
+        `);
+        expect(boundary.rows).toEqual([{
+            relrowsecurity: true,
+            relforcerowsecurity: true,
+            api_select: true,
+            api_insert: true,
+            api_delete: false,
+            worker_select: false,
+        }]);
+        const updateColumns = await admin.query<{ column_name: string }>(`
+            select column_name from information_schema.role_column_grants
+            where table_schema = 'public' and table_name = 'artbox_video_generations'
+              and grantee = 'app_api' and privilege_type = 'UPDATE'
+            order by column_name
+        `);
+        expect(updateColumns.rows.map((row) => row.column_name)).toEqual([
+            "poll_lease_epoch",
+            "poll_lease_until",
+            "public_error",
+            "remote_task_id",
+            "result_asset_id",
+            "status",
+            "updated_at",
+        ]);
+
+        const api = openPool(roles().api);
+        await expect(inspectDatabaseRole(api, "app_api")).resolves.toMatchObject({ violations: [] });
+    }, 120_000);
+});
+
+describe("0010 ArtBox create-outcome finalizer upgrade", () => {
+    it("upgrades a real 0009 schema with a fixed-search-path finalizer and narrowly bound schema_owner RLS", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_ARTBOX_FINALIZER_TAGS);
+
+        expect(
+            await admin.query(
+                "select to_regprocedure('public.finalize_artbox_video_generation_create(uuid,text,text,text,text,jsonb)') as function",
+            ),
+        ).toMatchObject({ rows: [{ function: null }] });
+        await runMigrations(roles().schemaOwner);
+
+        const boundary = await admin.query(`
+            select p.prosecdef,
+                   p.proconfig,
+                   pg_get_userbyid(p.proowner) as owner,
+                   has_function_privilege('app_api', p.oid, 'EXECUTE') as api_execute,
+                   has_function_privilege('app_worker', p.oid, 'EXECUTE') as worker_execute,
+                   has_function_privilege('app_maintenance', p.oid, 'EXECUTE') as maintenance_execute,
+                   has_function_privilege('public', p.oid, 'EXECUTE') as public_execute
+            from pg_proc p
+            where p.oid = 'public.finalize_artbox_video_generation_create(uuid,text,text,text,text,jsonb)'::regprocedure
+        `);
+        expect(boundary.rows).toEqual([{
+            prosecdef: true,
+            proconfig: ["search_path=pg_catalog, public"],
+            owner: "schema_owner",
+            api_execute: true,
+            worker_execute: false,
+            maintenance_execute: false,
+            public_execute: false,
+        }]);
+
+        const policies = await admin.query(`
+            select policyname, cmd, roles
+            from pg_policies
+            where schemaname = 'public'
+              and tablename = 'artbox_video_generations'
+              and 'schema_owner' = any(roles)
+            order by policyname
+        `);
+        expect(policies.rows).toEqual([
+            {
+                policyname: "artbox_video_generations_finalizer_schema_owner_select",
+                cmd: "SELECT",
+                roles: ["schema_owner"],
+            },
+            {
+                policyname: "artbox_video_generations_finalizer_schema_owner_update",
+                cmd: "UPDATE",
+                roles: ["schema_owner"],
+            },
+        ]);
+
+        const api = openPool(roles().api);
+        await expect(inspectDatabaseRole(api, "app_api")).resolves.toMatchObject({ violations: [] });
     }, 120_000);
 });
 

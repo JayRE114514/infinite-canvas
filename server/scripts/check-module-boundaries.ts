@@ -21,6 +21,8 @@ const MODULE_PUBLIC_ENTRIES: Record<string, readonly string[]> = {
     identity: ["schema", "session", "auth", "types", "routes"],
     workspaces: ["schema", "service", "authorization", "context", "routes"],
     canvases: ["schema", "service", "routes"],
+    assets: ["schema", "service", "routes"],
+    artbox: ["schema", "service", "adapter", "routes"],
     "platform-admin": ["schema", "service", "routes"],
 };
 

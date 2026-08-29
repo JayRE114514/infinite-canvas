@@ -1,4 +1,5 @@
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import type { CreateArtBoxVideoGenerationBody } from "@infinite-canvas/contracts";
 
 export type Position = {
     x: number;
@@ -33,6 +34,7 @@ export type CanvasNodeImage = {
     errorDetails?: string;
     content: string;
     storageKey?: string;
+    assetId?: string;
     naturalWidth: number;
     naturalHeight: number;
     bytes: number;
@@ -44,6 +46,11 @@ export type CanvasNodeText = {
     status: CanvasNodeStatus;
     errorDetails?: string;
     content: string;
+};
+
+export type HostedVideoAttempt = {
+    request: CreateArtBoxVideoGenerationBody;
+    idempotencyKey: string;
 };
 
 export type CanvasNodeMetadata = {
@@ -79,6 +86,10 @@ export type CanvasNodeMetadata = {
     images?: CanvasNodeImage[];
     primaryImageId?: string;
     storageKey?: string;
+    assetId?: string;
+    hostedPromptTemplate?: string;
+    hostedRequest?: CreateArtBoxVideoGenerationBody;
+    hostedAttempt?: HostedVideoAttempt;
     mimeType?: string;
     bytes?: number;
     durationMs?: number;

@@ -29,6 +29,8 @@ const APPLICATION_TABLES = [
     "admin_operations",
     "global_audit_logs",
     "workspace_provisioning_audits",
+    "assets",
+    "artbox_video_generations",
 ] as const;
 const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVILEGES)[number][]>> = {
     users: ["SELECT", "INSERT", "UPDATE", "DELETE"],
@@ -40,6 +42,8 @@ const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVI
     workspace_invitations: ["SELECT", "INSERT"],
     canvases: ["SELECT", "INSERT"],
     workspace_audit_logs: ["INSERT"],
+    assets: ["SELECT", "INSERT"],
+    artbox_video_generations: ["SELECT", "INSERT"],
 };
 
 const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
@@ -47,6 +51,16 @@ const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> =
     workspace_invitations: ["status"],
     // document_mode/deletion_receipt_id 不在可写列表：前者只在创建时由服务端写入，后者由触发器生成。
     canvases: ["title", "snapshot_json", "revision", "updated_by", "updated_at", "deleted_at"],
+    assets: ["status", "staging_object_key", "byte_size", "etag", "updated_at"],
+    artbox_video_generations: [
+        "status",
+        "remote_task_id",
+        "result_asset_id",
+        "public_error",
+        "poll_lease_epoch",
+        "poll_lease_until",
+        "updated_at",
+    ],
 };
 
 const API_FUNCTIONS = [
@@ -58,6 +72,7 @@ const API_FUNCTIONS = [
     "is_current_admin_operation(text,text,text)",
     "execute_workspace_admin_operation()",
     "record_workspace_provisioning(text,text,text)",
+    "finalize_artbox_video_generation_create(uuid,text,text,text,text,jsonb)",
 ] as const;
 
 export type DatabaseRoleInspection = {

@@ -85,6 +85,31 @@ function canonicalJson<T>(value: T, active: Set<object> = new Set()): T {
     }
 }
 
+const ASSET_LOCATION_KEYS = new Set(["content", "url", "dataUrl", "storageKey"]);
+
+/** Asset IDs are durable; every colocated media location is a session-scoped capability or local-only key. */
+function stripAssetLocations<T>(value: T, active: Set<object> = new Set()): T {
+    if (!value || typeof value !== "object" || active.has(value as object)) return value;
+    const prototype = Object.getPrototypeOf(value);
+    const isArray = Array.isArray(value) && prototype === Array.prototype;
+    if (!isArray && prototype !== Object.prototype && prototype !== null) return value;
+    const source = value as Record<string, unknown>;
+    const assetBacked = typeof source.assetId === "string" && source.assetId.length > 0;
+    const next: Record<PropertyKey, unknown> | unknown[] = isArray ? [] : {};
+    active.add(value as object);
+    try {
+        for (const key of Reflect.ownKeys(value)) {
+            if (!isArray && typeof key === "string" && assetBacked && ASSET_LOCATION_KEYS.has(key)) continue;
+            const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+            if (!("value" in descriptor)) Object.defineProperty(next, key, descriptor);
+            else Object.defineProperty(next, key, { ...descriptor, value: stripAssetLocations(descriptor.value, active) });
+        }
+        return next as T;
+    } finally {
+        active.delete(value as object);
+    }
+}
+
 function sanitizeNode(node: CanvasNodeData): CanvasNodeData {
     const metadata = node.metadata;
     if (!metadata) return node;
@@ -102,7 +127,7 @@ function sanitizeNode(node: CanvasNodeData): CanvasNodeData {
     }
     /** 生成参数里的参考项已经是「storageKey 或稳定外链」，临时地址换会话就失效，只能丢弃。 */
     if (next.references?.some(isTransientUrl)) next.references = next.references.filter((url) => !isTransientUrl(url));
-    return { ...node, metadata: next };
+    return { ...node, metadata: stripAssetLocations(next) };
 }
 
 function sanitizeSession(session: CanvasAssistantSession): CanvasAssistantSession {
