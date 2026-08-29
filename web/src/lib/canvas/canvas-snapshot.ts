@@ -50,6 +50,41 @@ function isTransientUrl(value?: string) {
     return Boolean(value?.startsWith("blob:"));
 }
 
+/**
+ * JSON 丢弃值为 undefined 的自有属性，structuredClone 会原样保留它。
+ * 上层给可选字段赋 undefined 很常见（例如文本节点没有 texts 时仍会写 texts: undefined），
+ * 于是云端 JSON 保存成功、本地恢复却因为不是合法 JSON 被拒绝。这里在唯一的快照边界统一成
+ * 云端会存下的那个值，让两条持久化路径看到同一份数据。
+ * 只归一普通对象和数组：Date、Map、类实例、访问器、symbol 键、稀疏数组和非有限数字一律原样保留，
+ * 继续由恢复校验器 fail-closed 拒绝，不在这里静默改写成别的值。
+ */
+function canonicalJson<T>(value: T, active: Set<object> = new Set()): T {
+    if (!value || typeof value !== "object") return value;
+    /** 出现环时原样返回，交给恢复校验器 fail-closed 拒绝，而不是在这里递归爆栈。 */
+    if (active.has(value as object)) return value;
+    const prototype = Object.getPrototypeOf(value);
+    const isPlainArray = Array.isArray(value) && prototype === Array.prototype;
+    const isPlainObject = !Array.isArray(value) && (prototype === Object.prototype || prototype === null);
+    /** Date、Map、类实例、子类化数组等一律原样保留，由校验器判定，不在这里改写成别的值。 */
+    if (!isPlainArray && !isPlainObject) return value;
+
+    active.add(value as object);
+    try {
+        /** map 会保留空洞，稀疏数组因此仍然会被校验器拒绝。 */
+        if (isPlainArray) return (value as unknown[]).map((item) => canonicalJson(item, active)) as unknown as T;
+        const next: Record<PropertyKey, unknown> = {};
+        for (const key of Reflect.ownKeys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+            /** 访问器与 symbol 键都原样搬过去，保持不合法即被拒绝的语义。 */
+            if (!("value" in descriptor)) Object.defineProperty(next, key, descriptor);
+            else if (descriptor.value !== undefined) next[key] = canonicalJson(descriptor.value, active);
+        }
+        return next as T;
+    } finally {
+        active.delete(value as object);
+    }
+}
+
 function sanitizeNode(node: CanvasNodeData): CanvasNodeData {
     const metadata = node.metadata;
     if (!metadata) return node;
@@ -90,7 +125,7 @@ function sanitizeSession(session: CanvasAssistantSession): CanvasAssistantSessio
  * 否则下次在别的会话打开画布会拿到一个已经失效的地址。
  */
 export function projectToSnapshot(project: CanvasProject): CanvasSnapshot {
-    return {
+    return canonicalJson({
         nodes: project.nodes.map(sanitizeNode),
         connections: project.connections,
         chatSessions: project.chatSessions.map(sanitizeSession),
@@ -98,7 +133,7 @@ export function projectToSnapshot(project: CanvasProject): CanvasSnapshot {
         backgroundMode: project.backgroundMode,
         showImageInfo: project.showImageInfo,
         viewport: project.viewport,
-    } as unknown as CanvasSnapshot;
+    }) as unknown as CanvasSnapshot;
 }
 
 export function canvasToProject(canvas: Canvas): CanvasProject {

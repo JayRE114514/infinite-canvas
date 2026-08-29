@@ -1,25 +1,28 @@
-import type { CanvasSnapshot } from "@infinite-canvas/contracts";
+import type { CanvasDeletionReceipt, CanvasSnapshot } from "@infinite-canvas/contracts";
 
 import type { CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
-import type { CanvasProject, CanvasScope } from "@/types/canvas";
+import type { CanvasDraftUpsertInput } from "@/services/canvas-recovery/store";
+import type { CanvasConflictMarkerEntry, CanvasDraftWriteOutcome } from "@/services/canvas-recovery/types";
+import type { RecoveryScopeId } from "@/services/canvas-recovery/scope";
+import type { CanvasProject, CanvasScope, ViewportTransform } from "@/types/canvas";
 
 export const LOCAL_COALESCE_MS = 120;
 export const NETWORK_DEBOUNCE_MS = 400;
 export const NETWORK_MAX_WAIT_MS = 5_000;
 export const SAVE_REQUEST_TIMEOUT_MS = 20_000;
 export const LOAD_REQUEST_TIMEOUT_MS = 20_000;
-export const LOCAL_READ_TIMEOUT_MS = 2_000;
 export const LOCAL_FLUSH_TIMEOUT_MS = 2_000;
 export const DETACHED_LOCAL_MS = 2_000;
 export const DETACHED_NETWORK_MS = 10_000;
 export const MAX_DETACHED_SESSIONS = 2;
 export const EXPORT_BATCH_SIZE = 3;
 export const DRAFT_GC_MIN_AGE_MS = 6 * 60 * 60 * 1_000;
-export const MAX_CONFLICT_MARKER_ENTRIES = 2;
+export const MAX_COORDINATION_ATTEMPTS = 2;
+export { MAX_CONFLICT_MARKER_ENTRIES } from "@/services/canvas-recovery/types";
 
-export type CanvasSyncPhase = "loading" | "clean" | "dirty" | "saving" | "save-error" | "conflict" | "recovery-blocked" | "disposing" | "disposed";
+export type CanvasSyncPhase = "loading" | "clean" | "dirty" | "saving" | "save-error" | "conflict" | "recovery-blocked" | "tombstoned" | "disposing" | "disposed";
 export type CanvasSaveErrorKind = "network" | "timeout" | "server" | "invariant";
-export type CanvasLocalPersistState = "ok" | "degraded";
+export type CanvasLocalPersistState = "ok" | "degraded" | "tombstoned";
 export type CanvasSyncSaveError = { kind: CanvasSaveErrorKind; messageKey: string };
 export type CanvasSyncConflictView = { baseRevision: number; source: "save" | "restored"; extraDraftCount: number };
 
@@ -36,10 +39,14 @@ export type CanvasSyncView = {
     saveError: CanvasSyncSaveError | null;
     localPersist: CanvasLocalPersistState;
     conflict: CanvasSyncConflictView | null;
+    unavailableKey: string | null;
 };
 
-export type CanvasProjectPatch = Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport">>;
-export const CANVAS_PATCH_FIELDS = ["nodes", "connections", "chatSessions", "activeChatId", "backgroundMode", "showImageInfo", "viewport"] as const;
+/** Document edits advance editSeq and schedule a cloud save. */
+export const CANVAS_DOCUMENT_PATCH_FIELDS = ["nodes", "connections", "chatSessions", "activeChatId", "backgroundMode", "showImageInfo"] as const;
+/** Local UI only: persisted in the draft envelope, never serialized as a document edit. */
+export const CANVAS_LOCAL_PATCH_FIELDS = ["viewport"] as const;
+export type CanvasProjectPatch = Partial<Pick<CanvasProject, (typeof CANVAS_DOCUMENT_PATCH_FIELDS)[number] | (typeof CANVAS_LOCAL_PATCH_FIELDS)[number]>>;
 
 export type CanvasDisposeReason = "replaced" | "scope-changed" | "deleted" | "forced";
 export type CanvasRetryRecoveryResult = "unlocked" | "conflict" | "failed";
@@ -50,75 +57,61 @@ export type CanvasRenameOutcome = "scheduled" | "local-only";
  * resolver 只描述要做什么，不自己执行：这些改写必须由 commit 之后的会话拥有，
  * 否则被取消的 prepare 会留下无人观察、可能在清理之后落盘的原始写。
  */
-export type CanvasRecoveryRepair =
-    | { kind: "write-marker"; marker: CanvasConflictMarker }
-    | { kind: "delete-marker"; expectedDraftKeys: string[] }
-    | { kind: "delete-draft"; draftKey: string };
-
-export type CanvasDraftScope = { userId: string; workspaceId: string; canvasId: string };
-export type CanvasDraftState = "pending" | "synced";
-
-export type CanvasDraftRecord = {
-    userId: string;
-    workspaceId: string;
-    canvasId: string;
-    draftId: string;
-    /** 该内容所基于的服务端 revision。 */
-    baseRevision: number;
-    /** pending：尚未确认保存到服务端；synced：内容已被服务端在 baseRevision 确认。 */
-    state: CanvasDraftState;
-    title: string;
-    snapshot: CanvasSnapshot;
-    savedAt: string;
-};
-
-export type CanvasConflictMarkerEntry = { draftKey: string; draftId: string; baseRevision: number; savedAt: string };
-
-export type CanvasConflictMarker = {
-    userId: string;
-    workspaceId: string;
-    canvasId: string;
-    /** 最新在前，最多 MAX_CONFLICT_MARKER_ENTRIES 条。 */
-    entries: CanvasConflictMarkerEntry[];
-};
-
-/** 本地读取超时或抛错时抛出；与「记录无效」（返回 null）是两种不同结果。 */
-export class CanvasLocalRecoveryError extends Error {
-    constructor(readonly operation: string) {
-        super("canvas_local_recovery_failed:" + operation);
-        this.name = "CanvasLocalRecoveryError";
-    }
-}
-
-export type CanvasLocalWrite = {
-    /** 最多等待 LOCAL_FLUSH_TIMEOUT_MS；失败或超时统一抛 CanvasLocalRecoveryError。 */
-    result: Promise<void>;
-    /** 观察同一次原始 setItem 直到成功或失败；永不拒绝、没有超时，也不会取消底层写。 */
-    settled: Promise<void>;
-};
-
-/** 只做存取与校验，不做调度，不判断冲突语义；读取有界，所有改写（写入与删除）都同时暴露有界结果与原始落定信号。 */
-export interface CanvasLocalRecovery {
-    readMarker(scope: CanvasDraftScope): Promise<CanvasConflictMarker | null>;
-    writeMarker(marker: CanvasConflictMarker): CanvasLocalWrite;
-    /** 删除同样是不可取消的原始改写：必须与写入对称地暴露 settled，否则超时后的迟到删除无人观察。 */
-    deleteMarker(scope: CanvasDraftScope): CanvasLocalWrite;
-    /**
-     * 仅当 marker 仍与期望身份一致时删除：entries 全部包含在 expectedDraftKeys 内才删，
-     * 否则说明已有更新的会话写入了自己的 marker，迟到清理不得抹掉它。
-     */
-    deleteMarkerIfOwned(scope: CanvasDraftScope, expectedDraftKeys: string[]): CanvasLocalWrite;
-    readDraftByKey(key: string): Promise<CanvasDraftRecord | null>;
-    writeDraft(record: CanvasDraftRecord): CanvasLocalWrite;
-    deleteDraftByKey(key: string): CanvasLocalWrite;
-    /** 前缀枚举该画布全部草稿，savedAt 新的在前。 */
-    listCanvasDrafts(scope: CanvasDraftScope): Promise<CanvasDraftRecord[]>;
-    /** 删除该画布下不在 keepKeys 中且超过 DRAFT_GC_MIN_AGE_MS 的草稿；失败忽略。 */
-    collectGarbage(scope: CanvasDraftScope, keepKeys: string[]): Promise<void>;
-}
+export type CanvasRecoveryRepair = { kind: "write-marker"; entries: CanvasConflictMarkerEntry[] } | { kind: "delete-marker" } | { kind: "delete-drafts"; draftIds: string[] };
 
 export type CanvasLoadResult = { project: CanvasProject; revision: number };
 export type CanvasSaveInput = { baseRevision: number; title: string; snapshot: CanvasSnapshot };
+
+export type CanvasRecoveryResolution = {
+    phase: "clean" | "dirty" | "conflict" | "recovery-blocked" | "tombstoned";
+    content: CanvasProject;
+    revision: number;
+    draftId: string;
+    conflict: CanvasSyncConflictView | null;
+    repairs: CanvasRecoveryRepair[];
+    expectedCoordinationRevision: number;
+    expectedDeletionGeneration: number;
+    /**
+     * 本会话把内容复制进自己新行时，被它取代的旧草稿行及其当时的 writeSeq。
+     * 等本会话自己的行确认落盘、且该行仍是当时那一行时才回收：内容此时已在新行里，
+     * 不依赖网络也能安全回收。留着不回收会让已保存干净的画布下次打开被误判成冲突，
+     * 而 GC 不允许回收未同步行。
+     */
+    supersededDrafts: { draftId: string; expectedWriteSeq: number }[];
+    documentDefaultViewport: ViewportTransform;
+};
+
+export type CanvasConflictPublishOutcome = { status: "published"; extraDraftCount: number } | { status: "tombstoned" } | { status: "unavailable" };
+export type CanvasCoordinatedRetryOutcome =
+    | ({ status: "unlocked" } & CanvasRecoveryOwnership)
+    | ({ status: "conflict"; conflict: CanvasSyncConflictView } & CanvasRecoveryOwnership)
+    | { status: "tombstoned" }
+    | { status: "failed" };
+
+/**
+ * 一次重试后重新确立的本地恢复所有权事实。重试必须把这些事实带回 Session：
+ * 只返回 "unlocked" 会让 Session 继续用 prepare 期的 draftId 和删除代次写盘，
+ * 那等于在存储已经换代之后假装自己仍然拥有旧行。
+ */
+export type CanvasRecoveryOwnership = {
+    /** 本会话在新 epoch 下自己的草稿行；重试会重新铸一个，不接管别人的行。 */
+    draftId: string;
+    expectedCoordinationRevision: number;
+    expectedDeletionGeneration: number;
+    /** 已被本会话复制走、待本会话自己的行落盘后回收的旧行。 */
+    supersededDrafts: { draftId: string; expectedWriteSeq: number }[];
+};
+
+/** Manager-owned coordination seam; Session never receives the full recovery store. */
+export type CanvasSessionRecoveryCoordinator = {
+    publishConflict(draftId: string, baseRevision: number, signal: AbortSignal): Promise<CanvasConflictPublishOutcome>;
+    retryRecovery(load: CanvasLoadResult, ownDraftId: string, hasUnsavedEdits: boolean, signal: AbortSignal): Promise<CanvasCoordinatedRetryOutcome>;
+    exportConflictDrafts(canvasId: string, ownDraftId: string, signal: AbortSignal): Promise<CanvasProject[] | null>;
+    /** 回收已被本会话复制走的旧草稿行；只在本会话自己的行确认落盘后调用。 */
+    retireSupersededDrafts(drafts: { draftId: string; expectedWriteSeq: number }[], signal: AbortSignal): Promise<void>;
+};
+
+export type CanvasDraftWriter = (input: CanvasDraftUpsertInput, signal?: AbortSignal) => Promise<CanvasDraftWriteOutcome>;
 
 /** 纯 HTTP 映射，不引用 store/manager；session 与 manager 通过它注入网络依赖。 */
 export interface CanvasSyncRepository {
@@ -127,13 +120,32 @@ export interface CanvasSyncRepository {
     create(workspaceId: string, title: string): Promise<CanvasLoadResult>;
     importProject(workspaceId: string, body: { title: string; snapshot: CanvasSnapshot }): Promise<CanvasLoadResult>;
     save(workspaceId: string, canvasId: string, input: CanvasSaveInput, signal?: AbortSignal): Promise<CanvasLoadResult>;
-    remove(workspaceId: string, canvasId: string): Promise<void>;
+    /** Denied and indeterminate results are values so callers cannot mistake them for deletion proof. */
+    remove(workspaceId: string, canvasId: string): Promise<CanvasDeleteOutcome>;
 }
 
 export type CanvasSaveFailure = { kind: "conflict" } | { kind: "network" | "timeout" | "server"; messageKey: string };
 export type CanvasOpenFailure = { kind: "missing" } | { kind: "failed"; messageKey: string };
+export type CanvasDeleteIndeterminateReason = "network" | "timeout" | "invalid-response" | "mismatched-receipt" | "unknown";
+/** Only a valid receipt for the requested canvas is positive deletion proof. */
+export type CanvasDeleteOutcome =
+    | { status: "deleted"; receipt: CanvasDeletionReceipt }
+    | { status: "denied"; code: string; messageKey: string }
+    | { status: "indeterminate"; reason: CanvasDeleteIndeterminateReason; messageKey: string };
 
-export type CanvasSyncInvariantContext = { sessionId: number; canvasId: string; phase: CanvasSyncPhase; event: string; editSeq: number; savedSeq: number; inflightSeq: number; revision: number };
+export type CanvasSyncInvariantContext = {
+    sessionId: number;
+    canvasId: string;
+    phase: CanvasSyncPhase;
+    event: string;
+    editSeq: number;
+    savedSeq: number;
+    inflightSeq: number;
+    revision: number;
+    localUiSeq: number;
+    materializedLocalUiSeq: number;
+    persistedLocalUiSeq: number;
+};
 
 export class CanvasSyncInvariantError extends Error {
     constructor(readonly context: CanvasSyncInvariantContext) {
@@ -148,8 +160,8 @@ export interface CanvasSyncSession {
     readonly scope: CanvasScope;
     readonly scopeToken: number;
     readonly openToken: number;
-    /** 本会话唯一的草稿键，供 manager 在回收与清理时保留或删除。 */
-    readonly draftKey: string;
+    /** 本会话在 recovery scope 内唯一的草稿 id。 */
+    readonly draftId: string;
     readonly view: CanvasSyncView;
     /** 当前权威前端内容，引用稳定，供导出与素材引用判定使用。 */
     readonly content: CanvasProject;
@@ -159,7 +171,7 @@ export interface CanvasSyncSession {
     update(patch: CanvasProjectPatch): boolean;
     /** 标题在调用前已由 clampCanvasTitle 截断到 CANVAS_TITLE_MAX_LENGTH。 */
     rename(title: string): CanvasRenameOutcome;
-    /** 强制物化本地并在允许时提交一次；对外等待全部有界，超时后的原始本地写由 settled 继续观察。 */
+    /** 强制物化本地并在允许时提交一次；所有本地事务都由会话 owner signal 有界取消。 */
     flush(): Promise<void>;
     /**
      * 删除活动画布前的可逆冻结：停止接受编辑与网络保存，强制把最后一次编辑物化到本地，但保留会话所有权。
@@ -172,13 +184,8 @@ export interface CanvasSyncSession {
     retryRecovery(): Promise<CanvasRetryRecoveryResult>;
     exportConflictDrafts(): Promise<CanvasProject[]>;
     dispose(reason: CanvasDisposeReason): Promise<void>;
-    /**
-     * 会话所有的本地落定信号：等到该会话的草稿队列、可产生写入的尾巴和原始 setItem 都结束，故意不设上界。
-     * 同一会话的重复调用共享一个观察器；等待期间新登记的操作会在下一轮被重新检查。
-     * 它只观察，不取消或重试：有界 result/dispose 返回不代表原始写已结束，永久挂起也会令本观察器永久挂起。
-     * 只允许在已 dispose 或正在 dispose 的会话上调用，且只用于清理路径补一次幂等清理，绝不出现在打开画布的等待路径上。
-     */
-    whenLocalSettled(): Promise<void>;
+    /** Manager reports coordination outcomes without exposing its store to Session. */
+    reportRecoveryState(state: { status: "degraded" } | { status: "tombstoned" } | { status: "conflict"; conflict: CanvasSyncConflictView }): void;
     subscribe(listener: (view: CanvasSyncView) => void): () => void;
 }
 
@@ -206,7 +213,12 @@ export type CanvasRenameResult =
     | { status: "conflict" }
     | { status: "scope-changed" }
     | { status: "failed"; messageKey: string };
-export type CanvasDeleteResult = { deleted: string[]; failed: string[] };
+/**
+ * `deleted` means the server proved the deletion. `localCleanupPending` is a subset of it whose
+ * local tombstone could not be written yet, so the canvas is gone but local rows remain.
+ * `failed` means no deletion proof was received and the canvas still exists.
+ */
+export type CanvasDeleteResult = { deleted: string[]; failed: string[]; localCleanupPending: string[] };
 export type CanvasCommitServerCopyResult = "committed" | "cancelled" | "failed";
 
 export interface CanvasSyncManager {

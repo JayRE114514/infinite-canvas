@@ -45,6 +45,12 @@ export type CanvasCoordinationInput = {
     marker?: CanvasConflictMarkerEntry[] | null;
     /** Draft ids to delete, re-validated inside the same transaction. */
     deleteDraftIds?: string[];
+    /**
+     * Rows to retire only if they are still exactly the row that was copied forward. The writeSeq
+     * comparison happens inside this transaction, so a row another live session has rewritten in the
+     * meantime is left untouched instead of losing that newer content.
+     */
+    retireDrafts?: { draftId: string; expectedWriteSeq: number }[];
 };
 
 export type CanvasGarbageInput = {
@@ -67,6 +73,7 @@ export type CanvasRecoveryStore = {
 };
 
 type EpochReadResult = { status: "ok"; epoch: CanvasRecoveryEpoch } | { status: "corrupt" };
+type MarkerReadResult = { status: "ok"; marker: CanvasConflictMarkerRecord | null } | { status: "corrupt" };
 
 const CORRUPT = { status: "unavailable", reason: "corrupt" } as const;
 /** The widest instant Date can represent; anything beyond it has no canonical ISO form. */
@@ -99,6 +106,15 @@ async function readEpoch(txn: RecoveryTxn, scopeId: RecoveryScopeId): Promise<Ep
     if (raw === undefined) return { status: "ok", epoch: initialEpoch(scopeId) };
     const epoch = asEpoch(raw, scopeId);
     return epoch ? { status: "ok", epoch } : { status: "corrupt" };
+}
+
+/** Any second, noncanonical or invalid row makes marker ownership unknowable. */
+async function readScopeMarker(txn: RecoveryTxn, scopeId: RecoveryScopeId): Promise<MarkerReadResult> {
+    const rows = (await txn.req(txn.store(MARKERS_STORE).index(SCOPE_INDEX).getAll(scopeId))) as unknown[];
+    if (rows.length === 0) return { status: "ok", marker: null };
+    if (rows.length !== 1) return { status: "corrupt" };
+    const marker = asMarkerRecord(rows[0], scopeId);
+    return marker ? { status: "ok", marker } : { status: "corrupt" };
 }
 
 /**
@@ -137,13 +153,11 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
                 async (txn): Promise<CanvasRecoveryOpenResult> => {
                     const epochRead = await readEpoch(txn, scopeId);
                     if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
+                    const markerRead = await readScopeMarker(txn, scopeId);
+                    if (markerRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
                     const epoch = epochRead.epoch;
                     if (epoch.tombstonedAt) return { status: "tombstoned", deletionGeneration: epoch.deletionGeneration };
-                    const markerRaw = await txn.req(txn.store(MARKERS_STORE).get([scopeId, CONFLICT_MARKER_ID]));
-                    const marker = asMarkerRecord(markerRaw, scopeId);
-                    /** A present but invalid marker has unknown ownership; fail closed instead of treating it as absent. */
-                    if (markerRaw !== undefined && !marker) return { status: "unavailable", reason: "corrupt" };
-                    return { status: "ok", snapshot: { epoch, marker, drafts: await readScopeDrafts(txn, scopeId) } };
+                    return { status: "ok", snapshot: { epoch, marker: markerRead.marker, drafts: await readScopeDrafts(txn, scopeId) } };
                 },
                 signal,
             );
@@ -174,21 +188,22 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
                 envelope: input.envelope,
                 savedAt: input.savedAt,
             });
-            const record = candidate && asDraftRecord(candidate, input.scopeId);
+            const record = candidate && asDraftRecord(candidate, candidate.scopeId);
             if (!record) return CORRUPT;
+            const { scopeId } = record;
 
             const run = await database.run(
                 "readwrite",
                 [EPOCHS_STORE, DRAFTS_STORE],
                 RECOVERY_TRANSACTION_TIMEOUT_MS,
                 async (txn): Promise<CanvasDraftWriteOutcome> => {
-                    const epochRead = await readEpoch(txn, input.scopeId);
+                    const epochRead = await readEpoch(txn, scopeId);
                     if (epochRead.status === "corrupt") return { status: "unavailable", reason: "corrupt" };
                     const epoch = epochRead.epoch;
                     if (epoch.tombstonedAt) return { status: "tombstoned" };
                     if (epoch.deletionGeneration !== record.deletionGeneration) return { status: "generation-changed", deletionGeneration: epoch.deletionGeneration };
-                    const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([input.scopeId, record.draftId]));
-                    const stored = asDraftRecord(storedRaw, input.scopeId);
+                    const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([scopeId, record.draftId]));
+                    const stored = asDraftRecord(storedRaw, scopeId);
                     /** Unknown sequence/shape cannot be compared safely. Preserve it until explicit confirmed deletion. */
                     if (storedRaw !== undefined && !stored) return { status: "unavailable", reason: "corrupt" };
                     if (stored && stored.writeSeq >= record.writeSeq) return { status: "superseded", storedWriteSeq: stored.writeSeq };
@@ -206,28 +221,37 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
          * It never writes a tombstone and never touches deletionGeneration.
          */
         commitCoordination: async (input, signal) => {
-            if (!isRecoveryCount(input.expectedCoordinationRevision) || !isRecoveryCount(input.expectedDeletionGeneration)) return CORRUPT;
-            /** Detached and validated before the first await: the caller cannot mutate what gets stored. */
+            const captured = detach({
+                scopeId: input.scopeId,
+                expectedCoordinationRevision: input.expectedCoordinationRevision,
+                expectedDeletionGeneration: input.expectedDeletionGeneration,
+                markerInput: input.marker,
+                deleteDraftIds: input.deleteDraftIds ?? [],
+                retireDrafts: input.retireDrafts ?? [],
+            });
+            if (!captured || !isRecoveryCount(captured.expectedCoordinationRevision) || !isRecoveryCount(captured.expectedDeletionGeneration)) return CORRUPT;
+            const { scopeId, expectedCoordinationRevision, expectedDeletionGeneration, markerInput, deleteDraftIds, retireDrafts } = captured;
+            /** Captured and validated before the first await: the caller cannot change what gets stored. */
             let marker: CanvasConflictMarkerRecord | null = null;
-            if (input.marker) {
-                const cloned = detach(input.marker);
-                const candidate = cloned && asMarkerRecord({ scopeId: input.scopeId, markerId: CONFLICT_MARKER_ID, entries: cloned }, input.scopeId);
+            if (markerInput !== undefined && markerInput !== null) {
+                const candidate = asMarkerRecord({ scopeId, markerId: CONFLICT_MARKER_ID, entries: markerInput }, scopeId);
                 if (!candidate || candidate.entries.length > MAX_CONFLICT_MARKER_ENTRIES) return CORRUPT;
                 marker = candidate;
             }
-            const deleteDraftIds = detach(input.deleteDraftIds ?? []);
-            if (!deleteDraftIds || !deleteDraftIds.every(isDraftId)) return CORRUPT;
+            if (!deleteDraftIds.every(isDraftId)) return CORRUPT;
+            if (!retireDrafts.every((row) => isDraftId(row.draftId) && isRecoveryCount(row.expectedWriteSeq))) return CORRUPT;
 
             const run = await database.run(
                 "readwrite",
                 [EPOCHS_STORE, MARKERS_STORE, DRAFTS_STORE],
                 RECOVERY_TRANSACTION_TIMEOUT_MS,
                 async (txn): Promise<CanvasCoordinationOutcome> => {
-                    const epochRead = await readEpoch(txn, input.scopeId);
+                    const epochRead = await readEpoch(txn, scopeId);
                     if (epochRead.status === "corrupt") return CORRUPT;
+                    if ((await readScopeMarker(txn, scopeId)).status === "corrupt") return CORRUPT;
                     const epoch = epochRead.epoch;
                     if (epoch.tombstonedAt) return { status: "tombstoned" };
-                    if (epoch.coordinationRevision !== input.expectedCoordinationRevision || epoch.deletionGeneration !== input.expectedDeletionGeneration) {
+                    if (epoch.coordinationRevision !== expectedCoordinationRevision || epoch.deletionGeneration !== expectedDeletionGeneration) {
                         return { status: "stale", coordinationRevision: epoch.coordinationRevision, deletionGeneration: epoch.deletionGeneration };
                     }
                     /** Refuse an unrepresentable increment BEFORE any write, so overflow cannot leave a partial commit. */
@@ -236,18 +260,25 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
                     const draftIdsToDelete: string[] = [];
                     for (const draftId of deleteDraftIds) {
                         /** Re-read and validate every target before the first write, preserving all-or-nothing semantics. */
-                        const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([input.scopeId, draftId]));
-                        const stored = asDraftRecord(storedRaw, input.scopeId);
+                        const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([scopeId, draftId]));
+                        const stored = asDraftRecord(storedRaw, scopeId);
                         /** Coordination cannot prove a corrupt row's lineage; only confirmed deletion may clear it. */
                         if (storedRaw !== undefined && !stored) return CORRUPT;
                         if (stored) draftIdsToDelete.push(draftId);
                     }
-                    if (input.marker !== undefined) {
-                        if (marker === null) await txn.req(txn.store(MARKERS_STORE).delete([input.scopeId, CONFLICT_MARKER_ID]));
+                    for (const row of retireDrafts) {
+                        const storedRaw = await txn.req(txn.store(DRAFTS_STORE).get([scopeId, row.draftId]));
+                        const stored = asDraftRecord(storedRaw, scopeId);
+                        if (storedRaw !== undefined && !stored) return CORRUPT;
+                        /** A different writeSeq means another writer owns this row now: never retire it. */
+                        if (stored && stored.writeSeq === row.expectedWriteSeq) draftIdsToDelete.push(row.draftId);
+                    }
+                    if (markerInput !== undefined) {
+                        if (marker === null) await txn.req(txn.store(MARKERS_STORE).delete([scopeId, CONFLICT_MARKER_ID]));
                         /** The detached validated candidate is stored, never the caller's live array. */
                         else await txn.req(txn.store(MARKERS_STORE).put(marker));
                     }
-                    for (const draftId of draftIdsToDelete) await txn.req(txn.store(DRAFTS_STORE).delete([input.scopeId, draftId]));
+                    for (const draftId of draftIdsToDelete) await txn.req(txn.store(DRAFTS_STORE).delete([scopeId, draftId]));
                     await txn.req(txn.store(EPOCHS_STORE).put(next));
                     return { status: "committed", coordinationRevision: next.coordinationRevision };
                 },
@@ -307,37 +338,47 @@ export function createCanvasRecoveryStore(database: RecoveryDatabase): CanvasRec
 
         /** GC is a coordination step: it re-verifies age, marker references and epoch inside the deleting transaction. */
         collectGarbage: async (input, signal) => {
-            if (!isRecoveryCount(input.expectedCoordinationRevision) || !isRecoveryCount(input.expectedDeletionGeneration)) return CORRUPT;
+            const captured = detach({
+                scopeId: input.scopeId,
+                expectedCoordinationRevision: input.expectedCoordinationRevision,
+                expectedDeletionGeneration: input.expectedDeletionGeneration,
+                keepDraftIds: input.keepDraftIds,
+                now: input.now,
+                minAgeMs: input.minAgeMs,
+            });
+            if (!captured || !isRecoveryCount(captured.expectedCoordinationRevision) || !isRecoveryCount(captured.expectedDeletionGeneration)) return CORRUPT;
+            const { scopeId, expectedCoordinationRevision, expectedDeletionGeneration, keepDraftIds, now, minAgeMs } = captured;
             /** Age arithmetic decides what is destroyed, so both operands must be real and nonnegative. */
-            if (!isElapsedMs(input.now) || !isElapsedMs(input.minAgeMs)) return CORRUPT;
-            /** Snapshotted before the first await: a later mutation of the caller's array cannot widen GC. */
-            const keepDraftIds = detach(input.keepDraftIds);
-            if (!keepDraftIds || !keepDraftIds.every(isDraftId)) return CORRUPT;
+            if (!isElapsedMs(now) || !isElapsedMs(minAgeMs) || !keepDraftIds.every(isDraftId)) return CORRUPT;
 
             const run = await database.run(
                 "readwrite",
                 [EPOCHS_STORE, MARKERS_STORE, DRAFTS_STORE],
                 RECOVERY_TRANSACTION_TIMEOUT_MS,
                 async (txn): Promise<CanvasCoordinationOutcome> => {
-                    const epochRead = await readEpoch(txn, input.scopeId);
+                    const epochRead = await readEpoch(txn, scopeId);
                     if (epochRead.status === "corrupt") return CORRUPT;
+                    const markerRead = await readScopeMarker(txn, scopeId);
+                    if (markerRead.status === "corrupt") return CORRUPT;
                     const epoch = epochRead.epoch;
                     if (epoch.tombstonedAt) return { status: "tombstoned" };
-                    if (epoch.coordinationRevision !== input.expectedCoordinationRevision || epoch.deletionGeneration !== input.expectedDeletionGeneration) {
+                    if (epoch.coordinationRevision !== expectedCoordinationRevision || epoch.deletionGeneration !== expectedDeletionGeneration) {
                         return { status: "stale", coordinationRevision: epoch.coordinationRevision, deletionGeneration: epoch.deletionGeneration };
                     }
                     const next = nextEpoch(epoch, { coordinationRevision: epoch.coordinationRevision + 1 });
                     if (!next) return CORRUPT;
-                    const markerRaw = await txn.req(txn.store(MARKERS_STORE).get([input.scopeId, CONFLICT_MARKER_ID]));
-                    const marker = asMarkerRecord(markerRaw, input.scopeId);
-                    if (markerRaw !== undefined && !marker) return CORRUPT;
                     /** Re-read marker references here: a draft another tab just published must not be collected. */
-                    const keep = new Set([...keepDraftIds, ...(marker ? marker.entries.map((entry) => entry.draftId) : [])]);
-                    for (const draft of await readScopeDrafts(txn, input.scopeId)) {
+                    const keep = new Set([...keepDraftIds, ...(markerRead.marker ? markerRead.marker.entries.map((entry) => entry.draftId) : [])]);
+                    for (const draft of await readScopeDrafts(txn, scopeId)) {
                         if (keep.has(draft.draftId)) continue;
+                        /**
+                         * Age is not proof of sync. A pending row may be the user's only copy of that work,
+                         * so only a row that already reached the server is ordinary garbage.
+                         */
+                        if (draft.state !== "synced") continue;
                         const savedAt = Date.parse(draft.savedAt);
-                        if (!Number.isFinite(savedAt) || input.now - savedAt <= input.minAgeMs) continue;
-                        await txn.req(txn.store(DRAFTS_STORE).delete([input.scopeId, draft.draftId]));
+                        if (!Number.isFinite(savedAt) || now - savedAt <= minAgeMs) continue;
+                        await txn.req(txn.store(DRAFTS_STORE).delete([scopeId, draft.draftId]));
                     }
                     await txn.req(txn.store(EPOCHS_STORE).put(next));
                     return { status: "committed", coordinationRevision: next.coordinationRevision };

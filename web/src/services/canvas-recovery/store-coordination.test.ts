@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { freshIndexedDB } from "../../../test/setup-indexeddb";
 import { createRecoveryDatabase, DRAFTS_STORE, EPOCHS_STORE, MARKERS_STORE, SCOPE_INDEX } from "./database";
 import { buildRecoveryScopeId } from "./scope";
-import { createCanvasRecoveryStore, createLazyBrowserRecoveryStore, type CanvasRecoveryStore } from "./store";
+import { createCanvasRecoveryStore, createLazyBrowserRecoveryStore, type CanvasCoordinationInput, type CanvasDraftUpsertInput, type CanvasGarbageInput, type CanvasRecoveryStore } from "./store";
 import { CONFLICT_MARKER_ID, type CanvasConflictMarkerEntry, type CanvasDraftEnvelope } from "./types";
 
 const scopeA = buildRecoveryScopeId({ kind: "account", userId: "u1", workspaceId: "w1", canvasId: "c1" })!;
@@ -19,6 +19,9 @@ const makeEnvelope = (title = "T"): CanvasDraftEnvelope => ({
 const envelope: CanvasDraftEnvelope = makeEnvelope();
 const write = (store: CanvasRecoveryStore, scopeId: typeof scopeA, draftId: string, writeSeq: number, savedAtMs: number) =>
     store.upsertDraft({ scopeId, draftId, writeSeq, expectedDeletionGeneration: 0, state: "pending", envelope, savedAt: new Date(savedAtMs).toISOString() });
+/** A synced row has positive proof it reached the server, so it is ordinary garbage. */
+const writeSynced = (store: CanvasRecoveryStore, scopeId: typeof scopeA, draftId: string, writeSeq: number, savedAtMs: number) =>
+    store.upsertDraft({ scopeId, draftId, writeSeq, expectedDeletionGeneration: 0, state: "synced", envelope, savedAt: new Date(savedAtMs).toISOString() });
 const entry = (draftId: string): CanvasConflictMarkerEntry => ({ draftId, baseRevision: 1, savedAt: new Date(0).toISOString() });
 const corrupt = { status: "unavailable", reason: "corrupt" } as const;
 
@@ -59,6 +62,63 @@ describe("coordination, deletion and gc CAS", () => {
         // Coordination must never write a tombstone or touch the deletion generation.
         expect(snapshot.snapshot.epoch.deletionGeneration).toBe(0);
         expect(snapshot.snapshot.epoch.tombstonedAt).toBeNull();
+    });
+
+    it("captures outer operation inputs before IndexedDB work begins", async () => {
+        await write(store, scopeA, "original", 2, 0);
+        const draftInput: CanvasDraftUpsertInput = { scopeId: scopeA, draftId: "original", writeSeq: 1, expectedDeletionGeneration: 0, state: "pending", envelope, savedAt: new Date(0).toISOString() };
+        const draftWrite = store.upsertDraft(draftInput);
+        draftInput.scopeId = scopeB;
+        draftInput.draftId = "hijacked";
+        draftInput.writeSeq = 99;
+        draftInput.expectedDeletionGeneration = 99;
+        expect(await draftWrite).toEqual({ status: "superseded", storedWriteSeq: 2 });
+
+        const coordinationInput: CanvasCoordinationInput = { scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("original")] };
+        const coordination = store.commitCoordination(coordinationInput);
+        coordinationInput.scopeId = scopeB;
+        coordinationInput.expectedCoordinationRevision = 99;
+        coordinationInput.expectedDeletionGeneration = 99;
+        coordinationInput.marker = null;
+        coordinationInput.deleteDraftIds = ["original"];
+        expect(await coordination).toEqual({ status: "committed", coordinationRevision: 1 });
+
+        const gcInput: CanvasGarbageInput = { scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, keepDraftIds: ["original"], now: 2 * DAY, minAgeMs: SIX_HOURS };
+        const gc = store.collectGarbage(gcInput);
+        gcInput.scopeId = scopeB;
+        gcInput.expectedCoordinationRevision = 99;
+        gcInput.expectedDeletionGeneration = 99;
+        gcInput.keepDraftIds = [];
+        gcInput.now = 0;
+        gcInput.minAgeMs = 0;
+        expect(await gc).toEqual({ status: "committed", coordinationRevision: 2 });
+
+        const snapshot = await store.readOpenSnapshot(scopeA);
+        if (snapshot.status !== "ok") throw new Error("expected ok");
+        expect(snapshot.snapshot.marker?.entries).toEqual([entry("original")]);
+        expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["original"]);
+        expect(snapshot.snapshot.epoch).toEqual({ scopeId: scopeA, coordinationRevision: 2, deletionGeneration: 0, tombstonedAt: null });
+        expect(await store.readOpenSnapshot(scopeB)).toEqual({ status: "ok", snapshot: { epoch: { scopeId: scopeB, coordinationRevision: 0, deletionGeneration: 0, tombstonedAt: null }, marker: null, drafts: [] } });
+    });
+
+    it("fails ordinary scope operations on a duplicate noncanonical marker but confirmed deletion clears it", async () => {
+        await write(store, scopeA, "d1", 1, 0);
+        const database = createRecoveryDatabase(factory);
+        await database.run("readwrite", [MARKERS_STORE], 2_000, async (txn) => {
+            await txn.req(txn.store(MARKERS_STORE).put({ scopeId: scopeA, markerId: CONFLICT_MARKER_ID, entries: [entry("d1")] }));
+            await txn.req(txn.store(MARKERS_STORE).put({ scopeId: scopeA, markerId: "duplicate", entries: [entry("d1")] }));
+            return 0;
+        });
+
+        expect(await store.readOpenSnapshot(scopeA)).toEqual(corrupt);
+        expect(await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: null })).toEqual(corrupt);
+        expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, keepDraftIds: [], now: 2 * DAY, minAgeMs: SIX_HOURS })).toEqual(corrupt);
+        expect(await store.confirmDeletion(scopeA, 0, 2 * DAY)).toEqual({ status: "tombstoned", deletionGeneration: 1 });
+
+        const markers = await database.run("readonly", [MARKERS_STORE], 2_000, (txn) => txn.req(txn.store(MARKERS_STORE).index(SCOPE_INDEX).getAll(scopeA)));
+        if (markers.status !== "ok") throw new Error("expected ok");
+        expect(markers.value).toEqual([]);
+        database.close();
     });
 
     it("rejects a stale coordination attempt and changes nothing", async () => {
@@ -178,8 +238,8 @@ describe("coordination, deletion and gc CAS", () => {
         const now = 10 * DAY;
         await write(store, scopeA, "live", 1, now);
         await write(store, scopeA, "referenced", 1, now - 2 * DAY);
-        await write(store, scopeA, "stale", 1, now - 2 * DAY);
-        await write(store, scopeA, "recent", 1, now - 60_000);
+        await writeSynced(store, scopeA, "stale", 1, now - 2 * DAY);
+        await writeSynced(store, scopeA, "recent", 1, now - 60_000);
         await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, marker: [entry("referenced")] });
 
         /** The keep list is snapshotted before the first await, so a later mutation cannot widen GC. */
@@ -193,6 +253,47 @@ describe("coordination, deletion and gc CAS", () => {
         const snapshot = await store.readOpenSnapshot(scopeA);
         if (snapshot.status !== "ok") throw new Error("expected ok");
         expect(snapshot.snapshot.drafts.map((draft) => draft.draftId).sort()).toEqual(["live", "recent", "referenced"]);
+    });
+
+    /**
+     * Age is not proof of sync. An unsynced draft may be the user's only copy, so GC must never
+     * collect it; only a row that already reached the server is ordinary garbage.
+     */
+    it("never collects an unsynced draft on age alone", async () => {
+        const now = 10 * DAY;
+        await write(store, scopeA, "unsynced-old", 1, now - 30 * DAY);
+        await writeSynced(store, scopeA, "synced-old", 1, now - 30 * DAY);
+
+        expect(await store.collectGarbage({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, keepDraftIds: [], now, minAgeMs: SIX_HOURS })).toEqual({
+            status: "committed",
+            coordinationRevision: 1,
+        });
+
+        const snapshot = await store.readOpenSnapshot(scopeA);
+        if (snapshot.status !== "ok") throw new Error("expected ok");
+        expect(snapshot.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["unsynced-old"]);
+    });
+
+    /**
+     * Retiring a copied-forward row is only safe while it is still that exact row. If another live
+     * session has rewritten it since, its newer content must survive.
+     */
+    it("retires a superseded row only when its writeSeq still matches", async () => {
+        await write(store, scopeA, "source", 4, 1_000);
+
+        expect(
+            await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 0, expectedDeletionGeneration: 0, retireDrafts: [{ draftId: "source", expectedWriteSeq: 3 }] }),
+        ).toEqual({ status: "committed", coordinationRevision: 1 });
+        const kept = await store.readOpenSnapshot(scopeA);
+        if (kept.status !== "ok") throw new Error("expected ok");
+        expect(kept.snapshot.drafts.map((draft) => draft.draftId)).toEqual(["source"]);
+
+        expect(
+            await store.commitCoordination({ scopeId: scopeA, expectedCoordinationRevision: 1, expectedDeletionGeneration: 0, retireDrafts: [{ draftId: "source", expectedWriteSeq: 4 }] }),
+        ).toEqual({ status: "committed", coordinationRevision: 2 });
+        const retired = await store.readOpenSnapshot(scopeA);
+        if (retired.status !== "ok") throw new Error("expected ok");
+        expect(retired.snapshot.drafts).toEqual([]);
     });
 
     it("refuses GC on a stale epoch so it cannot delete a draft another tab just published", async () => {

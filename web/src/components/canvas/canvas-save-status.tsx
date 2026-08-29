@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { App } from "antd";
+import { App, theme as antdTheme } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
@@ -13,6 +13,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
 export function CanvasSaveStatus({ onReloadCanvas }: { onReloadCanvas: () => void }) {
     const { t } = useTranslation();
     const { message } = App.useApp();
+    const { token } = antdTheme.useToken();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const sync = useCanvasStore((state) => state.sync);
     const retrySave = useCanvasStore((state) => state.retrySave);
@@ -22,10 +23,13 @@ export function CanvasSaveStatus({ onReloadCanvas }: { onReloadCanvas: () => voi
 
     const canvasId = sync.canvasId;
     const degraded = sync.localPersist === "degraded";
+    const tombstoned = sync.phase === "tombstoned";
     const invariant = sync.saveError?.kind === "invariant";
     /** clean 且本会话从未保存过时不显示状态位；冲突由冲突条表达。 */
     const label =
-        sync.phase === "saving"
+        tombstoned
+            ? t(sync.unavailableKey || "canvas.recovery.tombstoned")
+            : sync.phase === "saving"
             ? t("canvas.save.saving")
             : sync.phase === "dirty"
               ? t("canvas.save.unsaved")
@@ -50,7 +54,7 @@ export function CanvasSaveStatus({ onReloadCanvas }: { onReloadCanvas: () => voi
                   },
               }
             : null;
-    const failed = degraded || sync.phase === "save-error" || sync.phase === "recovery-blocked";
+    const failed = tombstoned || degraded || sync.phase === "save-error" || sync.phase === "recovery-blocked";
     const statusLabel = [label, degraded ? t("canvas.save.localDegraded") : ""].filter(Boolean).join(" · ");
 
     /** 重试都要真正重新执行：普通保存重新捕获当前最新内容，恢复失败则重新读本地 marker/草稿。 */
@@ -67,7 +71,7 @@ export function CanvasSaveStatus({ onReloadCanvas }: { onReloadCanvas: () => voi
     };
 
     return (
-        <span className="flex h-8 items-center gap-1.5 text-xs" style={{ color: failed ? "#dc2626" : theme.node.muted }}>
+        <span className="flex h-8 items-center gap-1.5 text-xs" style={{ color: failed ? token.colorError : theme.node.muted }}>
             <span className="max-w-[220px] truncate">{statusLabel}</span>
             {action ? (
                 <button

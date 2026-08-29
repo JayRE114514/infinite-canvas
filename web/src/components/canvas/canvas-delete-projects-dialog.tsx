@@ -21,8 +21,10 @@ export function CanvasDeleteProjectsDialog() {
     const confirm = async () => {
         setDeleting(true);
         try {
-            const { deleted, failed } = await deleteProjects(ids);
+            const { deleted, failed, localCleanupPending } = await deleteProjects(ids);
             if (deleted.length) removeSelectedIds(deleted);
+            /** 服务端已删除但本地清理未完成：画布确实没了，只提示本地草稿稍后清理，不能说“已保留”。 */
+            if (localCleanupPending.length) message.warning(t("canvas.deleteLocalCleanupPending"));
             if (failed.length) {
                 message.error(t(deleted.length ? "canvas.deletePartialFailed" : "canvas.deleteFailed"));
                 setDeleteIds(failed);

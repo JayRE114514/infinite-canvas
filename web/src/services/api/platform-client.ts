@@ -52,7 +52,11 @@ export class PlatformApiError extends Error {
 
 export async function platformRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
-    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    /**
+     * 只有真的带 body 才声明 JSON：无 body 的 DELETE 若仍声明 application/json，
+     * Fastify 会在进入路由前按空 JSON 解析并返回 400，删除请求根本到不了服务层。
+     */
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
     let response: Response;
     try {

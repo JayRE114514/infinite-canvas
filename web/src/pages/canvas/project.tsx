@@ -1151,8 +1151,9 @@ function InfiniteCanvasPage() {
 
     const deleteCurrentProject = useCallback(async () => {
         try {
-            const { failed } = await deleteProjects([projectId]);
+            const { failed, localCleanupPending } = await deleteProjects([projectId]);
             if (failed.length) return message.error(t("canvas.deleteFailed"));
+            if (localCleanupPending.length) message.warning(t("canvas.deleteLocalCleanupPending"));
             navigate("/canvas");
         } catch {
             message.error(t("canvas.deleteFailed"));

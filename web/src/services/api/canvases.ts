@@ -1,11 +1,11 @@
 import type {
     Canvas,
+    CanvasDeletionReceipt,
     CanvasListResponse,
     CanvasResponse,
     CanvasSummary,
     CreateCanvasBody,
     SaveCanvasRequest,
-    SuccessResponse,
 } from "@infinite-canvas/contracts";
 
 import { platformRequest } from "@/services/api/platform-client";
@@ -38,6 +38,7 @@ export async function saveCanvas(workspaceId: string, canvasId: string, body: Sa
     return response.canvas;
 }
 
-export async function deleteCanvas(workspaceId: string, canvasId: string): Promise<void> {
-    await platformRequest<SuccessResponse>(canvasPath(workspaceId, canvasId), { method: "DELETE" });
+/** DELETE responds with the durable receipt itself, not a success envelope. */
+export async function deleteCanvas(workspaceId: string, canvasId: string): Promise<CanvasDeletionReceipt> {
+    return platformRequest<CanvasDeletionReceipt>(canvasPath(workspaceId, canvasId), { method: "DELETE" });
 }

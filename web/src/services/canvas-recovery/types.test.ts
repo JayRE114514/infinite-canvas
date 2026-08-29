@@ -87,7 +87,8 @@ describe("recovery record validators", () => {
         expect(asDraftRecord(withSnapshot({ nested: new Map() }), scopeId)).toBeNull();
         expect(asDraftRecord(withSnapshot({ nested: new SnapshotClass() }), scopeId)).toBeNull();
         expect(asDraftRecord(withSnapshot({ nested: [undefined] }), scopeId)).toBeNull();
-        expect(asDraftRecord(withSnapshot({ nested: [1n] }), scopeId)).toBeNull();
+        /** BigInt 字面量需要 ES2020，这里用构造函数表达同一个非法快照值。 */
+        expect(asDraftRecord(withSnapshot({ nested: [BigInt(1)] }), scopeId)).toBeNull();
         expect(asDraftRecord(withSnapshot({ nested: [Symbol("bad")] }), scopeId)).toBeNull();
         expect(asDraftRecord(withSnapshot({ nested: [() => undefined] }), scopeId)).toBeNull();
         expect(asDraftRecord(withSnapshot({ nested: [Number.NaN] }), scopeId)).toBeNull();

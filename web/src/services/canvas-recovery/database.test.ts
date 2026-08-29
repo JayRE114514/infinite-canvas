@@ -48,7 +48,8 @@ describe("recovery database", () => {
                 queueMicrotask(() => request.onblocked?.({} as IDBVersionChangeEvent));
                 return request;
             },
-        } as IDBFactory;
+            /** 只实现 open：这是刻意残缺的替身，用 unknown 明确声明它不是完整 IDBFactory。 */
+        } as unknown as IDBFactory;
         const startedAt = performance.now();
         const result = await createRecoveryDatabase(factory).run("readonly", [EPOCHS_STORE], 2_000, async () => 0);
         expect(result).toEqual({ status: "failed", reason: "blocked" });
