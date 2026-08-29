@@ -6,11 +6,11 @@ import type {
     ArtBoxVideoGenerationStatus,
     CreateArtBoxVideoGenerationBody,
 } from "@infinite-canvas/contracts";
-import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 
 import { AppError } from "../../errors.js";
 import { hashCanonicalRequest } from "../../infrastructure/idempotency.js";
-import { withTenantTransaction } from "../../infrastructure/database/transactions.js";
+import { withTenantTransaction, withUserTransaction } from "../../infrastructure/database/transactions.js";
 import type { AppDatabase, AppTransaction } from "../../infrastructure/database/types.js";
 import type { ObjectStorage, StoredObject } from "../../infrastructure/object-storage/types.js";
 import { assets } from "../assets/schema.js";
@@ -91,32 +91,44 @@ function storageFailure(): ArtBoxGenerationError {
 async function persistCreateOutcome(
     db: AppDatabase,
     tenant: TenantInput,
-    generationId: string,
+    generation: GenerationRow,
     outcome:
         | { kind: "submitted"; remoteTaskId: string }
         | { kind: "failed" | "reconciling"; error: ArtBoxGenerationError },
 ): Promise<ArtBoxVideoGeneration> {
-    return withTenantTransaction(db, tenant, async (tx, access) => {
-        requireActiveWorkspace(access);
-        const current = await findGeneration(tx, access.workspaceId, generationId, true);
-        if (current.status !== "submitting") return toGeneration(current);
-        const [updated] = await tx
-            .update(artboxVideoGenerations)
-            .set(
-                outcome.kind === "submitted"
-                    ? { status: "queued", remoteTaskId: outcome.remoteTaskId, publicError: null, updatedAt: new Date() }
-                    : { status: outcome.kind, publicError: outcome.error, updatedAt: new Date() },
+    const status = outcome.kind === "submitted" ? "queued" : outcome.kind;
+    const remoteTaskId = outcome.kind === "submitted" ? outcome.remoteTaskId : null;
+    const errorJson = outcome.kind === "submitted" ? null : JSON.stringify(outcome.error);
+    return withUserTransaction(db, tenant.userId, async (tx) => {
+        const result = await tx.execute<{
+            generation_id: string;
+            workspace_id: string;
+            generation_status: string;
+            result_asset_id: string | null;
+            generation_error: unknown;
+            created_at: Date;
+            updated_at: Date;
+        }>(sql`
+            select * from public.finalize_artbox_video_generation_create(
+                ${generation.id}::uuid,
+                ${generation.workspaceId}::text,
+                ${generation.requestHash}::text,
+                ${status}::text,
+                ${remoteTaskId}::text,
+                ${errorJson}::jsonb
             )
-            .where(
-                and(
-                    eq(artboxVideoGenerations.id, current.id),
-                    eq(artboxVideoGenerations.workspaceId, access.workspaceId),
-                    eq(artboxVideoGenerations.status, "submitting"),
-                ),
-            )
-            .returning();
-        if (!updated) throw new Error("ArtBox create outcome update returned no row");
-        return toGeneration(updated);
+        `);
+        const finalized = result.rows[0];
+        if (!finalized || result.rows.length !== 1) throw new Error("ArtBox create finalizer returned no row");
+        return {
+            id: finalized.generation_id,
+            workspaceId: finalized.workspace_id,
+            status: finalized.generation_status as ArtBoxVideoGenerationStatus,
+            resultAssetId: finalized.result_asset_id,
+            error: publicError(finalized.generation_error),
+            createdAt: new Date(finalized.created_at).toISOString(),
+            updatedAt: new Date(finalized.updated_at).toISOString(),
+        };
     });
 }
 
@@ -127,6 +139,13 @@ export async function createArtBoxVideoGeneration(
     idempotencyKey: string,
     dependencies: ArtBoxServiceDependencies,
 ): Promise<ArtBoxVideoGeneration> {
+    const nodeIds = new Set<string>();
+    for (const binding of input.bindings) {
+        if (nodeIds.has(binding.nodeId)) {
+            throw new AppError("duplicate_media_binding", 422, "同一节点不能重复绑定素材");
+        }
+        nodeIds.add(binding.nodeId);
+    }
     const requestHash = hashCanonicalRequest(input);
     const prepared = await withTenantTransaction(db, tenant, async (tx, access) => {
         requireActiveWorkspace(access);
@@ -197,7 +216,7 @@ export async function createArtBoxVideoGeneration(
             })),
         );
     } catch {
-        return persistCreateOutcome(db, tenant, prepared.row.id, { kind: "failed", error: storageFailure() });
+        return persistCreateOutcome(db, tenant, prepared.row, { kind: "failed", error: storageFailure() });
     }
 
     const outcome = await dependencies.adapter.create({
@@ -209,7 +228,7 @@ export async function createArtBoxVideoGeneration(
         ...(input.resolution === undefined ? {} : { resolution: input.resolution }),
         generateAudio: input.generateAudio,
     });
-    return persistCreateOutcome(db, tenant, prepared.row.id, outcome);
+    return persistCreateOutcome(db, tenant, prepared.row, outcome);
 }
 
 function resultError(code: string, message: string, retryable: boolean): AppError {
@@ -227,6 +246,7 @@ function validateResultUrl(rawUrl: string, allowedHosts: readonly string[]): URL
         url.protocol !== "https:" ||
         url.username ||
         url.password ||
+        url.port !== "" ||
         !allowedHosts.includes(url.hostname.toLowerCase())
     ) {
         throw resultError("provider_result_rejected", "生成结果地址不安全", false);
@@ -310,14 +330,17 @@ async function acquirePollLease(
             .set({
                 pollLeaseEpoch: sql`${artboxVideoGenerations.pollLeaseEpoch} + 1`,
                 pollLeaseUntil: sql`now() + ${leaseSeconds} * interval '1 second'`,
-                updatedAt: new Date(),
+                updatedAt: sql`now()`,
             })
             .where(
                 and(
                     eq(artboxVideoGenerations.id, current.id),
                     eq(artboxVideoGenerations.workspaceId, access.workspaceId),
                     eq(artboxVideoGenerations.pollLeaseEpoch, current.pollLeaseEpoch),
-                    or(isNull(artboxVideoGenerations.pollLeaseUntil), lte(artboxVideoGenerations.pollLeaseUntil, new Date())),
+                    or(
+                        isNull(artboxVideoGenerations.pollLeaseUntil),
+                        sql`${artboxVideoGenerations.pollLeaseUntil} <= now()`,
+                    ),
                 ),
             )
             .returning();

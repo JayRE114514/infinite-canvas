@@ -72,6 +72,7 @@ const API_FUNCTIONS = [
     "is_current_admin_operation(text,text,text)",
     "execute_workspace_admin_operation()",
     "record_workspace_provisioning(text,text,text)",
+    "finalize_artbox_video_generation_create(uuid,text,text,text,text,jsonb)",
 ] as const;
 
 export type DatabaseRoleInspection = {

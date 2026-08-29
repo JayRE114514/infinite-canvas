@@ -125,6 +125,22 @@ describe("fixed ArtBox adapter", () => {
         });
     });
 
+    it("normalizes top-level and nested in_progress while preserving genuinely unknown reconciliation", async () => {
+        const fetchImpl = vi
+            .fn()
+            .mockResolvedValueOnce(response({ status: "in_progress" }))
+            .mockResolvedValueOnce(response({ data: { status: "in_progress" } }))
+            .mockResolvedValueOnce(response({ data: { status: "future_state" } }));
+        const adapter = createArtBoxAdapter(config, fetchImpl);
+
+        await expect(adapter.poll("top-level")).resolves.toEqual({ kind: "processing" });
+        await expect(adapter.poll("nested")).resolves.toEqual({ kind: "processing" });
+        await expect(adapter.poll("unknown")).resolves.toMatchObject({
+            kind: "reconciling",
+            error: { code: "provider_state_unknown" },
+        });
+    });
+
     it("reconciles unknown states and successful responses without a result URL", async () => {
         const fetchImpl = vi
             .fn()
@@ -156,6 +172,29 @@ describe("fixed ArtBox adapter", () => {
         await expect(adapter.create({ ...input([]), model: "unconfigured-model" })).resolves.toMatchObject({
             kind: "failed",
             error: { code: "provider_model_not_allowed", retryable: false },
+        });
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ["same-kind", { nodeId: "duplicate", kind: "image", url: "https://media.test/image-2" }],
+        ["different-kind", { nodeId: "duplicate", kind: "audio", url: "https://media.test/audio-1" }],
+    ] as const)("rejects %s duplicate node bindings before network", async (_label, duplicate) => {
+        const fetchImpl = vi.fn(async () => response({ task_id: "must-not-run" }));
+        const adapter = createArtBoxAdapter(config, fetchImpl);
+
+        await expect(
+            adapter.create({
+                ...input([]),
+                promptTemplate: "参考 @[node:duplicate]",
+                bindings: [
+                    { nodeId: "duplicate", kind: "image", url: "https://media.test/image-1" },
+                    duplicate,
+                ],
+            }),
+        ).resolves.toMatchObject({
+            kind: "failed",
+            error: { code: "duplicate_media_binding", retryable: false },
         });
         expect(fetchImpl).not.toHaveBeenCalled();
     });

@@ -69,7 +69,21 @@ const errors = {
         message: "生成状态需要人工核对",
         retryable: false,
     }),
+    duplicateBinding: (): ArtBoxGenerationError => ({
+        code: "duplicate_media_binding",
+        message: "同一节点不能重复绑定素材",
+        retryable: false,
+    }),
 };
+
+function hasDuplicateNodeIds(bindings: ArtBoxCreateInput["bindings"]): boolean {
+    const nodeIds = new Set<string>();
+    for (const binding of bindings) {
+        if (nodeIds.has(binding.nodeId)) return true;
+        nodeIds.add(binding.nodeId);
+    }
+    return false;
+}
 
 function record(value: unknown): JsonRecord | undefined {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : undefined;
@@ -145,7 +159,7 @@ function pollOutcome(payload: unknown): ArtBoxPollOutcome {
     const status = rawStatus?.toLowerCase();
 
     if (status === "queued" || status === "pending") return { kind: "queued" };
-    if (status === "processing" || status === "running") return { kind: "processing" };
+    if (status === "processing" || status === "running" || status === "in_progress") return { kind: "processing" };
     if (status === "completed" || status === "succeeded") {
         const resultUrl = firstString(sources, ["video_url", "result_url", "url"]);
         return resultUrl
@@ -163,6 +177,7 @@ export function createArtBoxAdapter(config: ArtBoxAdapterConfig, fetchImpl: type
 
     return {
         async create(input) {
+            if (hasDuplicateNodeIds(input.bindings)) return { kind: "failed", error: errors.duplicateBinding() };
             if (!config.videoModels.includes(input.model)) return { kind: "failed", error: errors.model() };
             try {
                 const { response, payload } = await requestJson(
