@@ -296,13 +296,14 @@ describe("ArtBox Workspace lifecycle", () => {
         ]);
         for (const id of [workspaceId, otherWorkspaceId]) {
             await admin.query(
-                "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, 'ArtBox', $2, 'team', $3, 'active')",
+                "insert into public.workspaces (id, name, slug, type, owner_user_id, status) values ($1, 'ArtBox', $2, 'team', $3, 'suspended')",
                 [id, `artbox-${id}`, userId],
             );
             await admin.query(
                 "insert into public.workspace_members (id, workspace_id, user_id, role, status) values ($1, $2, $3, 'owner', 'active')",
                 [randomUUID(), id, userId],
             );
+            await admin.query("update public.workspaces set status = 'active' where id = $1", [id]);
         }
         await admin.query(
             `insert into public.assets
