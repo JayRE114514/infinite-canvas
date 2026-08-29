@@ -64,6 +64,11 @@ const errors = {
         message: "视频生成失败",
         retryable: false,
     }),
+    contentModeration: (): ArtBoxGenerationError => ({
+        code: "provider_content_moderation",
+        message: "内容审核未通过，请调整提示词或参考素材后重试",
+        retryable: false,
+    }),
     unknown: (): ArtBoxGenerationError => ({
         code: "provider_state_unknown",
         message: "生成状态需要人工核对",
@@ -162,16 +167,20 @@ function pollOutcome(payload: unknown): ArtBoxPollOutcome {
     const sources = [parsed.data, parsed.root];
     const rawStatus = firstString(sources, ["status", "state"]);
     const status = rawStatus?.toLowerCase();
+    const providerError = record(record(parsed.data?.data)?.error);
 
-    if (status === "queued" || status === "pending") return { kind: "queued" };
+    if (["queued", "pending", "not_start", "submitted"].includes(status ?? "")) return { kind: "queued" };
     if (status === "processing" || status === "running" || status === "in_progress") return { kind: "processing" };
-    if (status === "completed" || status === "succeeded") {
+    if (status === "completed" || status === "succeeded" || status === "success") {
         const resultUrl = firstString(sources, ["video_url", "result_url", "url"]);
         return resultUrl
             ? { kind: "succeeded", resultUrl }
             : { kind: "reconciling", error: errors.unknown() };
     }
     if (["failed", "failure", "error", "cancelled", "canceled", "rejected", "timed_out"].includes(status ?? "")) {
+        if (firstString([providerError], ["code"])?.toLowerCase() === "content_moderation") {
+            return { kind: "failed", error: errors.contentModeration() };
+        }
         return { kind: "failed", error: errors.generationFailed() };
     }
     return { kind: "reconciling", error: errors.unknown() };

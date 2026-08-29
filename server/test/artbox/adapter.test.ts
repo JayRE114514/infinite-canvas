@@ -130,6 +130,81 @@ describe("fixed ArtBox adapter", () => {
         });
     });
 
+    it.each(["NOT_START", "SUBMITTED"])("keeps New API task status %s queued", async (status) => {
+        const adapter = createArtBoxAdapter(config, async () =>
+            response({
+                code: "success",
+                message: "",
+                data: {
+                    id: 43719,
+                    task_id: "task_public_1",
+                    status,
+                    fail_reason: "",
+                    result_url: "",
+                    progress: "0%",
+                    data: { id: "task_provider_1", status: "queued", progress: 0 },
+                },
+            }),
+        );
+
+        await expect(adapter.poll("task_public_1")).resolves.toEqual({ kind: "queued" });
+    });
+
+    it("accepts a New API SUCCESS task result", async () => {
+        const adapter = createArtBoxAdapter(config, async () =>
+            response({
+                code: "success",
+                message: "",
+                data: {
+                    id: 43719,
+                    task_id: "task_public_1",
+                    status: "SUCCESS",
+                    fail_reason: "",
+                    result_url: "https://results.test/video.mp4",
+                    progress: "100%",
+                    data: { id: "task_provider_1", status: "succeeded", progress: 100 },
+                },
+            }),
+        );
+
+        await expect(adapter.poll("task_public_1")).resolves.toEqual({
+            kind: "succeeded",
+            resultUrl: "https://results.test/video.mp4",
+        });
+    });
+
+    it("reports New API content moderation failures clearly", async () => {
+        const adapter = createArtBoxAdapter(config, async () =>
+            response({
+                code: "success",
+                message: "",
+                data: {
+                    id: 43719,
+                    task_id: "task_public_1",
+                    status: "FAILURE",
+                    fail_reason: "道德审查失败：内容审核未通过，或成片过程中有敏感或版权因素导致返回失败",
+                    result_url: "",
+                    progress: "100%",
+                    data: {
+                        id: "task_provider_1",
+                        status: "failed",
+                        progress: 100,
+                        error: { code: "CONTENT_MODERATION", message: "内容审核失败" },
+                    },
+                },
+            }),
+        );
+
+        await expect(adapter.poll("task_public_1")).resolves.toEqual({
+            kind: "failed",
+            error: {
+                code: "provider_content_moderation",
+                message: "内容审核未通过，请调整提示词或参考素材后重试",
+                retryable: false,
+            },
+        });
+    });
+
     it("normalizes top-level and nested in_progress while preserving genuinely unknown reconciliation", async () => {
         const fetchImpl = vi
             .fn()
