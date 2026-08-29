@@ -17,8 +17,10 @@
 
 - [本地开发](/zh-CN/docs/development/local-development)
 - [画布数据结构](/zh-CN/docs/development/canvas-data-structure)
-- [后端平台架构设计](./superpowers/specs/2026-08-26-backend-platform-architecture-design.md)
-- [后端平台实施路线图](./superpowers/plans/2026-08-26-backend-platform-roadmap.md)
+- [领域上下文](../CONTEXT.md)
+- [后端平台架构](./architecture/backend-platform.md)
+- [后端平台路线图](./architecture/platform-roadmap.md)
+- [架构决策记录](./adr/README.md)
 
 ## 商务合作
 
@@ -33,6 +35,8 @@
 ## 项目进度
 
 - [更新日志](/zh-CN/docs/progress/changelog)
+- [Gate 0 后端验证记录](/zh-CN/docs/progress/gate-0-backend-verification)
+- [Gate 0 前端验证记录](/zh-CN/docs/progress/gate-0-frontend-verification)
 - [待测试](/zh-CN/docs/progress/pending-test)
 - [TODO](/zh-CN/docs/progress/todo)
 

@@ -7,6 +7,7 @@
     "local-agent-integration-plan",
     "prompt-chip-input-plan",
     "gate-0-backend-verification",
+    "gate-0-frontend-verification",
     "pending-test",
     "todo"
   ]

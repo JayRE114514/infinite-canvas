@@ -18,8 +18,10 @@
 - [Local Development](/docs/development/local-development)
 - [Canvas Data Structure](/docs/development/canvas-data-structure)
 - [How the Local Codex Connection Works](/docs/development/local-codex-canvas)
-- [Backend Platform Architecture Design](./superpowers/specs/2026-08-26-backend-platform-architecture-design.md)
-- [Backend Platform Implementation Roadmap](./superpowers/plans/2026-08-26-backend-platform-roadmap.md)
+- [Domain Context](../CONTEXT.md)
+- [Backend Platform Architecture](./architecture/backend-platform.md)
+- [Backend Platform Roadmap](./architecture/platform-roadmap.md)
+- [Architecture Decision Records](./adr/README.md)
 
 ## Business
 
@@ -35,7 +37,7 @@
 
 - [Changelog](/docs/progress/changelog)
 - [Gate 0 Backend Verification](/docs/progress/gate-0-backend-verification)
-- [Gate 0 后端验证记录](/zh-CN/docs/progress/gate-0-backend-verification)
+- [Gate 0 Frontend Verification](/docs/progress/gate-0-frontend-verification)
 - [Pending Tests](/docs/progress/pending-test)
 - [TODO](/docs/progress/todo)
 

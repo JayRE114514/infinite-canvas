@@ -1,0 +1,57 @@
+---
+title: Gate 0 前端验证记录
+description: 原生 IndexedDB CAS 画布恢复的真实浏览器证据
+---
+
+# Gate 0 前端验证记录
+
+本页把 Gate 0 浏览器部分的关键证据保存进 Git，范围是原生 IndexedDB 恢复及其与云画布策略的接缝；它不代表全部云画布流程或生产部署已经验收通过。
+
+## 验收范围
+
+- Chrome 与 Firefox 已完成真实浏览器人工验收。
+- 用户明确豁免 macOS Safari 测试，因此 Safari 是**未验证**，不是通过。
+- `fake-indexeddb` 只作为开发证据，不能替代以下浏览器结果。
+
+## 自动化证据
+
+| 里程碑证据 | 结果 |
+| --- | --- |
+| 独立受影响套件审查 | 9 个文件、65 个测试通过 |
+| 删除请求与回执边界 | 10 个文件、68 个测试通过 |
+| 类型修复与定向回归 | 21 个测试通过；`web` typecheck 退出 0 |
+| 规范化快照边界 | 17 个测试通过；`web` typecheck 退出 0 |
+| 恢复重试所有权接缝 | 46 个受影响 sync/recovery 测试通过；`web` typecheck 退出 0 |
+| 最终 web 构建 | 退出 0 |
+
+独立审查发现并修复了首轮全绿测试曾当作正确行为的四个策略接缝缺陷：多标签页复用同一草稿身份、仅按时间回收未同步草稿、把服务端已确认删除误报为失败、以及不安全的恢复源行退役。源行退役现在由写序号 CAS 保护，不会删除另一个仍存活标签页的行。
+
+## Chrome 证据
+
+真实人工检查覆盖：
+
+- 恢复数据库版本 1，且只有 `drafts`、`epochs`、`markers`；
+- 并发标签页拥有独立草稿身份，不会静默覆盖；
+- 只有精确删除回执证明才能本地墓碑化或清理；
+- pending 草稿不被 GC 删除，满足条件的 synced 草稿可以回收；
+- 损坏 epoch/marker 时 fail-closed，pending 草稿保持不变；
+- viewport 只写入 `localUi`，文档 viewport 与服务端 revision 不变；
+- 人为结束渲染进程后，pending 哨兵恢复到新的本会话 synced 行，源行按 CAS 退役，epoch 保持健康。
+
+损坏后的显式「重新检查」还验证了：只有新所有权事实被采用且本行写入得到正面证明后才恢复云端保存；写入无法确认时继续阻断。
+
+## Firefox 证据
+
+使用同一个画布 `1a87c7eb-7d49-4392-9461-717a23f4072f` 验证了：
+
+- 恢复数据库结构准确且 legacy recovery store 已不存在；
+- 本机 viewport 与文档快照隔离；
+- 两个离线标签页产生两个独立 pending 行且内容互不污染；
+- 显式载入服务端版本后完成冲突清理；
+- 独立内容进程强杀后的恢复持久性。
+
+强杀验证先把测试标签页唯一命名为 `GATE0 FIREFOX CRASH TAB`。用户明确确认后，只结束该标签页内容进程 PID `3020309`，正常画布进程 `3020267` 与 Firefox 主进程 `3019649` 均未触碰。writeSeq 2 的 pending 源行 `dWLEmh7y70tPWTtxAKDhTt` 在崩溃后仍存在；重新载入后，其哨兵恢复到 writeSeq 3 的新本会话行 `-hpjZCz1y0iFU8cXM6HWP`，源行经 CAS 退役，marker 为 0，epoch 健康。同步完成后服务端 revision 从 7 推进到 8。
+
+## 结论与剩余范围
+
+Gate 0 在用户批准的 Chrome + Firefox 范围内关闭。Safari 明确保留为未验证。更完整的云画布产品场景仍记录在[待测试](/zh-CN/docs/progress/pending-test)；本结果不代表容量、生产部署或多人实时协作已经验收。

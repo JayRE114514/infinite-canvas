@@ -5,9 +5,9 @@ description: Gate 0 后端修正的提交边界、数据库边界与测试证据
 
 # Gate 0 后端验证记录
 
-本页记录 [Gate 0 后端架构修正计划](../../../superpowers/plans/2026-08-28-gate-0-backend-architecture-correction.md) 中 Task 1–6 实际落地的内容，以及每一项的自动化验证结果。规格来源是[后端平台架构设计](../../../superpowers/specs/2026-08-26-backend-platform-architecture-design.md)。
+本页记录 Gate 0 后端部分实际落地的内容，以及每一项的自动化验证结果。长期设计来源是[后端平台架构](../../../architecture/backend-platform.md)，交付顺序见[后端平台路线图](../../../architecture/platform-roadmap.md)。
 
-**Gate 0 尚未关闭：原生 IndexedDB CAS、Chrome/Firefox/Safari 矩阵和用户 typecheck 证据仍待完成。** 本页只覆盖 Gate 0 的后端部分，不代表整个 Gate 0 通过，也不代表生产部署已经验证。
+**后端部分已经完成，Gate 0 在用户批准的 Chrome + Firefox 范围内关闭。** 浏览器证据单独记录在 [Gate 0 前端验证记录](/zh-CN/docs/progress/gate-0-frontend-verification)。Safari 已由用户明确豁免并保持未验证。两份记录都不代表生产部署已经验证。
 
 ## 提交边界
 
@@ -127,7 +127,7 @@ Task 6 的独立验收（Acceptance round 1/2，由独立验收代理执行）�
 
 ## 残余风险
 
-- **Gate 0 尚未关闭**：原生 IndexedDB 事务/CAS 方案未实现，Chrome/Firefox/Safari 三浏览器真实证据未采集，`web` 的 typecheck 与构建由用户执行。
+- **浏览器范围**：原生 IndexedDB 事务/CAS 恢复、`web` typecheck/构建及 Chrome、Firefox 真实证据均已完成，详见 [Gate 0 前端验证记录](/zh-CN/docs/progress/gate-0-frontend-verification)。Safari 已明确豁免，状态是未验证而不是通过。
 - **运行环境差异**：本地验证使用 Node v22.23.2，生产基线设想是 Node 24 LTS，发布前需要在目标版本复跑完整套件。
 - **既有类型错误**：`server` 的严格 TypeScript 检查目前有 15 个报错（3 个在 `src/error-handler.ts`，12 个在测试与测试辅助代码），不在本计划范围内，尚未清理。
 - **超级用户边界**：数据库超级用户仍可禁用触发器或改写复制角色以绕过删除回执不变量；四个运行期角色都没有该能力。

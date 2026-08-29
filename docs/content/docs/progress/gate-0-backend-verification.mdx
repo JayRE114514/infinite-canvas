@@ -5,9 +5,9 @@ description: Commit boundaries, database boundaries, and test evidence for the G
 
 # Gate 0 Backend Verification Record
 
-This page records what Tasks 1–6 of the [Gate 0 Backend Architecture Correction Plan](../../../superpowers/plans/2026-08-28-gate-0-backend-architecture-correction.md) actually landed, and the automated evidence behind each item. The governing spec is the [Backend Platform Architecture Design](../../../superpowers/specs/2026-08-26-backend-platform-architecture-design.md).
+This page records what landed in the backend half of Gate 0 and the automated evidence behind each item. The permanent design source is the [Backend Platform Architecture](../../../architecture/backend-platform.md), with delivery order in the [Backend Platform Roadmap](../../../architecture/platform-roadmap.md).
 
-**Gate 0 is not closed.** Native IndexedDB CAS, the Chrome/Firefox/Safari matrix, and user-owned typecheck evidence are still outstanding. This page covers only the backend half of Gate 0 and does not claim a verified production deployment.
+**The backend half is complete, and Gate 0 is closed for the user-approved Chrome and Firefox scope.** The browser evidence is recorded separately in [Gate 0 Frontend Verification](/docs/progress/gate-0-frontend-verification). Safari was explicitly waived and remains unverified. Neither record claims a verified production deployment.
 
 ## Commit boundaries
 
@@ -127,7 +127,7 @@ Implementation-agent self-tests count as development evidence only and do not co
 
 ## Residual risks
 
-- **Gate 0 is still open.** Native IndexedDB transactional/CAS storage is unimplemented, real Chrome/Firefox/Safari evidence has not been collected, and `web` typecheck and build verification remain with the user.
+- **Browser scope.** Native IndexedDB transactional/CAS recovery, `web` typecheck/build, and real Chrome/Firefox evidence are complete as recorded in [Gate 0 Frontend Verification](/docs/progress/gate-0-frontend-verification). Safari was explicitly waived and remains unverified rather than passed.
 - **Runtime version gap.** Local verification ran on Node v22.23.2 while the intended production baseline is Node 24 LTS; the suite must be rerun on the target version before release.
 - **Pre-existing type errors.** Strict TypeScript on `server` currently reports 15 errors (3 in `src/error-handler.ts`, 12 in tests and test helpers). They are outside this plan's scope and remain unfixed.
 - **Superuser boundary.** A database superuser can still disable the trigger or change the replication role to bypass the deletion-receipt invariant; none of the four runtime roles can.
