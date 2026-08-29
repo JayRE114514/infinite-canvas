@@ -16,6 +16,7 @@
 ## Development and Data
 
 - [Local Development](/docs/development/local-development)
+- [Agent Development Workflow](./matt-pocock-skills.md)
 - [Canvas Data Structure](/docs/development/canvas-data-structure)
 - [How the Local Codex Connection Works](/docs/development/local-codex-canvas)
 - [Domain Context](../CONTEXT.md)

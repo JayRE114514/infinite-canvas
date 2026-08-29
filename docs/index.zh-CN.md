@@ -16,6 +16,7 @@
 ## 开发与数据
 
 - [本地开发](/zh-CN/docs/development/local-development)
+- [Agent 开发流程](./matt-pocock-skills.md)
 - [画布数据结构](/zh-CN/docs/development/canvas-data-structure)
 - [领域上下文](../CONTEXT.md)
 - [后端平台架构](./architecture/backend-platform.md)
