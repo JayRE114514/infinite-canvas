@@ -144,7 +144,17 @@ function toHostedMedia(inputs: NodeGenerationResourceInput[]): HostedMediaSource
     return inputs.flatMap((input): HostedMediaSource[] => {
         const media = input.image || input.video || input.audio;
         if (!media || input.type === "text") return [];
-        return [{ nodeId: input.nodeId, kind: input.type, assetId: media.assetId, storageKey: media.storageKey, fileName: media.name, contentType: media.type }];
+        return [
+            {
+                nodeId: input.nodeId,
+                kind: input.type,
+                assetId: media.assetId,
+                storageKey: media.storageKey,
+                content: "dataUrl" in media ? media.dataUrl : media.url,
+                fileName: media.name,
+                contentType: media.type,
+            },
+        ];
     });
 }
 

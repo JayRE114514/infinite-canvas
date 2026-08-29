@@ -26,6 +26,7 @@ export type HostedMediaSource = {
     kind: "image" | "video" | "audio";
     assetId?: string;
     storageKey?: string;
+    content?: string;
     fileName: string;
     contentType: string;
 };

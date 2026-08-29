@@ -11,7 +11,21 @@ import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audi
 import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
 import { boolConfig, defaultConfig, HOSTED_ARTBOX_VIDEO_MODEL, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
-import { applyHostedVideoResult, buildHostedVideoRequest, requestHostedArtBoxVideo, resolveHostedVideoRequest, runCanvasVideoGeneration, saveHostedVideoRequest, videoGenerationRoute } from "@/services/hosted-media";
+import {
+    applyHostedVideoResult,
+    attachHostedAssetIfSourceUnchanged,
+    buildHostedVideoRequest,
+    HostedMediaError,
+    hostedVideoAttemptDurability,
+    hostedVideoRequestDurability,
+    requestHostedArtBoxVideo,
+    resolveHostedVideoAttempt,
+    resolveHostedVideoRequest,
+    runCanvasVideoGeneration,
+    saveHostedVideoAttempt,
+    saveHostedVideoRequest,
+    videoGenerationRoute,
+} from "@/services/hosted-media";
 import { uploadImage } from "@/services/image-storage";
 import { uploadMediaFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -88,6 +102,7 @@ import {
     type CanvasNodeMetadata,
     type CanvasNodeTypeId,
     type CanvasProject,
+    type HostedVideoAttempt,
     type ConnectionHandle,
     type ContextMenuState,
     type Position,
@@ -379,13 +394,21 @@ function InfiniteCanvasPage() {
         [ownsGeneration],
     );
 
-    const persistOwnedHostedRequest = useCallback(
-        async (controller: AbortController, targetNodeId: string, request: CreateArtBoxVideoGenerationBody) => {
-            const next = setOwnedNodesImmediately(controller, (current) => saveHostedVideoRequest(current, targetNodeId, request));
+    const persistOwnedHostedState = useCallback(
+        async (controller: AbortController, targetNodeId: string, state: HostedVideoAttempt | CreateArtBoxVideoGenerationBody) => {
+            const attempt = "idempotencyKey" in state ? state : null;
+            const request: CreateArtBoxVideoGenerationBody = attempt ? attempt.request : (state as CreateArtBoxVideoGenerationBody);
+            const next = setOwnedNodesImmediately(controller, (current) => (attempt ? saveHostedVideoAttempt(current, targetNodeId, attempt) : saveHostedVideoRequest(current, targetNodeId, request)));
             if (!next || !next.some((node) => node.id === targetNodeId)) throw new DOMException("Aborted", "AbortError");
             updateProject(projectId, { nodes: next });
             await flushProject(projectId);
             if (!ownsGeneration(controller)) throw new DOMException("Aborted", "AbortError");
+            const store = useCanvasStore.getState();
+            const durability = attempt
+                ? hostedVideoAttemptDurability(projectId, targetNodeId, attempt, store.getActiveProject(), store.sync)
+                : hostedVideoRequestDurability(projectId, targetNodeId, request, store.getActiveProject(), store.sync);
+            if (durability === "missing") throw new DOMException("Aborted", "AbortError");
+            if (durability === "unsafe") throw new HostedMediaError("hosted_attempt_not_durable", "生成请求未能安全保存，请稍后重试");
         },
         [flushProject, ownsGeneration, projectId, setOwnedNodesImmediately, updateProject],
     );
@@ -880,6 +903,11 @@ function InfiniteCanvasPage() {
         (ids: Set<string>) => {
             if (!ids.size) return;
             const allIds = new Set(ids);
+            generationRequestsRef.current.forEach((request) => {
+                if (!allIds.has(request.targetNodeId) && !allIds.has(request.originNodeId)) return;
+                request.controller.abort();
+                generationRequestsRef.current.delete(request.targetNodeId);
+            });
             setNodes((prev) => {
                 const next = prev.filter((node) => !allIds.has(node.id));
                 return next.map((node) => {
@@ -2517,7 +2545,9 @@ function InfiniteCanvasPage() {
                     try {
                         await runCanvasVideoGeneration({
                             model: generationConfig.model,
+                            savedAttempt: null,
                             savedRequest: null,
+                            createIdempotencyKey: nanoid,
                             prepareHostedRequest: async () => {
                                 if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
                                 return buildHostedVideoRequest(
@@ -2530,17 +2560,18 @@ function InfiniteCanvasPage() {
                                         generateAudio: boolConfig(generationConfig.videoGenerateAudio, true),
                                     },
                                     undefined,
-                                    (source, assetId) => setOwnedNodesImmediately(controller, (prev) => prev.map((node) => (node.id === source.nodeId ? { ...node, metadata: { ...node.metadata, assetId } } : node))),
+                                    (source, assetId) => setOwnedNodesImmediately(controller, (prev) => attachHostedAssetIfSourceUnchanged(prev, source, assetId)),
                                     controller.signal,
                                 );
                             },
-                            persistHostedRequest: (request) => persistOwnedHostedRequest(controller, videoId, request),
-                            generateHosted: (request) => {
+                            persistHostedAttempt: (attempt) => persistOwnedHostedState(controller, videoId, attempt),
+                            invalidateHostedAttempt: (request) => persistOwnedHostedState(controller, videoId, request),
+                            generateHosted: (attempt) => {
                                 if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
-                                return requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
+                                return requestHostedArtBoxVideo(activeWorkspaceId, attempt.request, attempt.idempotencyKey, { signal: controller.signal });
                             },
-                            applyHostedResult: async (result, request) => {
-                                if (!setOwnedNodesImmediately(controller, (prev) => applyHostedVideoResult(prev, videoId, result, request))) throw new DOMException("Aborted", "AbortError");
+                            applyHostedResult: async (result, attempt) => {
+                                if (!setOwnedNodesImmediately(controller, (prev) => applyHostedVideoResult(prev, videoId, result, attempt.request))) throw new DOMException("Aborted", "AbortError");
                             },
                             generateLocal: async () => {
                                 const video = await storeGeneratedVideo(await requestVideoGeneration(generationConfig, effectivePrompt, generationContext.referenceImages, { signal: controller.signal }));
@@ -2734,7 +2765,7 @@ function InfiniteCanvasPage() {
                 runOwned(runController, () => setRunningNodeId(null));
             }
         },
-        [activeWorkspaceId, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, ownsGeneration, persistOwnedHostedRequest, runOwned, setOwnedNodes, setOwnedNodesImmediately, startGenerationRequest, t],
+        [activeWorkspaceId, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, ownsGeneration, persistOwnedHostedState, runOwned, setOwnedNodes, setOwnedNodesImmediately, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2756,6 +2787,7 @@ function InfiniteCanvasPage() {
                           count: "1",
                       }
                     : { ...buildGenerationConfig(effectiveConfig, sourceNode, node.type === CanvasNodeType.Text ? "text" : node.type === CanvasNodeType.Video ? "video" : node.type === CanvasNodeType.Audio ? "audio" : "image"), count: "1" };
+            const savedHostedAttempt = node.type === CanvasNodeType.Video ? resolveHostedVideoAttempt(node) : null;
             const savedHostedRequest = node.type === CanvasNodeType.Video ? resolveHostedVideoRequest(node, null) : null;
             const isHostedVideo = node.type === CanvasNodeType.Video && videoGenerationRoute(generationConfig.model, savedHostedRequest) === "hosted";
             if (!isHostedVideo && !isAiConfigReady(generationConfig, generationConfig.model)) {
@@ -2808,7 +2840,9 @@ function InfiniteCanvasPage() {
                 if (node.type === CanvasNodeType.Video) {
                     await runCanvasVideoGeneration({
                         model: generationConfig.model,
+                        savedAttempt: savedHostedAttempt,
                         savedRequest: savedHostedRequest,
+                        createIdempotencyKey: nanoid,
                         prepareHostedRequest: async () => {
                             if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
                             if (!context) throw new Error("Hosted video request is unavailable");
@@ -2822,17 +2856,18 @@ function InfiniteCanvasPage() {
                                     generateAudio: boolConfig(generationConfig.videoGenerateAudio, true),
                                 },
                                 undefined,
-                                (source, assetId) => setOwnedNodesImmediately(controller, (prev) => prev.map((item) => (item.id === source.nodeId ? { ...item, metadata: { ...item.metadata, assetId } } : item))),
+                                (source, assetId) => setOwnedNodesImmediately(controller, (prev) => attachHostedAssetIfSourceUnchanged(prev, source, assetId)),
                                 controller.signal,
                             );
                         },
-                        persistHostedRequest: (request) => persistOwnedHostedRequest(controller, node.id, request),
-                        generateHosted: (request) => {
+                        persistHostedAttempt: (attempt) => persistOwnedHostedState(controller, node.id, attempt),
+                        invalidateHostedAttempt: (request) => persistOwnedHostedState(controller, node.id, request),
+                        generateHosted: (attempt) => {
                             if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
-                            return requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
+                            return requestHostedArtBoxVideo(activeWorkspaceId, attempt.request, attempt.idempotencyKey, { signal: controller.signal });
                         },
-                        applyHostedResult: async (result, request) => {
-                            if (!setOwnedNodesImmediately(controller, (prev) => applyHostedVideoResult(prev, node.id, result, request))) throw new DOMException("Aborted", "AbortError");
+                        applyHostedResult: async (result, attempt) => {
+                            if (!setOwnedNodesImmediately(controller, (prev) => applyHostedVideoResult(prev, node.id, result, attempt.request))) throw new DOMException("Aborted", "AbortError");
                         },
                         generateLocal: async () => {
                             const video = await storeGeneratedVideo(await requestVideoGeneration(generationConfig, prompt, retryImages, { signal: controller.signal }));
@@ -2927,7 +2962,7 @@ function InfiniteCanvasPage() {
                 runOwned(controller, () => setRunningNodeId(null));
             }
         },
-        [activeWorkspaceId, captureGenerationOwner, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, persistOwnedHostedRequest, runOwned, setOwnedNodes, setOwnedNodesImmediately, startGenerationRequest, t],
+        [activeWorkspaceId, captureGenerationOwner, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, persistOwnedHostedState, runOwned, setOwnedNodes, setOwnedNodesImmediately, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {

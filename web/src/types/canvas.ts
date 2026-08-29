@@ -48,6 +48,11 @@ export type CanvasNodeText = {
     content: string;
 };
 
+export type HostedVideoAttempt = {
+    request: CreateArtBoxVideoGenerationBody;
+    idempotencyKey: string;
+};
+
 export type CanvasNodeMetadata = {
     content?: string;
     composerContent?: string;
@@ -84,6 +89,7 @@ export type CanvasNodeMetadata = {
     assetId?: string;
     hostedPromptTemplate?: string;
     hostedRequest?: CreateArtBoxVideoGenerationBody;
+    hostedAttempt?: HostedVideoAttempt;
     mimeType?: string;
     bytes?: number;
     durationMs?: number;
