@@ -4,14 +4,31 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { requireAppConfig, requireDatabase } from "../src/infrastructure/database/plugin.js";
 
-const config = loadConfig({
+const baseEnv: NodeJS.ProcessEnv = {
     NODE_ENV: "test",
     DATABASE_URL_API: "postgres://app_api:test@127.0.0.1:1/test",
     BETTER_AUTH_SECRET: "x".repeat(32),
     APP_ORIGIN: "http://localhost:3000",
     SMTP_HOST: "localhost",
     SMTP_FROM: "no-reply@example.com",
-});
+};
+const config = loadConfig(baseEnv);
+
+const integrationEnv: NodeJS.ProcessEnv = {
+    ...baseEnv,
+    COS_SECRET_ID: "test-cos-secret-id",
+    COS_SECRET_KEY: "test-cos-secret-key",
+    COS_BUCKET: "test-assets-1250000000",
+    COS_REGION: "ap-guangzhou",
+    COS_SIGNED_URL_TTL_SECONDS: "300",
+    ARTBOX_BASE_URL: "https://artbox.test",
+    ARTBOX_API_KEY: "test-artbox-key",
+    ARTBOX_VIDEO_MODELS: "Artdance 2 Mini-480p",
+    ARTBOX_REQUEST_TIMEOUT_MS: "2500",
+    ARTBOX_RESULT_MAX_BYTES: "50000000",
+    ARTBOX_RESULT_ALLOWED_HOSTS: "results.artbox.test",
+    ARTBOX_POLL_LEASE_SECONDS: "20",
+};
 
 describe("pure app construction", () => {
     it("stays free of runtime decorations", async () => {
@@ -90,5 +107,52 @@ describe("config-driven app construction", () => {
         } finally {
             await app.close();
         }
+    });
+
+    it("registers the configured Asset and ArtBox routes", async () => {
+        const app = await buildApp({ logger: false, config: loadConfig(integrationEnv) });
+
+        try {
+            const routes = [
+                ["POST", "/api/v1/workspaces/:workspaceId/assets"],
+                ["POST", "/api/v1/workspaces/:workspaceId/assets/:assetId/complete"],
+                ["GET", "/api/v1/workspaces/:workspaceId/assets/:assetId"],
+                ["POST", "/api/v1/workspaces/:workspaceId/integrations/artbox/video-generations"],
+                ["POST", "/api/v1/workspaces/:workspaceId/integrations/artbox/video-generations/:generationId/poll"],
+            ] as const;
+            expect(routes.map(([method, url]) => app.hasRoute({ method, url }))).toEqual([true, true, true, true, true]);
+        } finally {
+            await app.close();
+        }
+    });
+
+    it("keeps unrelated routes healthy when optional integrations are omitted", async () => {
+        const app = await buildApp({ logger: false, config });
+
+        try {
+            const response = await app.inject({ method: "GET", url: "/api/v1/health/live" });
+
+            expect(response.statusCode).toBe(200);
+            expect(response.json()).toEqual({ status: "ok" });
+        } finally {
+            await app.close();
+        }
+    });
+
+    it.each([
+        ["COS", { COS_SECRET_KEY: "must-not-leak-cos-secret" }],
+        ["ARTBOX", { ARTBOX_API_KEY: "must-not-leak-artbox-secret" }],
+    ])("rejects a partial %s block before app construction without leaking its secret", (_name, partial) => {
+        const env = { ...baseEnv, ...partial };
+        let thrown: unknown;
+
+        try {
+            loadConfig(env);
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(Error);
+        expect(String(thrown)).not.toContain(Object.values(partial)[0]);
     });
 });

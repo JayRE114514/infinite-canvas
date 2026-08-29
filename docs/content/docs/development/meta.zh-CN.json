@@ -4,6 +4,7 @@
   "defaultOpen": true,
   "pages": [
     "local-development",
+    "artbox-cos",
     "canvas-data-structure",
     "local-codex-canvas"
   ]
