@@ -6,6 +6,7 @@ import { createArtBoxVideoGeneration, pollArtBoxVideoGeneration } from "@/servic
 import { VIDEO_GENERATION_POLL_ATTEMPTS, VIDEO_GENERATION_POLL_INTERVAL_MS } from "@/services/api/video";
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob } from "@/services/image-storage";
+import { HOSTED_ARTBOX_VIDEO_MODEL, isHostedArtBoxModel } from "@/stores/use-config-store";
 import type { CanvasNodeData } from "@/types/canvas";
 import type { HostedMediaSource } from "@/types/media";
 
@@ -20,7 +21,7 @@ export type HostedMediaDependencies = {
 const defaultDependencies: HostedMediaDependencies = { createAsset, uploadAsset, completeAsset, getImageBlob, getMediaBlob };
 
 export class HostedMediaError extends Error {
-    constructor(readonly code: "hosted_media_bytes_missing" | "hosted_asset_not_ready" | "hosted_generation_failed" | "hosted_generation_timeout" | "hosted_generation_result_missing", message: string) {
+    constructor(readonly code: "hosted_media_bytes_missing" | "hosted_asset_not_ready" | "hosted_generation_failed" | "hosted_generation_reconciling" | "hosted_generation_timeout" | "hosted_generation_result_missing", message: string) {
         super(message);
         this.name = "HostedMediaError";
     }
@@ -66,7 +67,7 @@ export async function buildHostedVideoRequest(input: BuildHostedVideoRequest, de
     };
 }
 
-type HostedVideoRequestOptions = {
+export type HostedVideoRequestOptions = {
     signal?: AbortSignal;
     idempotencyKey?: string;
     wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
@@ -84,12 +85,47 @@ export async function requestHostedArtBoxVideo(workspaceId: string, body: Create
     for (let attempt = 0; attempt < VIDEO_GENERATION_POLL_ATTEMPTS; attempt += 1) {
         const resultAssetId = terminalResult(generation);
         if (resultAssetId) return read(workspaceId, resultAssetId);
+        if (generation.status === "reconciling") throw new HostedMediaError("hosted_generation_reconciling", generation.error?.message || "Hosted video generation requires reconciliation");
         if (generation.status === "failed") throw new HostedMediaError("hosted_generation_failed", generation.error?.message || "Hosted video generation failed");
         if (attempt === VIDEO_GENERATION_POLL_ATTEMPTS - 1) throw new HostedMediaError("hosted_generation_timeout", "Hosted video generation timed out");
         await wait(VIDEO_GENERATION_POLL_INTERVAL_MS, options.signal);
         generation = await poll(workspaceId, generation.id, options.signal);
     }
     throw new HostedMediaError("hosted_generation_timeout", "Hosted video generation timed out");
+}
+
+export function videoGenerationRoute(model: string, savedRequest?: CreateArtBoxVideoGenerationBody | null) {
+    return savedRequest || isHostedArtBoxModel(model) ? "hosted" : "local";
+}
+
+export function resolveHostedVideoRequest(node: CanvasNodeData, fallback: CreateArtBoxVideoGenerationBody | null) {
+    return isCompleteHostedVideoRequest(node.metadata?.hostedRequest) ? node.metadata.hostedRequest : fallback;
+}
+
+export function saveHostedVideoRequest(nodes: CanvasNodeData[], targetNodeId: string, request: CreateArtBoxVideoGenerationBody) {
+    return nodes.map((node) => (node.id === targetNodeId ? { ...node, metadata: { ...node.metadata, hostedRequest: request } } : node));
+}
+
+export function submitHostedVideoRequest(workspaceId: string, request: CreateArtBoxVideoGenerationBody, persist: (request: CreateArtBoxVideoGenerationBody) => void, options: HostedVideoRequestOptions = {}) {
+    persist(request);
+    return requestHostedArtBoxVideo(workspaceId, request, options);
+}
+
+function isCompleteHostedVideoRequest(value: unknown): value is CreateArtBoxVideoGenerationBody {
+    if (!value || typeof value !== "object") return false;
+    const request = value as Partial<CreateArtBoxVideoGenerationBody>;
+    const allowedKeys = new Set(["model", "promptTemplate", "bindings", "seconds", "aspectRatio", "resolution", "generateAudio"]);
+    return (
+        Object.keys(request).every((key) => allowedKeys.has(key)) &&
+        request.model === HOSTED_ARTBOX_VIDEO_MODEL &&
+        typeof request.promptTemplate === "string" && Boolean(request.promptTemplate.trim()) &&
+        typeof request.seconds === "string" && Boolean(request.seconds.trim()) &&
+        (request.aspectRatio === undefined || (typeof request.aspectRatio === "string" && Boolean(request.aspectRatio.trim()))) &&
+        (request.resolution === undefined || (typeof request.resolution === "string" && Boolean(request.resolution.trim()))) &&
+        typeof request.generateAudio === "boolean" &&
+        Array.isArray(request.bindings) &&
+        request.bindings.every((binding) => Boolean(binding && Object.keys(binding).length === 3 && binding.nodeId && binding.assetId && (binding.kind === "image" || binding.kind === "video" || binding.kind === "audio")))
+    );
 }
 
 function terminalResult(generation: ArtBoxVideoGeneration) {

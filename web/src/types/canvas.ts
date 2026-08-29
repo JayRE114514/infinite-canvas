@@ -1,5 +1,5 @@
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
-import type { HostedMediaBinding } from "@infinite-canvas/contracts";
+import type { CreateArtBoxVideoGenerationBody } from "@infinite-canvas/contracts";
 
 export type Position = {
     x: number;
@@ -82,8 +82,8 @@ export type CanvasNodeMetadata = {
     primaryImageId?: string;
     storageKey?: string;
     assetId?: string;
-    hostedBindings?: HostedMediaBinding[];
     hostedPromptTemplate?: string;
+    hostedRequest?: CreateArtBoxVideoGenerationBody;
     mimeType?: string;
     bytes?: number;
     durationMs?: number;

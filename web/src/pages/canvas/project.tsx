@@ -8,9 +8,9 @@ import { useTranslation } from "react-i18next";
 import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
-import { boolConfig, defaultConfig, HOSTED_ARTBOX_VIDEO_MODEL, isHostedArtBoxModel, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { boolConfig, defaultConfig, HOSTED_ARTBOX_VIDEO_MODEL, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useWorkspaceStore } from "@/stores/use-workspace-store";
-import { applyHostedVideoResult, buildHostedVideoRequest, requestHostedArtBoxVideo } from "@/services/hosted-media";
+import { applyHostedVideoResult, buildHostedVideoRequest, resolveHostedVideoRequest, saveHostedVideoRequest, submitHostedVideoRequest, videoGenerationRoute } from "@/services/hosted-media";
 import { uploadImage } from "@/services/image-storage";
 import { uploadMediaFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -49,7 +49,7 @@ import { useCanvasProjectSync } from "@/pages/canvas/hooks/use-canvas-project-sy
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
-import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
+import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, primaryImageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { findContainingGroupId, findGroupDropTarget, getConnectionTargetAnchor, normalizeConnection, snapNodesIntoGroup } from "@/lib/canvas/canvas-node-geometry";
 import {
     audioExtension,
@@ -1692,12 +1692,7 @@ function InfiniteCanvasPage() {
                     ...size,
                     metadata: {
                         ...node.metadata,
-                        content: image.content,
-                        storageKey: image.storageKey,
-                        naturalWidth: image.naturalWidth,
-                        naturalHeight: image.naturalHeight,
-                        bytes: image.bytes,
-                        mimeType: image.mimeType,
+                        ...primaryImageMetadata(image),
                         primaryImageId: image.id,
                     },
                 };
@@ -1718,12 +1713,7 @@ function InfiniteCanvasPage() {
             position: { x: node.position.x + node.width * 2 + 96, y: node.position.y + node.height / 2 - size.height / 2 },
             ...size,
             metadata: {
-                content: image.content,
-                storageKey: image.storageKey,
-                naturalWidth: image.naturalWidth,
-                naturalHeight: image.naturalHeight,
-                bytes: image.bytes,
-                mimeType: image.mimeType,
+                ...primaryImageMetadata(image),
                 status: NODE_STATUS_SUCCESS,
                 prompt: node.metadata?.prompt,
                 generationType: node.metadata?.generationType,
@@ -2266,7 +2256,7 @@ function InfiniteCanvasPage() {
         async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
-            const isHostedVideo = mode === "video" && isHostedArtBoxModel(generationConfig.model);
+            const isHostedVideo = mode === "video" && videoGenerationRoute(generationConfig.model) === "hosted";
             if (!isHostedVideo && !isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
                 return;
@@ -2429,12 +2419,7 @@ function InfiniteCanvasPage() {
                                             ...imageSize,
                                             metadata: {
                                                 ...node.metadata,
-                                                content: item.content,
-                                                storageKey: item.storageKey,
-                                                naturalWidth: item.naturalWidth,
-                                                naturalHeight: item.naturalHeight,
-                                                bytes: item.bytes,
-                                                mimeType: item.mimeType,
+                                                ...primaryImageMetadata(item),
                                                 images,
                                                 primaryImageId: imageId,
                                             },
@@ -2522,9 +2507,14 @@ function InfiniteCanvasPage() {
                                 (source, assetId) => setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === source.nodeId ? { ...node, metadata: { ...node.metadata, assetId } } : node))),
                                 controller.signal,
                             );
-                            const result = await requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
+                            const result = await submitHostedVideoRequest(
+                                activeWorkspaceId,
+                                request,
+                                (prepared) => setOwnedNodes(controller, (prev) => saveHostedVideoRequest(prev, videoId, prepared)),
+                                { signal: controller.signal },
+                            );
                             setOwnedNodes(controller, (prev) =>
-                                applyHostedVideoResult(prev, videoId, result).map((node) => (node.id === videoId ? { ...node, metadata: { ...node.metadata, prompt: effectivePrompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark, hostedBindings: request.bindings, hostedPromptTemplate: request.promptTemplate } } : node)),
+                                applyHostedVideoResult(prev, videoId, result).map((node) => (node.id === videoId ? { ...node, metadata: { ...node.metadata, prompt: effectivePrompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark } } : node)),
                             );
                             return;
                         }
@@ -2741,7 +2731,8 @@ function InfiniteCanvasPage() {
                           count: "1",
                       }
                     : { ...buildGenerationConfig(effectiveConfig, sourceNode, node.type === CanvasNodeType.Text ? "text" : node.type === CanvasNodeType.Video ? "video" : node.type === CanvasNodeType.Audio ? "audio" : "image"), count: "1" };
-            const isHostedVideo = node.type === CanvasNodeType.Video && isHostedArtBoxModel(generationConfig.model);
+            const savedHostedRequest = node.type === CanvasNodeType.Video ? resolveHostedVideoRequest(node, null) : null;
+            const isHostedVideo = node.type === CanvasNodeType.Video && videoGenerationRoute(generationConfig.model, savedHostedRequest) === "hosted";
             if (!isHostedVideo && !isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
                 return;
@@ -2749,10 +2740,10 @@ function InfiniteCanvasPage() {
 
             /** 补水与引用解析都在请求登记之前，因此先捕获归属，await 之后据此判断这次重试是否还属于当前画布。 */
             const stillOwned = captureGenerationOwner();
-            const rawContext = hasSavedImageMetadata ? null : buildNodeGenerationContext(sourceNode.id, nodesRef.current, connectionsRef.current, node.metadata?.hostedPromptTemplate || sourceNode.metadata?.prompt || node.metadata?.prompt || "");
+            const rawContext = hasSavedImageMetadata || savedHostedRequest ? null : buildNodeGenerationContext(sourceNode.id, nodesRef.current, connectionsRef.current, node.metadata?.hostedPromptTemplate || sourceNode.metadata?.prompt || node.metadata?.prompt || "");
             const context = rawContext && !isHostedVideo ? await hydrateNodeGenerationContext(rawContext) : rawContext;
             if (!stillOwned()) return;
-            const prompt = (savedImageMetadata?.prompt || context?.prompt || "").trim();
+            const prompt = (savedImageMetadata?.prompt || node.metadata?.prompt || context?.prompt || savedHostedRequest?.promptTemplate || "").trim();
             if (!prompt) {
                 message.warning(t("canvas.projectPage.retryPromptMissing"));
                 return;
@@ -2790,16 +2781,25 @@ function InfiniteCanvasPage() {
                     return;
                 }
                 if (node.type === CanvasNodeType.Video) {
-                    if (isHostedVideo && context) {
+                    if (isHostedVideo) {
                         if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
-                        const request = await buildHostedVideoRequest(
-                            { workspaceId: activeWorkspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: generationConfig.videoSeconds, aspectRatio: generationConfig.size, resolution: generationConfig.vquality, generateAudio: boolConfig(generationConfig.videoGenerateAudio, true) },
-                            undefined,
-                            (source, assetId) => setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === source.nodeId ? { ...item, metadata: { ...item.metadata, assetId } } : item))),
-                            controller.signal,
+                        const request = savedHostedRequest ||
+                            (context
+                                ? await buildHostedVideoRequest(
+                                      { workspaceId: activeWorkspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: generationConfig.videoSeconds, aspectRatio: generationConfig.size, resolution: generationConfig.vquality, generateAudio: boolConfig(generationConfig.videoGenerateAudio, true) },
+                                      undefined,
+                                      (source, assetId) => setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === source.nodeId ? { ...item, metadata: { ...item.metadata, assetId } } : item))),
+                                      controller.signal,
+                                  )
+                                : null);
+                        if (!request) throw new Error("Hosted video request is unavailable");
+                        const result = await submitHostedVideoRequest(
+                            activeWorkspaceId,
+                            request,
+                            (prepared) => setOwnedNodes(controller, (prev) => saveHostedVideoRequest(prev, node.id, prepared)),
+                            { signal: controller.signal },
                         );
-                        const result = await requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
-                        setOwnedNodes(controller, (prev) => applyHostedVideoResult(prev, node.id, result).map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, prompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark, hostedBindings: request.bindings, hostedPromptTemplate: request.promptTemplate } } : item)));
+                        setOwnedNodes(controller, (prev) => applyHostedVideoResult(prev, node.id, result).map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, prompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark } } : item)));
                         return;
                     }
                     const video = await storeGeneratedVideo(await requestVideoGeneration(generationConfig, prompt, retryImages, { signal: controller.signal }));

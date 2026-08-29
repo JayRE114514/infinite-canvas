@@ -1,7 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.hoisted(() => {
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: { getItem: () => null, setItem: () => undefined, removeItem: () => undefined } });
+});
 
 import { freshIndexedDB } from "../../../test/setup-indexeddb";
 import { projectToSnapshot } from "@/lib/canvas/canvas-snapshot";
+import { audioMetadata, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { createRecoveryDatabase } from "./database";
 import { buildRecoveryScopeId } from "./scope";
 import { createCanvasRecoveryStore, type CanvasRecoveryStore } from "./store";
@@ -126,6 +131,28 @@ describe("canonical draft snapshot", () => {
 
         const snapshot = projectToSnapshot({ ...project(nodes[0]), nodes }) as unknown as { nodes: CanvasNodeData[] };
         expect(snapshot.nodes.map((node) => node.metadata)).toEqual(nodes.map((node) => ({ assetId: node.metadata?.assetId, mimeType: node.metadata?.mimeType })));
+    });
+
+    it("keeps new local image, video, and audio bytes after replacing stale Asset identities", () => {
+        const replacements = [
+            ["image", imageMetadata({ url: "blob:new-image", storageKey: "image:new", width: 1, height: 1, bytes: 1, mimeType: "image/png" })],
+            ["video", videoMetadata({ url: "blob:new-video", storageKey: "video:new", bytes: 1, mimeType: "video/mp4" })],
+            ["audio", audioMetadata({ url: "blob:new-audio", storageKey: "audio:new", bytes: 1, mimeType: "audio/mpeg" })],
+        ] as const;
+        const nodes = replacements.map(([type, replacement], index) => ({
+            id: type,
+            type,
+            title: type,
+            position: { x: 0, y: 0 },
+            width: 1,
+            height: 1,
+            metadata: { assetId: `10000000-0000-4000-8000-00000000000${index + 1}`, ...replacement },
+        })) as CanvasNodeData[];
+
+        const snapshot = projectToSnapshot({ ...project(nodes[0]), nodes }) as unknown as { nodes: CanvasNodeData[] };
+        expect(snapshot.nodes.map((node) => node.metadata?.assetId)).toEqual([undefined, undefined, undefined]);
+        expect(snapshot.nodes.map((node) => node.metadata?.content)).toEqual(["image:new", "video:new", "audio:new"]);
+        expect(snapshot.nodes.map((node) => node.metadata?.storageKey)).toEqual(["image:new", "video:new", "audio:new"]);
     });
 
     /**

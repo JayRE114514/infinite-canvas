@@ -78,14 +78,17 @@ function buildComposerGenerationContext(inputs: NodeGenerationInput[], prompt: s
     let hasToken = false;
     let lastIndex = 0;
     let nextPrompt = "";
+    let hostedPromptTemplate = "";
 
     for (const match of prompt.matchAll(/@\[node:([^\]]+)\]/g)) {
         if (match.index === undefined) continue;
         hasToken = true;
         nextPrompt += prompt.slice(lastIndex, match.index);
+        hostedPromptTemplate += prompt.slice(lastIndex, match.index);
         const input = inputByNodeId.get(match[1]);
         if (input) {
-            const labels = flattenGenerationInputs([input]).map((resource) => {
+            const resources = flattenGenerationInputs([input]);
+            const labels = resources.map((resource) => {
                 let label = labelByNodeId.get(resource.nodeId);
                 if (!label) {
                     label = generationLabel(resource.type, counts[resource.type]++);
@@ -96,11 +99,13 @@ function buildComposerGenerationContext(inputs: NodeGenerationInput[], prompt: s
                 return resource.type === "text" ? `【${label}】` : label;
             });
             nextPrompt += labels.join("、");
+            hostedPromptTemplate += resources.map((resource) => (resource.type === "text" ? resource.text || "" : `@[node:${resource.nodeId}]`)).join("、");
         }
         lastIndex = match.index + match[0].length;
     }
 
     nextPrompt += prompt.slice(lastIndex);
+    hostedPromptTemplate += prompt.slice(lastIndex);
     if (textBlocks.length) nextPrompt = `${nextPrompt.trim()}\n\n${textBlocks.join("\n\n")}`;
     const referenceImages = selectedInputs.map((input) => input.image).filter((image): image is ReferenceImage => Boolean(image));
     const referenceVideos = selectedInputs.map((input) => input.video).filter((video): video is ReferenceVideo => Boolean(video));
@@ -123,7 +128,7 @@ function buildComposerGenerationContext(inputs: NodeGenerationInput[], prompt: s
 
     return {
         prompt: nextPrompt,
-        promptTemplate: prompt,
+        promptTemplate: hostedPromptTemplate,
         hostedMedia: toHostedMedia(selectedInputs),
         referenceImages,
         referenceVideos,

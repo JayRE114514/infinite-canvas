@@ -64,6 +64,8 @@ export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webd
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 export const HOSTED_ARTBOX_VIDEO_MODEL = "Artdance 2 Mini-480p";
+export const HOSTED_ARTBOX_CHANNEL_ID = "__hosted_artbox__";
+export const HOSTED_ARTBOX_VIDEO_MODEL_OPTION = `${HOSTED_ARTBOX_CHANNEL_ID}::${HOSTED_ARTBOX_VIDEO_MODEL}`;
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
@@ -164,14 +166,17 @@ export function modelCapabilityOf(config: AiConfig, value: string): ModelCapabil
 }
 
 export function isHostedArtBoxModel(value: string) {
-    return modelOptionName(value).trim() === HOSTED_ARTBOX_VIDEO_MODEL;
+    return value === HOSTED_ARTBOX_VIDEO_MODEL_OPTION;
 }
 
 /** Canvas-only virtual channel: the hosted capability has no browser endpoint or credential. */
 export function withHostedArtBoxVideoModel(config: AiConfig): AiConfig {
-    if (config.channels.some((channel) => channel.models.some((model) => model.name === HOSTED_ARTBOX_VIDEO_MODEL))) return config;
-    const channel: ModelChannel = { id: "hosted-artbox", name: "ArtBox", baseUrl: "", apiKey: "", apiFormat: "openai", models: [{ name: HOSTED_ARTBOX_VIDEO_MODEL, capability: "video" }] };
-    return { ...config, channels: [...config.channels, channel], models: [...config.models, encodeChannelModel(channel.id, HOSTED_ARTBOX_VIDEO_MODEL)] };
+    const channel: ModelChannel = { id: HOSTED_ARTBOX_CHANNEL_ID, name: "ArtBox", baseUrl: "", apiKey: "", apiFormat: "openai", models: [{ name: HOSTED_ARTBOX_VIDEO_MODEL, capability: "video" }] };
+    return {
+        ...config,
+        channels: [...config.channels.filter((item) => item.id !== HOSTED_ARTBOX_CHANNEL_ID), channel],
+        models: [...config.models.filter((model) => model !== HOSTED_ARTBOX_VIDEO_MODEL_OPTION), HOSTED_ARTBOX_VIDEO_MODEL_OPTION],
+    };
 }
 
 export function modelMatchesCapability(config: AiConfig, value: string, capability?: ModelCapability) {
