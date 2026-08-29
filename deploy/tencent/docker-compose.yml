@@ -1,0 +1,112 @@
+name: infinite-canvas-jayre
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: infinite_canvas
+      POSTGRES_USER: infinite_canvas_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U infinite_canvas_admin -d infinite_canvas"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  db-bootstrap:
+    image: postgres:17-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGDATABASE: infinite_canvas
+      PGUSER: infinite_canvas_admin
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      SCHEMA_OWNER_PASSWORD: ${SCHEMA_OWNER_PASSWORD}
+      APP_API_PASSWORD: ${APP_API_PASSWORD}
+      APP_WORKER_PASSWORD: ${APP_WORKER_PASSWORD}
+      APP_MAINTENANCE_PASSWORD: ${APP_MAINTENANCE_PASSWORD}
+    volumes:
+      - ../../server/database/bootstrap/roles.sql:/bootstrap/roles.sql:ro
+      - ../../server/database/bootstrap/adopt-ownership.sql:/bootstrap/adopt-ownership.sql:ro
+      - ./bootstrap.sh:/bootstrap/bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    restart: "no"
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+    working_dir: /app/server
+    environment:
+      DATABASE_URL_SCHEMA_OWNER: postgres://schema_owner:${SCHEMA_OWNER_PASSWORD}@db:5432/infinite_canvas
+    command: ["bun", "run", "db:migrate"]
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      APP_ORIGIN: ${APP_ORIGIN}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      DATABASE_URL_API: postgres://app_api:${APP_API_PASSWORD}@db:5432/infinite_canvas
+      DB_POOL_MAX: 10
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-no-reply@infinite-canvas.local}
+    ports:
+      - "127.0.0.1:4001:4000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:4000/api/v1/health/ready');if(!r.ok)process.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5184:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:v1.31.0
+    expose:
+      - "1025"
+      - "8025"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
