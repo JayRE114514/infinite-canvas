@@ -87,8 +87,7 @@ services:
   web:
     build:
       context: ../..
-      dockerfile: Dockerfile
-      target: web
+      dockerfile: deploy/tencent/Dockerfile.prebuilt-web
     depends_on:
       api:
         condition: service_healthy
