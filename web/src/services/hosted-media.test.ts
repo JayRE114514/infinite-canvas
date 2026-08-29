@@ -1,4 +1,4 @@
-import type { Asset, CreateAssetResponse } from "@infinite-canvas/contracts";
+import type { Asset, CreateArtBoxVideoGenerationBody, CreateAssetResponse } from "@infinite-canvas/contracts";
 import { describe, expect, it, vi } from "vitest";
 
 vi.hoisted(() => {
@@ -15,10 +15,33 @@ vi.hoisted(() => {
 
 import { buildNodeGenerationContext } from "@/components/canvas/canvas-node-generation";
 import { hydrateCanvasImages } from "@/lib/canvas/canvas-generation-helpers";
-import { audioMetadata, imageMetadata, primaryImageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
-import { defaultConfig, encodeChannelModel, HOSTED_ARTBOX_CHANNEL_ID, HOSTED_ARTBOX_VIDEO_MODEL, HOSTED_ARTBOX_VIDEO_MODEL_OPTION, isHostedArtBoxModel, modelCapabilityOf, selectableModelsByCapability, withHostedArtBoxVideoModel } from "@/stores/use-config-store";
+import { audioMetadata, deleteBatchImageMetadata, imageMetadata, primaryImageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
+import { projectToSnapshot } from "@/lib/canvas/canvas-snapshot";
+import {
+    defaultConfig,
+    encodeChannelModel,
+    HOSTED_ARTBOX_CHANNEL_ID,
+    HOSTED_ARTBOX_VIDEO_MODEL,
+    HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+    isHostedArtBoxModel,
+    modelCapabilityOf,
+    selectableModelsByCapability,
+    withHostedArtBoxVideoModel,
+} from "@/stores/use-config-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/types/canvas";
-import { applyHostedVideoResult, buildHostedVideoRequest, ensureAssetReady, HostedMediaError, requestHostedArtBoxVideo, resolveHostedVideoRequest, saveHostedVideoRequest, submitHostedVideoRequest, videoGenerationRoute, type HostedMediaDependencies } from "./hosted-media";
+import {
+    applyHostedVideoResult,
+    buildHostedVideoRequest,
+    ensureAssetReady,
+    HostedMediaError,
+    requestHostedArtBoxVideo,
+    resolveHostedVideoRequest,
+    runCanvasVideoGeneration,
+    saveHostedVideoRequest,
+    videoGenerationRoute,
+    type BuildHostedVideoRequest,
+    type HostedMediaDependencies,
+} from "./hosted-media";
 
 const workspaceId = "10000000-0000-4000-8000-000000000002";
 const asset = (id: string, kind: Asset["kind"] = "image", status: Asset["status"] = "ready"): Asset => ({
@@ -81,7 +104,9 @@ describe("hosted media preparation", () => {
 
     it("fails explicitly when the exact local bytes are missing", async () => {
         const deps = dependencies();
-        await expect(ensureAssetReady(workspaceId, { nodeId: "audio", kind: "audio", storageKey: "audio:missing", fileName: "audio.mp3", contentType: "audio/mpeg" }, deps)).rejects.toMatchObject({ code: "hosted_media_bytes_missing" } satisfies Partial<HostedMediaError>);
+        await expect(ensureAssetReady(workspaceId, { nodeId: "audio", kind: "audio", storageKey: "audio:missing", fileName: "audio.mp3", contentType: "audio/mpeg" }, deps)).rejects.toMatchObject({
+            code: "hosted_media_bytes_missing",
+        } satisfies Partial<HostedMediaError>);
         expect(deps.createAsset).not.toHaveBeenCalled();
     });
 
@@ -95,10 +120,7 @@ describe("hosted media preparation", () => {
         const connections = ["image", "video", "audio"].map((id) => ({ id, fromNodeId: id, toNodeId: "config" })) satisfies CanvasConnection[];
         const promptTemplate = "听 @[node:audio]，参考 @[node:image]，跟随 @[node:video]，再次 @[node:image]";
         const context = buildNodeGenerationContext("config", nodes, connections, promptTemplate);
-        const request = await buildHostedVideoRequest(
-            { workspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: "5", generateAudio: true },
-            dependencies(),
-        );
+        const request = await buildHostedVideoRequest({ workspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: "5", generateAudio: true }, dependencies());
 
         expect(request.promptTemplate).toBe(promptTemplate);
         expect(request.bindings).toEqual([
@@ -153,6 +175,61 @@ describe("hosted media preparation", () => {
         expect(context.hostedMedia[0].assetId).toBeUndefined();
         expect(deps.createAsset).toHaveBeenCalledOnce();
     });
+
+    it("moves complete visible media identity when deleting the batch primary and clears it when empty", async () => {
+        const assetA = "10000000-0000-4000-8000-000000000001";
+        const assetB = "10000000-0000-4000-8000-000000000002";
+        const imageA = { id: "a", status: "success" as const, content: "https://display/a", assetId: assetA, naturalWidth: 10, naturalHeight: 20, bytes: 30, mimeType: "image/png" };
+        const imageB = { id: "b", status: "success" as const, content: "https://display/b", assetId: assetB, naturalWidth: 40, naturalHeight: 50, bytes: 60, mimeType: "image/webp" };
+        const metadata = deleteBatchImageMetadata({ ...primaryImageMetadata(imageA), images: [imageA, imageB], primaryImageId: "a", count: 2, status: "success" }, "a");
+        expect(metadata).toMatchObject({ content: imageB.content, assetId: assetB, naturalWidth: 40, naturalHeight: 50, bytes: 60, mimeType: "image/webp", primaryImageId: "b", count: 1, images: [imageB] });
+        const implicitPrimary = deleteBatchImageMetadata({ ...primaryImageMetadata(imageA), images: [imageA, imageB], count: 2, status: "success" }, "a");
+        expect(implicitPrimary).toMatchObject({ content: imageB.content, assetId: assetB, primaryImageId: "b", images: [imageB] });
+
+        const node = { ...mediaNode("batch", CanvasNodeType.Image), metadata };
+        const config = { id: "config", type: CanvasNodeType.Config, title: "config", position: { x: 0, y: 0 }, width: 1, height: 1, metadata: { composerContent: "yes" } } satisfies CanvasNodeData;
+        const context = buildNodeGenerationContext("config", [node, config], [{ id: "edge", fromNodeId: "batch", toNodeId: "config" }], "@[node:batch]");
+        const request = await buildHostedVideoRequest({ workspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: "5", generateAudio: true }, dependencies());
+        expect(request.bindings).toEqual([{ nodeId: "batch", kind: "image", assetId: assetB }]);
+
+        const snapshot = projectToSnapshot({
+            id: "canvas",
+            title: "canvas",
+            createdAt: "",
+            updatedAt: "",
+            nodes: [node],
+            connections: [],
+            chatSessions: [],
+            activeChatId: null,
+            backgroundMode: "dots",
+            showImageInfo: false,
+            viewport: { x: 0, y: 0, k: 1 },
+        });
+        expect(JSON.stringify(snapshot)).toContain(assetB);
+        expect(JSON.stringify(snapshot)).not.toContain(assetA);
+
+        const empty = deleteBatchImageMetadata(metadata, "b");
+        expect(empty).toMatchObject({ images: [], count: 0 });
+        expect({
+            content: empty.content,
+            storageKey: empty.storageKey,
+            assetId: empty.assetId,
+            naturalWidth: empty.naturalWidth,
+            naturalHeight: empty.naturalHeight,
+            bytes: empty.bytes,
+            mimeType: empty.mimeType,
+            primaryImageId: empty.primaryImageId,
+        }).toEqual({
+            content: undefined,
+            storageKey: undefined,
+            assetId: undefined,
+            naturalWidth: undefined,
+            naturalHeight: undefined,
+            bytes: undefined,
+            mimeType: undefined,
+            primaryImageId: undefined,
+        });
+    });
 });
 
 describe("hosted Canvas integration helpers", () => {
@@ -178,6 +255,160 @@ describe("hosted Canvas integration helpers", () => {
         expect(videoGenerationRoute("default::grok-imagine-video")).toBe("local");
     });
 
+    it("runs a same-named custom model only through the local video operation", async () => {
+        const trace: string[] = [];
+        const route = await runCanvasVideoGeneration({
+            model: encodeChannelModel("custom", HOSTED_ARTBOX_VIDEO_MODEL),
+            savedRequest: null,
+            prepareHostedRequest: async () => {
+                trace.push("prepare-hosted");
+                throw new Error("unexpected hosted prepare");
+            },
+            persistHostedRequest: async () => {
+                trace.push("persist-hosted");
+            },
+            generateHosted: async () => {
+                trace.push("generate-hosted");
+                throw new Error("unexpected hosted create");
+            },
+            applyHostedResult: async () => {
+                trace.push("apply-hosted");
+            },
+            generateLocal: async () => {
+                trace.push("generate-local");
+            },
+        });
+
+        expect(route).toBe("local");
+        expect(trace).toEqual(["generate-local"]);
+    });
+
+    it("awaits durable target persistence before hosted create and applies one authoritative target result", async () => {
+        const gate = deferred<void>();
+        const trace: string[] = [];
+        const request: CreateArtBoxVideoGenerationBody = {
+            model: HOSTED_ARTBOX_VIDEO_MODEL,
+            promptTemplate: "saved @[node:image]",
+            bindings: [{ nodeId: "image", kind: "image", assetId: "10000000-0000-4000-8000-000000000001" }],
+            seconds: "5",
+            generateAudio: true,
+        };
+        const result = { asset: asset("10000000-0000-4000-8000-000000000008", "video"), displayUrl: "https://display/result" };
+        const createBodies: CreateArtBoxVideoGenerationBody[] = [];
+        let nodes: CanvasNodeData[] = [
+            mediaNode("source", CanvasNodeType.Image),
+            { ...mediaNode("target", CanvasNodeType.Video), metadata: { freeResize: true, groupId: "keep", prompt: "visible prompt", model: "changed-local", size: "9:16", vquality: "1080", watermark: "true" } },
+        ];
+
+        const pending = runCanvasVideoGeneration({
+            model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+            savedRequest: null,
+            prepareHostedRequest: async () => {
+                trace.push("prepare");
+                return request;
+            },
+            persistHostedRequest: async (prepared) => {
+                trace.push("persist:start");
+                await gate.promise;
+                nodes = saveHostedVideoRequest(nodes, "target", prepared);
+                trace.push("persist:durable");
+            },
+            generateHosted: async (prepared) => {
+                trace.push("create");
+                createBodies.push(prepared);
+                return result;
+            },
+            applyHostedResult: async (created, prepared) => {
+                trace.push("apply");
+                nodes = applyHostedVideoResult(nodes, "target", created, prepared);
+            },
+            generateLocal: async () => {
+                trace.push("local");
+            },
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(trace).toEqual(["prepare", "persist:start"]);
+        expect(createBodies).toEqual([]);
+
+        gate.resolve();
+        await expect(pending).resolves.toBe("hosted");
+        expect(trace).toEqual(["prepare", "persist:start", "persist:durable", "create", "apply"]);
+        expect(createBodies).toStrictEqual([request]);
+        expect(createBodies[0]).not.toHaveProperty("aspectRatio");
+        expect(createBodies[0]).not.toHaveProperty("resolution");
+        expect(nodes).toHaveLength(2);
+        expect(nodes.filter((node) => node.id === "target")).toHaveLength(1);
+        expect(nodes[1].metadata).toMatchObject({
+            freeResize: true,
+            groupId: "keep",
+            assetId: result.asset.id,
+            content: result.displayUrl,
+            model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+            prompt: "visible prompt",
+            seconds: "5",
+            generateAudio: "true",
+            size: "9:16",
+        });
+        expect(nodes[1].metadata?.vquality).toBeUndefined();
+        expect(nodes[1].metadata?.watermark).toBeUndefined();
+    });
+
+    it("retries a failed saved request after graph and settings change with saved body and provenance", async () => {
+        const request: CreateArtBoxVideoGenerationBody = {
+            model: HOSTED_ARTBOX_VIDEO_MODEL,
+            promptTemplate: "original @[node:image]",
+            bindings: [{ nodeId: "image", kind: "image", assetId: "10000000-0000-4000-8000-000000000001" }],
+            seconds: "5",
+            generateAudio: false,
+        };
+        const result = { asset: asset("10000000-0000-4000-8000-000000000008", "video"), displayUrl: "https://display/result" };
+        let nodes: CanvasNodeData[] = [{ ...mediaNode("target", CanvasNodeType.Video), metadata: { freeResize: true, groupId: "keep", prompt: "visible changed prompt", size: "9:16", vquality: "1080", watermark: "true" } }];
+        await expect(
+            runCanvasVideoGeneration({
+                model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+                savedRequest: null,
+                prepareHostedRequest: async () => request,
+                persistHostedRequest: async (prepared) => {
+                    nodes = saveHostedVideoRequest(nodes, "target", prepared);
+                },
+                generateHosted: async () => {
+                    throw new Error("first create failed");
+                },
+                applyHostedResult: async () => undefined,
+                generateLocal: async () => undefined,
+            }),
+        ).rejects.toThrow("first create failed");
+
+        const savedRequest = resolveHostedVideoRequest(nodes[0], null);
+        const submitted: CreateArtBoxVideoGenerationBody[] = [];
+        await runCanvasVideoGeneration({
+            model: "default::changed-local-model",
+            savedRequest,
+            prepareHostedRequest: async () => {
+                throw new Error("changed graph must not prepare");
+            },
+            persistHostedRequest: async (prepared) => {
+                nodes = saveHostedVideoRequest(nodes, "target", prepared);
+            },
+            generateHosted: async (prepared) => {
+                submitted.push(prepared);
+                return result;
+            },
+            applyHostedResult: async (created, prepared) => {
+                nodes = applyHostedVideoResult(nodes, "target", created, prepared);
+            },
+            generateLocal: async () => {
+                throw new Error("saved hosted retry must not run local");
+            },
+        });
+
+        expect(submitted).toStrictEqual([request]);
+        expect(nodes[0].metadata).toMatchObject({ freeResize: true, groupId: "keep", model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION, prompt: "visible changed prompt", seconds: "5", size: "9:16", generateAudio: "false", assetId: result.asset.id });
+        expect(nodes[0].metadata?.vquality).toBeUndefined();
+        expect(nodes[0].metadata?.watermark).toBeUndefined();
+    });
+
     it("keeps a saved hosted request on the hosted retry route and rejects corrupted model identity", () => {
         const request = { model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: "saved", bindings: [], seconds: "5", generateAudio: true };
         const saved = saveHostedVideoRequest([mediaNode("target", CanvasNodeType.Video)], "target", request)[0];
@@ -187,8 +418,87 @@ describe("hosted Canvas integration helpers", () => {
 
         const corrupted = { ...saved, metadata: { ...saved.metadata, hostedRequest: { ...request, model: "arbitrary-model" } } };
         expect(resolveHostedVideoRequest(corrupted, null)).toBeNull();
-        const corruptedBinding = { ...saved, metadata: { ...saved.metadata, hostedRequest: { ...request, bindings: [{ nodeId: "image", kind: "image", assetId: "10000000-0000-4000-8000-000000000001", url: "https://forbidden" }] } } } as unknown as CanvasNodeData;
+        const corruptedBinding = {
+            ...saved,
+            metadata: { ...saved.metadata, hostedRequest: { ...request, bindings: [{ nodeId: "image", kind: "image", assetId: "10000000-0000-4000-8000-000000000001", url: "https://forbidden" }] } },
+        } as unknown as CanvasNodeData;
         expect(resolveHostedVideoRequest(corruptedBinding, null)).toBeNull();
+    });
+
+    it("rejects every malformed saved request before the create boundary", async () => {
+        const valid: CreateArtBoxVideoGenerationBody = {
+            model: HOSTED_ARTBOX_VIDEO_MODEL,
+            promptTemplate: "saved @[node:image]",
+            bindings: [{ nodeId: "image", kind: "image", assetId: "10000000-0000-4000-8000-000000000001" }],
+            seconds: "5",
+            generateAudio: true,
+        };
+        const sparseBindings = Array(1) as CreateArtBoxVideoGenerationBody["bindings"];
+        const disguisedSparse = Object.assign(Array(1), { "01": valid.bindings[0] }) as CreateArtBoxVideoGenerationBody["bindings"];
+        const arrayWithExtra = Object.assign([...valid.bindings], { url: "https://forbidden" });
+        let accessorRead = false;
+        const accessorBindings: unknown[] = [];
+        Object.defineProperty(accessorBindings, "0", {
+            enumerable: true,
+            get: () => {
+                accessorRead = true;
+                return valid.bindings[0];
+            },
+        });
+        accessorBindings.length = 1;
+        const symbol = Symbol("forbidden");
+        const malformed: unknown[] = [
+            { ...valid, bindings: sparseBindings },
+            { ...valid, bindings: disguisedSparse },
+            { ...valid, bindings: accessorBindings },
+            { ...valid, bindings: [{ nodeId: "image", kind: "image", assetId: "https://signed.example/private" }] },
+            { ...valid, bindings: [{ nodeId: "image", kind: "image", assetId: "not-a-uuid" }] },
+            { ...valid, bindings: [{ nodeId: { url: "https://private" }, kind: "image", assetId: valid.bindings[0].assetId }] },
+            { ...valid, bindings: [{ nodeId: "image", kind: "image", assetId: { storageKey: "image:secret" } }] },
+            { ...valid, bindings: [{ ...valid.bindings[0], nested: { url: "https://forbidden" } }] },
+            { ...valid, bindings: arrayWithExtra },
+            { ...valid, generateAudio: "true" },
+            { ...valid, seconds: { value: "5" } },
+            { ...valid, aspectRatio: "16:9" },
+            { ...valid, resolution: "480p" },
+            { ...valid, image_urls: ["https://forbidden"] },
+            Object.assign(Object.create(null), valid),
+            Object.assign({ ...valid }, { [symbol]: "https://forbidden" }),
+        ];
+        const sent: CreateArtBoxVideoGenerationBody[] = [];
+
+        for (const hostedRequest of malformed) {
+            const node = { ...mediaNode("target", CanvasNodeType.Video), metadata: { hostedRequest } } as unknown as CanvasNodeData;
+            const resolved = resolveHostedVideoRequest(node, null);
+            if (!resolved) continue;
+            await requestHostedArtBoxVideo(workspaceId, resolved, {
+                create: vi.fn(async (_workspaceId, body) => {
+                    sent.push(body);
+                    return { id: "g1", workspaceId, status: "reconciling" as const, resultAssetId: null, error: { code: "invalid", message: "invalid", retryable: false }, createdAt: "", updatedAt: "" };
+                }),
+            }).catch(() => undefined);
+        }
+
+        expect(sent).toEqual([]);
+        expect(accessorRead).toBe(false);
+    });
+
+    it("omits generic Canvas size and quality from the fixed hosted request", async () => {
+        const request = await buildHostedVideoRequest(
+            {
+                workspaceId,
+                model: HOSTED_ARTBOX_VIDEO_MODEL,
+                promptTemplate: "go",
+                media: [],
+                seconds: "5",
+                generateAudio: true,
+                aspectRatio: "1:1",
+                resolution: "720",
+            } as BuildHostedVideoRequest & { aspectRatio: string; resolution: string },
+            dependencies(),
+        );
+
+        expect(request).toStrictEqual({ model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: "go", bindings: [], seconds: "5", generateAudio: true });
     });
 
     it("hydrates Asset-backed image, video, and audio nodes with fresh display URLs", async () => {
@@ -250,14 +560,12 @@ describe("hosted Canvas integration helpers", () => {
         expect(pollAtPoll).toHaveBeenCalledOnce();
     });
 
-    it("saves the complete request before submission and uses it as retry authority", async () => {
+    it("saves the complete request on only the target and uses it as retry authority", () => {
         const request = {
             model: HOSTED_ARTBOX_VIDEO_MODEL,
             promptTemplate: "saved @[node:image]",
             bindings: [{ nodeId: "image", kind: "image" as const, assetId: "10000000-0000-4000-8000-000000000001" }],
             seconds: "5",
-            aspectRatio: "16:9",
-            resolution: "480p",
             generateAudio: true,
         };
         const initial = [mediaNode("source", CanvasNodeType.Image), mediaNode("target", CanvasNodeType.Video)];
@@ -267,21 +575,6 @@ describe("hosted Canvas integration helpers", () => {
         expect(saved).toHaveLength(2);
         expect(saved[0]).toBe(initial[0]);
         expect(saved[1].metadata?.hostedRequest).toEqual(request);
-
-        const order: string[] = [];
-        await expect(
-            submitHostedVideoRequest(workspaceId, request, (prepared) => {
-                order.push("save");
-                expect(prepared).toEqual(request);
-            }, {
-                create: vi.fn(async () => {
-                    order.push("submit");
-                    return { id: "g1", workspaceId, status: "reconciling" as const, resultAssetId: null, error: { code: "uncertain", message: "manual", retryable: false }, createdAt: "", updatedAt: "" };
-                }),
-                wait: vi.fn(async () => undefined),
-            }),
-        ).rejects.toMatchObject({ code: "hosted_generation_reconciling" });
-        expect(order).toEqual(["save", "submit"]);
     });
 });
 
@@ -300,4 +593,12 @@ function mediaNode(id: string, type: CanvasNodeType.Image | CanvasNodeType.Video
 
 function textNode(id: string, content: string, groupId?: string): CanvasNodeData {
     return { id, type: CanvasNodeType.Text, title: id, position: { x: 0, y: 0 }, width: 1, height: 1, metadata: { content, groupId } };
+}
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => {
+        resolve = done;
+    });
+    return { promise, resolve };
 }

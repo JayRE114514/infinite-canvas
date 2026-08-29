@@ -40,6 +40,16 @@ export function primaryImageMetadata(image: CanvasNodeImage): CanvasNodeMetadata
     return { content: image.content, storageKey: image.storageKey, assetId: image.assetId, naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight, bytes: image.bytes, mimeType: image.mimeType };
 }
 
+export function deleteBatchImageMetadata(metadata: CanvasNodeMetadata, imageId: string): CanvasNodeMetadata {
+    const images = metadata.images?.filter((image) => image.id !== imageId) || [];
+    const common = { ...metadata, images, count: images.length };
+    if ((metadata.primaryImageId || metadata.images?.[0]?.id) !== imageId) return common;
+    const replacement = images[0];
+    return replacement
+        ? { ...common, ...primaryImageMetadata(replacement), primaryImageId: replacement.id }
+        : { ...common, content: undefined, storageKey: undefined, assetId: undefined, naturalWidth: undefined, naturalHeight: undefined, bytes: undefined, mimeType: undefined, primaryImageId: undefined };
+}
+
 export function referenceUrl(image: ReferenceImage) {
     return image.storageKey || image.url || (!image.dataUrl.startsWith("data:") ? image.dataUrl : undefined);
 }

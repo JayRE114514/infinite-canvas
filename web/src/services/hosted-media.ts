@@ -6,7 +6,7 @@ import { createArtBoxVideoGeneration, pollArtBoxVideoGeneration } from "@/servic
 import { VIDEO_GENERATION_POLL_ATTEMPTS, VIDEO_GENERATION_POLL_INTERVAL_MS } from "@/services/api/video";
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob } from "@/services/image-storage";
-import { HOSTED_ARTBOX_VIDEO_MODEL, isHostedArtBoxModel } from "@/stores/use-config-store";
+import { HOSTED_ARTBOX_VIDEO_MODEL, HOSTED_ARTBOX_VIDEO_MODEL_OPTION, isHostedArtBoxModel } from "@/stores/use-config-store";
 import type { CanvasNodeData } from "@/types/canvas";
 import type { HostedMediaSource } from "@/types/media";
 
@@ -21,7 +21,10 @@ export type HostedMediaDependencies = {
 const defaultDependencies: HostedMediaDependencies = { createAsset, uploadAsset, completeAsset, getImageBlob, getMediaBlob };
 
 export class HostedMediaError extends Error {
-    constructor(readonly code: "hosted_media_bytes_missing" | "hosted_asset_not_ready" | "hosted_generation_failed" | "hosted_generation_reconciling" | "hosted_generation_timeout" | "hosted_generation_result_missing", message: string) {
+    constructor(
+        readonly code: "hosted_media_bytes_missing" | "hosted_asset_not_ready" | "hosted_generation_failed" | "hosted_generation_reconciling" | "hosted_generation_timeout" | "hosted_generation_result_missing",
+        message: string,
+    ) {
         super(message);
         this.name = "HostedMediaError";
     }
@@ -44,12 +47,15 @@ export type BuildHostedVideoRequest = {
     promptTemplate: string;
     media: HostedMediaSource[];
     seconds: string;
-    aspectRatio?: string;
-    resolution?: string;
     generateAudio: boolean;
 };
 
-export async function buildHostedVideoRequest(input: BuildHostedVideoRequest, deps: HostedMediaDependencies = defaultDependencies, onAssetReady?: (source: HostedMediaSource, assetId: string) => void, signal?: AbortSignal): Promise<CreateArtBoxVideoGenerationBody> {
+export async function buildHostedVideoRequest(
+    input: BuildHostedVideoRequest,
+    deps: HostedMediaDependencies = defaultDependencies,
+    onAssetReady?: (source: HostedMediaSource, assetId: string) => void,
+    signal?: AbortSignal,
+): Promise<CreateArtBoxVideoGenerationBody> {
     const bindings: HostedMediaBinding[] = [];
     for (const source of input.media) {
         const assetId = await ensureAssetReady(input.workspaceId, source, deps, signal);
@@ -61,8 +67,6 @@ export async function buildHostedVideoRequest(input: BuildHostedVideoRequest, de
         promptTemplate: input.promptTemplate,
         bindings,
         seconds: input.seconds,
-        ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
-        ...(input.resolution ? { resolution: input.resolution } : {}),
         generateAudio: input.generateAudio,
     };
 }
@@ -106,26 +110,66 @@ export function saveHostedVideoRequest(nodes: CanvasNodeData[], targetNodeId: st
     return nodes.map((node) => (node.id === targetNodeId ? { ...node, metadata: { ...node.metadata, hostedRequest: request } } : node));
 }
 
-export function submitHostedVideoRequest(workspaceId: string, request: CreateArtBoxVideoGenerationBody, persist: (request: CreateArtBoxVideoGenerationBody) => void, options: HostedVideoRequestOptions = {}) {
-    persist(request);
-    return requestHostedArtBoxVideo(workspaceId, request, options);
+export type CanvasVideoGenerationOperations = {
+    model: string;
+    savedRequest: CreateArtBoxVideoGenerationBody | null;
+    prepareHostedRequest: () => Promise<CreateArtBoxVideoGenerationBody>;
+    persistHostedRequest: (request: CreateArtBoxVideoGenerationBody) => Promise<void>;
+    generateHosted: (request: CreateArtBoxVideoGenerationBody) => Promise<ReadAssetResponse>;
+    applyHostedResult: (result: ReadAssetResponse, request: CreateArtBoxVideoGenerationBody) => void | Promise<void>;
+    generateLocal: () => Promise<void>;
+};
+
+export async function runCanvasVideoGeneration(operations: CanvasVideoGenerationOperations) {
+    if (videoGenerationRoute(operations.model, operations.savedRequest) === "local") {
+        await operations.generateLocal();
+        return "local" as const;
+    }
+    const request = operations.savedRequest || (await operations.prepareHostedRequest());
+    await operations.persistHostedRequest(request);
+    const result = await operations.generateHosted(request);
+    await operations.applyHostedResult(result, request);
+    return "hosted" as const;
 }
 
 function isCompleteHostedVideoRequest(value: unknown): value is CreateArtBoxVideoGenerationBody {
-    if (!value || typeof value !== "object") return false;
+    if (!isExactRecord(value, ["model", "promptTemplate", "bindings", "seconds", "generateAudio"], ["model", "promptTemplate", "bindings", "seconds", "generateAudio"])) return false;
     const request = value as Partial<CreateArtBoxVideoGenerationBody>;
-    const allowedKeys = new Set(["model", "promptTemplate", "bindings", "seconds", "aspectRatio", "resolution", "generateAudio"]);
     return (
-        Object.keys(request).every((key) => allowedKeys.has(key)) &&
         request.model === HOSTED_ARTBOX_VIDEO_MODEL &&
-        typeof request.promptTemplate === "string" && Boolean(request.promptTemplate.trim()) &&
-        typeof request.seconds === "string" && Boolean(request.seconds.trim()) &&
-        (request.aspectRatio === undefined || (typeof request.aspectRatio === "string" && Boolean(request.aspectRatio.trim()))) &&
-        (request.resolution === undefined || (typeof request.resolution === "string" && Boolean(request.resolution.trim()))) &&
+        typeof request.promptTemplate === "string" &&
+        Boolean(request.promptTemplate.trim()) &&
+        typeof request.seconds === "string" &&
+        Boolean(request.seconds.trim()) &&
         typeof request.generateAudio === "boolean" &&
-        Array.isArray(request.bindings) &&
-        request.bindings.every((binding) => Boolean(binding && Object.keys(binding).length === 3 && binding.nodeId && binding.assetId && (binding.kind === "image" || binding.kind === "video" || binding.kind === "audio")))
+        isDenseArray(request.bindings) &&
+        request.bindings.every(
+            (binding) =>
+                isExactRecord(binding, ["nodeId", "kind", "assetId"], ["nodeId", "kind", "assetId"]) &&
+                typeof binding.nodeId === "string" &&
+                Boolean(binding.nodeId.trim()) &&
+                typeof binding.assetId === "string" &&
+                UUID_PATTERN.test(binding.assetId) &&
+                (binding.kind === "image" || binding.kind === "video" || binding.kind === "audio"),
+        )
     );
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isExactRecord(value: unknown, allowedKeys: string[], requiredKeys: string[]): value is Record<string, unknown> {
+    if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
+    const keys = Reflect.ownKeys(value);
+    return keys.every((key) => typeof key === "string" && allowedKeys.includes(key) && "value" in Object.getOwnPropertyDescriptor(value, key)!) && requiredKeys.every((key) => keys.includes(key));
+}
+
+function isDenseArray(value: unknown): value is HostedMediaBinding[] {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length + 1) return false;
+    for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor || !("value" in descriptor)) return false;
+    }
+    return true;
 }
 
 function terminalResult(generation: ArtBoxVideoGeneration) {
@@ -134,7 +178,7 @@ function terminalResult(generation: ArtBoxVideoGeneration) {
     return generation.resultAssetId;
 }
 
-export function applyHostedVideoResult(nodes: CanvasNodeData[], targetNodeId: string, result: ReadAssetResponse) {
+export function applyHostedVideoResult(nodes: CanvasNodeData[], targetNodeId: string, result: ReadAssetResponse, request?: CreateArtBoxVideoGenerationBody) {
     return nodes.map((node) => {
         if (node.id !== targetNodeId) return node;
         const { storageKey: _storageKey, ...metadata } = node.metadata || {};
@@ -142,6 +186,15 @@ export function applyHostedVideoResult(nodes: CanvasNodeData[], targetNodeId: st
             ...node,
             metadata: {
                 ...metadata,
+                ...(request
+                    ? {
+                          model: HOSTED_ARTBOX_VIDEO_MODEL_OPTION,
+                          seconds: request.seconds,
+                          generateAudio: String(request.generateAudio),
+                          vquality: undefined,
+                          watermark: undefined,
+                      }
+                    : {}),
                 assetId: result.asset.id,
                 content: result.displayUrl,
                 status: "success" as const,
@@ -157,9 +210,13 @@ function delay(milliseconds: number, signal?: AbortSignal) {
     return new Promise<void>((resolve, reject) => {
         if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
         const timer = setTimeout(resolve, milliseconds);
-        signal?.addEventListener("abort", () => {
-            clearTimeout(timer);
-            reject(new DOMException("Aborted", "AbortError"));
-        }, { once: true });
+        signal?.addEventListener(
+            "abort",
+            () => {
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+        );
     });
 }
