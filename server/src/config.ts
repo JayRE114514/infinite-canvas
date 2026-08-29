@@ -70,15 +70,24 @@ function loadTencentCosConfig(env: NodeJS.ProcessEnv): TencentCosConfig | undefi
 
     const ttlRaw = values[4]!;
     const signedUrlTtlSeconds = Number(ttlRaw);
-    if (!Number.isInteger(signedUrlTtlSeconds) || signedUrlTtlSeconds <= 0) {
+    if (!Number.isSafeInteger(signedUrlTtlSeconds) || signedUrlTtlSeconds <= 0) {
         throw new Error("COS_SIGNED_URL_TTL_SECONDS must be a positive integer");
+    }
+
+    const bucket = values[2]!;
+    if (!/^[a-z\d-]+-\d+$/.test(bucket)) {
+        throw new Error('COS_BUCKET must use the "bucket-appid" format accepted by Tencent COS');
+    }
+    const region = values[3]!;
+    if (region.includes("cos.") || !/^[a-z\d-]+$/.test(region)) {
+        throw new Error("COS_REGION must use the Tencent COS region format");
     }
 
     return {
         secretId: values[0]!,
         secretKey: values[1]!,
-        bucket: values[2]!,
-        region: values[3]!,
+        bucket,
+        region,
         signedUrlTtlSeconds,
     };
 }

@@ -12,7 +12,11 @@ import { and, eq, inArray } from "drizzle-orm";
 import { AppError } from "../../errors.js";
 import { withTenantTransaction } from "../../infrastructure/database/transactions.js";
 import type { AppDatabase, AppTransaction } from "../../infrastructure/database/types.js";
-import type { ObjectStorage, StoredObject } from "../../infrastructure/object-storage/types.js";
+import {
+    ObjectStorageVerificationError,
+    type ObjectStorage,
+    type StoredObject,
+} from "../../infrastructure/object-storage/types.js";
 import { requireActiveWorkspace } from "../workspaces/authorization.js";
 import { assets } from "./schema.js";
 
@@ -57,7 +61,7 @@ function assertStoredObject(stored: StoredObject, row: AssetRow): void {
         !Number.isSafeInteger(stored.byteSize) ||
         stored.byteSize < 0
     ) {
-        throw new Error("Object storage returned unverifiable Asset metadata");
+        throw new ObjectStorageVerificationError();
     }
 }
 
@@ -121,10 +125,15 @@ export async function completeAssetUpload(
             expectedContentType: row.contentType,
         });
         assertStoredObject(stored, row);
-    } catch {
-        await withTenantTransaction(db, tenant, async (tx, access) => {
+    } catch (error) {
+        const recovery = await withTenantTransaction(db, tenant, async (tx, access) => {
             requireActiveWorkspace(access);
-            await tx
+            const current = await findAsset(tx, access.workspaceId, assetId, true);
+            if (current.status === "ready") return { kind: "ready" as const, asset: toAsset(current) };
+            if (current.status !== "staging") throw new AppError("asset_not_ready", 409, "素材未就绪");
+            if (!(error instanceof ObjectStorageVerificationError)) return { kind: "retryable" as const };
+
+            const [failed] = await tx
                 .update(assets)
                 .set({ status: "failed", updatedAt: new Date() })
                 .where(
@@ -133,8 +142,15 @@ export async function completeAssetUpload(
                         eq(assets.workspaceId, access.workspaceId),
                         eq(assets.status, "staging"),
                     ),
-                );
+                )
+                .returning();
+            if (!failed) throw new Error("Asset failure update returned no row");
+            return { kind: "failed" as const };
         });
+        if (recovery.kind === "ready") return recovery.asset;
+        if (recovery.kind === "retryable") {
+            throw new AppError("asset_upload_completion_retryable", 503, "素材上传完成状态暂时无法确认", true);
+        }
         throw new AppError("asset_upload_verification_failed", 422, "素材上传校验失败");
     }
 

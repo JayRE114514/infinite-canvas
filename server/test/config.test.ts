@@ -160,10 +160,22 @@ describe("loadConfig", () => {
             expect(() => loadConfig({ ...baseEnv, ...cosEnv, [name]: undefined })).toThrow("COS configuration");
         });
 
-        it.each(["0", "-1", "1.5", "abc", ""])("rejects non-positive integer COS_SIGNED_URL_TTL_SECONDS=%j", (value) => {
-            expect(() => loadConfig({ ...baseEnv, ...cosEnv, COS_SIGNED_URL_TTL_SECONDS: value })).toThrow(
-                "COS_SIGNED_URL_TTL_SECONDS",
-            );
+        it.each(["0", "-1", "1.5", "abc", "", "9007199254740992", "1e100"])(
+            "rejects invalid COS_SIGNED_URL_TTL_SECONDS=%j",
+            (value) => {
+                expect(() => loadConfig({ ...baseEnv, ...cosEnv, COS_SIGNED_URL_TTL_SECONDS: value })).toThrow(
+                    "COS_SIGNED_URL_TTL_SECONDS",
+                );
+            },
+        );
+
+        it.each([
+            ["COS_BUCKET", "missing-app-id"],
+            ["COS_BUCKET", "Assets-1250000000"],
+            ["COS_REGION", "cos.ap-guangzhou"],
+            ["COS_REGION", "ap_guangzhou"],
+        ])("rejects invalid %s=%j before SDK construction", (name, value) => {
+            expect(() => loadConfig({ ...baseEnv, ...cosEnv, [name]: value })).toThrow(name);
         });
     });
 });

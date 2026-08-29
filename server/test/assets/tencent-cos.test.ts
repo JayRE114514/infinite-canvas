@@ -13,23 +13,41 @@ const config = {
 
 function fakeClient() {
     const calls: { method: string; input: Record<string, unknown> }[] = [];
-    const heads = [
+    const heads: Array<COS.HeadObjectResult | Error> = [
         { ETag: "staging-etag", headers: { "content-type": "image/png", "content-length": "12" } },
         { ETag: "final-etag", headers: { "Content-Type": "image/png", "Content-Length": 12 } },
     ];
+    let signedUrlResult: Partial<COS.GetObjectUrlResult> = { Url: "https://signed.example/object" };
+    let signedUrlError: Error | undefined;
+    let copyError: Error | undefined;
     const client = {
-        getObjectUrl(input: Record<string, unknown>) {
+        getObjectUrl(
+            input: Record<string, unknown>,
+            callback: (err: COS.CosError, data: COS.GetObjectUrlResult) => void,
+        ) {
             calls.push({ method: "getObjectUrl", input });
-            return "https://signed.example/object";
+            const error = signedUrlError
+                ? ({
+                      code: "TestError",
+                      message: signedUrlError.message,
+                      error: signedUrlError,
+                      url: "",
+                      method: "GET",
+                  } as COS.CosSdkError)
+                : null;
+            callback(error, signedUrlResult as COS.GetObjectUrlResult);
+            return undefined as unknown as string;
         },
         async headObject(input: Record<string, unknown>) {
             calls.push({ method: "headObject", input });
             const result = heads.shift();
             if (!result) throw new Error("missing fake HEAD result");
+            if (result instanceof Error) throw result;
             return result;
         },
         async putObjectCopy(input: Record<string, unknown>) {
             calls.push({ method: "putObjectCopy", input });
+            if (copyError) throw copyError;
             return {};
         },
         async deleteObject(input: Record<string, unknown>) {
@@ -41,7 +59,20 @@ function fakeClient() {
             return {};
         },
     };
-    return { calls, heads, client: client as unknown as COS };
+    return {
+        calls,
+        heads,
+        client: client as unknown as COS,
+        setSignedUrlResult(result: Partial<COS.GetObjectUrlResult>) {
+            signedUrlResult = result;
+        },
+        setSignedUrlError(error: Error) {
+            signedUrlError = error;
+        },
+        setCopyError(error: Error) {
+            copyError = error;
+        },
+    };
 }
 
 describe("Tencent COS storage", () => {
@@ -104,6 +135,62 @@ describe("Tencent COS storage", () => {
             storage.completeUpload({ stagingKey: "staging", finalKey: "final", expectedContentType: "image/png" }),
         ).rejects.toThrow("verification");
         expect(fake.calls.map((call) => call.method)).toEqual(["headObject", "putObjectCopy", "headObject"]);
+    });
+
+    it("reconciles a verified final object when copy succeeded but its response failed", async () => {
+        const fake = fakeClient();
+        fake.setCopyError(new Error("socket reset after remote copy"));
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.completeUpload({ stagingKey: "staging", finalKey: "final", expectedContentType: "image/png" }),
+        ).resolves.toMatchObject({ key: "final", contentType: "image/png", byteSize: 12 });
+        expect(fake.calls.map((call) => call.method)).toEqual([
+            "headObject",
+            "putObjectCopy",
+            "headObject",
+            "deleteObject",
+        ]);
+    });
+
+    it("reconciles final metadata when a concurrent caller already deleted staging", async () => {
+        const fake = fakeClient();
+        const missing = Object.assign(new Error("not found"), { statusCode: 404, code: "NoSuchKey" });
+        fake.heads.splice(
+            0,
+            2,
+            missing,
+            { ETag: "final-etag", headers: { "content-type": "image/png", "content-length": "12" } },
+        );
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.completeUpload({ stagingKey: "staging", finalKey: "final", expectedContentType: "image/png" }),
+        ).resolves.toMatchObject({ key: "final", byteSize: 12 });
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject", "headObject", "deleteObject"]);
+    });
+
+    it("rejects signed-URL callback errors without exposing a URL", async () => {
+        const fake = fakeClient();
+        fake.setSignedUrlError(new Error("Region format error."));
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(storage.createReadUrl({ key: "private-key", expiresInSeconds: 300 })).rejects.toThrow(
+            "COS signed URL creation failed",
+        );
+    });
+
+    it.each([
+        [{}, "missing URL"],
+        [{ Url: "http://signed.example/object" }, "non-HTTPS URL"],
+    ])("rejects a signed-URL callback with %s", async (result, _label) => {
+        const fake = fakeClient();
+        fake.setSignedUrlResult(result);
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(storage.createReadUrl({ key: "private-key", expiresInSeconds: 300 })).rejects.toThrow(
+            "COS signed URL creation failed",
+        );
     });
 
     it("verifies putResult and signs fresh reads", async () => {

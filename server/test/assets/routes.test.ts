@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 import type { Asset } from "@infinite-canvas/contracts";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import type { ObjectStorage, StoredObject } from "../../src/infrastructure/object-storage/types.js";
+import {
+    ObjectStorageVerificationError,
+    type ObjectStorage,
+    type StoredObject,
+} from "../../src/infrastructure/object-storage/types.js";
 import type { AuthApp, VerifiedUser } from "../helpers/auth.js";
 import { createAuthTestHarness, registerVerifiedUser } from "../helpers/auth.js";
 
@@ -30,7 +34,7 @@ class FakeStorage implements ObjectStorage {
         await this.beforeCall();
         this.completions += 1;
         expect(input.stagingKey).not.toBe(input.finalKey);
-        if (this.failCompletion) throw new Error("injected verification failure");
+        if (this.failCompletion) throw new ObjectStorageVerificationError();
         return { key: input.finalKey, contentType: input.expectedContentType, byteSize: 123, etag: "verified-etag" };
     }
 
