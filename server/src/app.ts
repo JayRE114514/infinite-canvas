@@ -88,8 +88,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
             registerCanvasRoutes(app);
             const objectStorage =
                 options.objectStorage ?? (options.config.cos ? createTencentCosStorage(options.config.cos) : undefined);
-            registerAssetRoutes(app, objectStorage);
             const fetchImpl = options.fetchImpl ?? fetch;
+            registerAssetRoutes(app, objectStorage, fetchImpl);
             const artBoxAdapter =
                 options.artBoxAdapter ??
                 (options.config.artbox ? createArtBoxAdapter(options.config.artbox, fetchImpl) : undefined);

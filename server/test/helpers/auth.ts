@@ -101,7 +101,7 @@ export function createAuthTestHarness() {
 
         async openAuthApp(
             configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {},
-            appOverrides: Pick<BuildAppOptions, "logger" | "objectStorage"> = {},
+            appOverrides: Pick<BuildAppOptions, "fetchImpl" | "logger" | "objectStorage"> = {},
         ) {
             const mailer = new MemoryMailer();
             const current = roles();
@@ -133,6 +133,7 @@ export function createAuthTestHarness() {
                 database,
                 mailer,
                 objectStorage: appOverrides.objectStorage,
+                fetchImpl: appOverrides.fetchImpl,
             });
             return { app, mailer, database, adminPool };
         },

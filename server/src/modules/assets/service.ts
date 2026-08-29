@@ -5,7 +5,6 @@ import type {
     AssetKind,
     CreateAssetBody,
     CreateAssetResponse,
-    ReadAssetResponse,
 } from "@infinite-canvas/contracts";
 import { and, eq, inArray } from "drizzle-orm";
 
@@ -181,23 +180,35 @@ export async function completeAssetUpload(
     });
 }
 
-export async function readAsset(
+async function findReadyAsset(
     db: AppDatabase,
     tenant: TenantInput,
     assetId: string,
-    storage: ObjectStorage,
-    signedUrlTtlSeconds: number,
-): Promise<ReadAssetResponse> {
+): Promise<AssetRow> {
     const row = await withTenantTransaction(db, tenant, async (tx, access) => {
         requireActiveWorkspace(access);
         return findAsset(tx, access.workspaceId, assetId);
     });
     if (row.status !== "ready") throw new AppError("asset_not_ready", 409, "素材未就绪");
-    const displayUrl = await storage.createReadUrl({
+    return row;
+}
+
+export async function readAssetMetadata(db: AppDatabase, tenant: TenantInput, assetId: string): Promise<Asset> {
+    return toAsset(await findReadyAsset(db, tenant, assetId));
+}
+
+export async function createAssetReadUrl(
+    db: AppDatabase,
+    tenant: TenantInput,
+    assetId: string,
+    storage: ObjectStorage,
+    signedUrlTtlSeconds: number,
+): Promise<string> {
+    const row = await findReadyAsset(db, tenant, assetId);
+    return storage.createReadUrl({
         key: row.finalObjectKey,
         expiresInSeconds: signedUrlTtlSeconds,
     });
-    return { asset: toAsset(row), displayUrl };
 }
 
 export async function getReadyAssets(

@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+
 import {
     AppErrorResponseSchema,
     AssetPathSchema,
@@ -16,7 +18,7 @@ import { AppError } from "../../errors.js";
 import { requireDatabase } from "../../infrastructure/database/plugin.js";
 import type { ObjectStorage } from "../../infrastructure/object-storage/types.js";
 import { requireSession } from "../identity/session.js";
-import { completeAssetUpload, createAssetUpload, readAsset } from "./service.js";
+import { completeAssetUpload, createAssetReadUrl, createAssetUpload, readAssetMetadata } from "./service.js";
 
 const errorResponses = {
     400: AppErrorResponseSchema,
@@ -36,7 +38,66 @@ function requireStorage(storage: ObjectStorage | undefined, ttl: number | undefi
     return { storage, ttl };
 }
 
-export function registerAssetRoutes(app: FastifyInstance, storage?: ObjectStorage): void {
+const CONTENT_RESPONSE_HEADERS = [
+    "accept-ranges",
+    "content-length",
+    "content-range",
+    "content-type",
+    "etag",
+    "last-modified",
+] as const;
+
+const PRIVATE_CONTENT_HEADERS = {
+    "cache-control": "private, no-store",
+    "content-security-policy": "sandbox; default-src 'none'",
+    "x-content-type-options": "nosniff",
+} as const;
+
+type AssetContent = {
+    status: 200 | 206 | 416;
+    headers: Record<string, string>;
+    body: Response["body"];
+};
+
+export async function loadAssetContent(
+    displayUrl: string,
+    range: string | undefined,
+    fetchImpl: typeof fetch,
+): Promise<AssetContent> {
+    let response: Response;
+    try {
+        response = await fetchImpl(displayUrl, {
+            headers: range === undefined ? undefined : { range },
+            redirect: "error",
+        });
+    } catch {
+        throw new AppError("asset_content_unavailable", 503, "素材内容暂时不可用", true);
+    }
+
+    const successfulBody = (response.status === 200 || response.status === 206) && response.body !== null;
+    if (!successfulBody && response.status !== 416) {
+        await response.body?.cancel().catch(() => {});
+        throw new AppError("asset_content_unavailable", 503, "素材内容暂时不可用", true);
+    }
+
+    const headers: Record<string, string> = { ...PRIVATE_CONTENT_HEADERS };
+    for (const name of CONTENT_RESPONSE_HEADERS) {
+        const value = response.headers.get(name);
+        if (value !== null) headers[name] = value;
+    }
+    const status: AssetContent["status"] = response.status === 200 ? 200 : response.status === 206 ? 206 : 416;
+    return { status, headers, body: response.body };
+}
+
+function assetContentPath(workspaceId: string, assetId: string): string {
+    return `/api/v1/workspaces/${workspaceId}/assets/${assetId}/content`;
+}
+
+export function registerAssetRoutes(
+    app: FastifyInstance,
+    storage?: ObjectStorage,
+    fetchImpl: typeof fetch = fetch,
+): void {
     app.post<{ Params: WorkspacePath; Body: CreateAssetBody }>(
         "/api/v1/workspaces/:workspaceId/assets",
         {
@@ -94,15 +155,37 @@ export function registerAssetRoutes(app: FastifyInstance, storage?: ObjectStorag
         },
         async (request) => {
             const { userId } = await requireSession(request);
+            const { db } = requireDatabase(request.server);
+            const asset = await readAssetMetadata(
+                db,
+                { userId, workspaceId: request.params.workspaceId },
+                request.params.assetId,
+            );
+            return {
+                asset,
+                displayUrl: assetContentPath(request.params.workspaceId, request.params.assetId),
+            };
+        },
+    );
+
+    app.get<{ Params: AssetPath }>(
+        "/api/v1/workspaces/:workspaceId/assets/:assetId/content",
+        { exposeHeadRoute: false, schema: { params: AssetPathSchema, response: { ...errorResponses } } },
+        async (request, reply) => {
+            const { userId } = await requireSession(request);
             const configured = requireStorage(storage, request.server.appConfig?.cos?.signedUrlTtlSeconds);
             const { db } = requireDatabase(request.server);
-            return readAsset(
+            const displayUrl = await createAssetReadUrl(
                 db,
                 { userId, workspaceId: request.params.workspaceId },
                 request.params.assetId,
                 configured.storage,
                 configured.ttl,
             );
+            const content = await loadAssetContent(displayUrl, request.headers.range, fetchImpl);
+            for (const [name, value] of Object.entries(content.headers)) reply.header(name, value);
+            if (content.body === null) return reply.status(content.status).send();
+            return reply.status(content.status).send(Readable.fromWeb(content.body));
         },
     );
 }

@@ -84,7 +84,7 @@ afterAll(async () => {
 }, 60_000);
 
 describe("asset routes", () => {
-    it("creates, completes idempotently, and issues a fresh display URL outside database transactions", async () => {
+    it("creates, completes idempotently, and issues a same-origin display URL outside database transactions", async () => {
         const storage = new FakeStorage();
         const { app, mailer, adminPool } = await harness.openAuthApp({}, { objectStorage: storage });
         storage.beforeCall = async () => {
@@ -134,9 +134,76 @@ describe("asset routes", () => {
             headers: { cookie: owner.cookie },
         });
         expect(firstRead.statusCode).toBe(200);
-        expect(firstRead.json().displayUrl).toBe("https://storage.test/read/1");
-        expect(secondRead.json().displayUrl).toBe("https://storage.test/read/2");
+        const contentUrl = `/api/v1/workspaces/${workspace.id}/assets/${asset.id}/content`;
+        expect(firstRead.json().displayUrl).toBe(contentUrl);
+        expect(secondRead.json().displayUrl).toBe(contentUrl);
         expect(firstRead.json().asset).toEqual(completed.json().asset);
+        expect(storage.reads).toBe(0);
+    }, 90_000);
+
+    it("streams authenticated media through the API, forwards byte ranges, and drops forced download headers", async () => {
+        const storage = new FakeStorage();
+        let upstreamUrl: string | undefined;
+        let upstreamRange: string | null = null;
+        let upstreamCalls = 0;
+        const fetchImpl: typeof fetch = async (input, init) => {
+            upstreamCalls += 1;
+            upstreamUrl = input instanceof URL ? input.href : String(input);
+            upstreamRange = new Headers(init?.headers).get("range");
+            return new Response(new Uint8Array([1, 2, 3]), {
+                status: 206,
+                headers: {
+                    "accept-ranges": "bytes",
+                    "content-disposition": 'attachment; filename="reference.png"',
+                    "content-length": "3",
+                    "content-range": "bytes 0-2/9",
+                    "content-type": "image/png",
+                    etag: '"asset-etag"',
+                },
+            });
+        };
+        const { app, mailer } = await harness.openAuthApp({}, { objectStorage: storage, fetchImpl });
+        const owner = await registerVerifiedUser(app, mailer, {
+            name: "owner",
+            email: "asset-stream@example.com",
+        });
+        const workspace = await createTeam(app, owner, "asset-stream-team");
+        const created = await createAsset(app, owner, workspace.id);
+        const asset = created.json().asset as Asset;
+
+        const completed = await app.inject({
+            method: "POST",
+            url: `/api/v1/workspaces/${workspace.id}/assets/${asset.id}/complete`,
+            headers: { cookie: owner.cookie },
+        });
+        expect(completed.statusCode).toBe(200);
+
+        const unauthenticated = await app.inject({
+            method: "GET",
+            url: `/api/v1/workspaces/${workspace.id}/assets/${asset.id}/content`,
+        });
+        expect(unauthenticated.statusCode).toBe(401);
+        expect(upstreamCalls).toBe(0);
+        expect(storage.reads).toBe(0);
+
+        const streamed = await app.inject({
+            method: "GET",
+            url: `/api/v1/workspaces/${workspace.id}/assets/${asset.id}/content`,
+            headers: { cookie: owner.cookie, range: "bytes=0-2" },
+        });
+
+        expect(streamed.statusCode).toBe(206);
+        expect(streamed.rawPayload).toEqual(Buffer.from([1, 2, 3]));
+        expect(streamed.headers["content-type"]).toBe("image/png");
+        expect(streamed.headers["content-range"]).toBe("bytes 0-2/9");
+        expect(streamed.headers["accept-ranges"]).toBe("bytes");
+        expect(streamed.headers["cache-control"]).toBe("private, no-store");
+        expect(streamed.headers["content-security-policy"]).toBe("sandbox; default-src 'none'");
+        expect(streamed.headers["x-content-type-options"]).toBe("nosniff");
+        expect(streamed.headers["content-disposition"]).toBeUndefined();
+        expect(upstreamUrl).toBe("https://storage.test/read/1");
+        expect(upstreamRange).toBe("bytes=0-2");
+        expect(upstreamCalls).toBe(1);
     }, 90_000);
 
     it("marks a verified completion failure terminal and never returns a display URL", async () => {
