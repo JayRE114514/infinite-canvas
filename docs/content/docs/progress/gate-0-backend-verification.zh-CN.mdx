@@ -1,0 +1,136 @@
+---
+title: Gate 0 后端验证记录
+description: Gate 0 后端修正的提交边界、数据库边界与测试证据
+---
+
+# Gate 0 后端验证记录
+
+本页记录 Gate 0 后端部分实际落地的内容，以及每一项的自动化验证结果。长期设计来源是[后端平台架构](../../../architecture/backend-platform.md)，交付顺序见[后端平台路线图](../../../architecture/platform-roadmap.md)。
+
+**后端部分已经完成，Gate 0 在用户批准的 Chrome + Firefox 范围内关闭。** 浏览器证据单独记录在 [Gate 0 前端验证记录](/zh-CN/docs/progress/gate-0-frontend-verification)。Safari 已由用户明确豁免并保持未验证。两份记录都不代表生产部署已经验证。
+
+## 提交边界
+
+| 单元 | 提交 | 落地内容 |
+| --- | --- | --- |
+| 基线 | `2d78c24` | 冻结计划与集成契约，Task 1–6 全部基于此基线 |
+| Task 1–4（一个原子单元） | `57d82b0` | 四个 PostgreSQL 登录角色、角色专用连接与就绪校验、事务级上下文、封闭授权矩阵与默认拒绝 RLS |
+| Task 5 | `47be7a2` | 邮箱验证时供给个人 Workspace，并提供显式修复入口与不可变供给审计 |
+| Task 6 | `542efd7` | 画布 `snapshot` 文档模式、固定保存判定顺序、数据库签发的删除回执 |
+| Task 7 | 本次文档提交 | 变更记录、待测事项与本页验证记录 |
+
+Task 1–4 是一个不可拆分的部署单元：中途不存在"已发布但缺授权""已迁移但仍用旧路由"的可见状态。Task 5、Task 6 各自一个提交，Task 6 未修改任何早期迁移（`git diff 47be7a2..542efd7 -- server/migrations/0000..0005` 为 0 行）。
+
+## 数据库角色与最小权限
+
+`server/database/bootstrap/roles.sql` 幂等创建四个固定登录角色，并反复重申属性：`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`。`schema_owner` 只用于发布期迁移作业，三个运行期角色都不拥有业务对象。进程启动时由 `server/src/infrastructure/database/role-assertions.ts` 校验实际生效角色、对象归属与 BYPASSRLS 属性，不符即拒绝就绪。
+
+`0004_tenant-rls.sql` 先从 `PUBLIC` 和三个运行期角色收回全部表、序列、函数权限与 `CREATE ON SCHEMA public`，再逐项授予：
+
+| 对象 | app_api | app_worker | app_maintenance |
+| --- | --- | --- | --- |
+| `users` / `sessions` / `accounts` / `verifications` | SELECT, INSERT, UPDATE, DELETE | 无 | 无 |
+| `workspaces` | SELECT, INSERT, UPDATE(`name`, `slug`, `status`, `deleted_at`, `updated_at`) | 无 | SELECT(`id`, `status`) |
+| `workspace_members` | SELECT, INSERT, DELETE | 无 | 无 |
+| `workspace_invitations` | SELECT, INSERT, UPDATE(`status`) | 无 | 无 |
+| `canvases` | SELECT, INSERT, UPDATE(`title`, `snapshot_json`, `revision`, `updated_by`, `updated_at`, `deleted_at`) | 无 | 无 |
+| `workspace_audit_logs` | INSERT | 无 | 无 |
+| schema `public` | USAGE（无 CREATE） | USAGE（无 CREATE） | USAGE（无 CREATE） |
+| schema `drizzle` | 无 | 无 | 无 |
+
+画布 UPDATE 是列级授权，因此 Task 6 新增的 `document_mode` 与 `deletion_receipt_id` 不会落入旧授权，无需额外 REVOKE：`app_api` 直接改写这两列会得到 `42501`。`app_api` 对 `canvases` 没有 DELETE 权限，硬删除同样是 `42501`。
+
+函数执行权限同样全量收回后只恢复八个明确签名：`is_active_workspace_member`、`is_workspace_manager`、`is_current_verified_email`、`has_accepted_workspace_invitation`、`begin_admin_operation`、`is_current_admin_operation`、`execute_workspace_admin_operation`、`record_workspace_provisioning`。
+
+## 事务级上下文与行级安全
+
+租户上下文只使用事务局部 `set_config(key, value, true)`，提交或回滚后自动失效，连接归还池中不残留任何应用变量。策略侧统一用 `nullif(current_setting('app.user_id', true), '')` 读取，缺失时为 NULL，策略求值为假，因此"没有上下文"的结果是 0 行而不是报错。
+
+`server/src/infrastructure/database/transactions.ts` 是唯一的业务事务入口，共四个：`withUserTransaction`、`withTenantTransaction`、`withWorkerTransaction`、`withPlatformAdminTransaction`。成员校验与业务 SQL 跑在同一个事务和同一条连接上。
+
+启用范围：`workspaces`、`workspace_members`、`workspace_invitations`、`canvases`、`workspace_audit_logs` 全部 `ENABLE ROW LEVEL SECURITY`；其中 `workspace_invitations`、`canvases`、`workspace_audit_logs` 额外 `FORCE`，表属主也不能绕过。
+
+| 表 | 关键策略 | 判定条件 |
+| --- | --- | --- |
+| `workspaces` | `workspaces_api_select_member` | 用户维度读取，不要求 Workspace 上下文，供 `GET /api/v1/workspaces` 使用 |
+| `workspaces` | `workspaces_api_update_manager` / `workspaces_api_update_owner_deactivate` | 必须同时命中精确 Workspace 上下文与管理角色；所有者自助下线只允许 active → deactivated |
+| `workspace_members` | `workspace_members_api_select_self` / `_select_workspace` / `_delete_manager` | 自读直接比较 `user_id` 不递归；成员列表与移除都要求精确上下文与管理角色，且不得移除 owner |
+| `workspace_invitations` | `_select_manager` / `_select_recipient` / `_update_manager` / `_update_recipient` | 管理员只能 pending → canceled；接收人只能在未过期时 pending → accepted/rejected |
+| `canvases` | `canvases_api_select_member` / `_insert_member` / `_update_member` | 必须同时命中精确 Workspace 上下文与活跃成员身份 |
+| `workspace_audit_logs` | `_api_insert_owner` / `_schema_owner_insert_admin` | 只追加；管理员审计只能由 xid 绑定的窄口函数在同一事务内产生 |
+
+画布 SELECT 策略刻意不把 `deleted_at` 作为谓词：软删除由服务层过滤，这样授权成员重放删除时仍能锁定已删除行并读回持久回执。
+
+## Workspace 生命周期
+
+平台管理员入口是 `GET /api/v1/admin/workspaces/:workspaceId` 与 `suspend` / `deactivate` / `restore` 三个动作，全部通过同一事务内的窄口 `SECURITY DEFINER` 函数 `execute_workspace_admin_operation()` 执行。
+
+| 用途 | 允许的起始状态 | 目标状态 |
+| --- | --- | --- |
+| `workspace_read` | 任意 | 不变更状态 |
+| `workspace_suspend` | active | suspended |
+| `workspace_deactivate` | active、suspended | deactivated |
+| `workspace_restore` | suspended、deactivated | active |
+| 团队所有者自助下线 | active | deactivated |
+
+非法流转由函数抛出 `P4091`，并发状态变更抛出 `P4092` 并映射为 `workspace_status_transition_conflict`，非管理员调用得到 `42501` 并映射为 `platform_admin_forbidden`。每次操作恰好写入一条带 `operation_id` 与 `pg_current_xact_id()` 的不可变审计，且审计写在最终状态更新之前。
+
+## 个人 Workspace 供给与显式修复
+
+供给来源固定为两个值：`email_verification`（邮箱验证回调）与 `explicit_repair`（显式修复）。两者都通过 `record_workspace_provisioning(source, workspace_id, event_id)` 写入不可变供给审计；该函数固定 `search_path`、要求事务局部 `app.user_id`，缺失时抛 `42501`，来源不在词表内抛 `22023`。
+
+显式修复入口是 `POST /api/v1/workspaces/personal/repair`，事件 ID 由用户 ID 派生，因此重复调用按事件 ID 幂等收敛到同一个个人 Workspace，不会新增审计；该接口不接受请求体，带 body 返回 `invalid_request_body`。
+
+## 画布 snapshot 模式、保存与删除回执
+
+`0006_canvas_document_mode.sql` 新增 `document_mode`（默认 `snapshot`）与可空唯一的 `deletion_receipt_id`，并加上三个约束：`canvases_document_mode_check`、`canvases_deletion_state_check`（`deleted_at` 与回执必须同时为空或同时非空）、`canvases_deletion_receipt_unique`。回填只针对发布前已软删除的行，在同一迁移事务内临时 `NO FORCE` 后立即恢复 `FORCE`，条数不符即整体回滚。
+
+`document_mode` 对客户端只读：`documentMode` 只出现在响应契约，创建与保存请求体都是 `additionalProperties: false` 且不含该字段。
+
+保存的判定顺序在同一次行锁内固定为：
+
+1. 行不可见、不存在或已软删除 → 404 `canvas_not_found`
+2. 模式不是 `snapshot` → 409 `canvas_document_mode_mismatch`
+3. `revision` 与 `baseRevision` 不一致 → 409 `revision_conflict`
+4. 存储版本与 `baseRevision` 同为 9007199254740991 → 409 `canvas_revision_limit_reached`
+5. 上述检查全部通过后条件更新仍为零行 → 回滚并返回脱敏、不可重试的 500 `canvas_save_invariant_failed`，同时记录 `requestId`、`canvasId`、`workspaceId` 与期望版本
+
+删除回执由数据库触发器签发。`BEFORE INSERT OR UPDATE` 触发器覆盖三种情况：INSERT 阶段拒绝伪造删除状态；首次 active → deleted 跃迁强制由数据库生成回执并覆盖调用方自带值；回执签发后 `deleted_at` 与 `deletion_receipt_id` 逐字节不可变，改写、平移或清空（复活）都会失败。活跃行被直写回执时强制置 NULL。重放删除读取已持久化的回执，不产生第二次状态变更；普通 GET 与列表的 404 永远不包含回执。不变量被破坏时返回脱敏、不可重试的 500 `canvas_delete_invariant_failed`。
+
+## 迁移链
+
+| idx | tag | 类型 |
+| --- | --- | --- |
+| 0 | `0000_auth_and_workspaces` | 基线（未改动） |
+| 1 | `0001_canvases` | 基线（未改动） |
+| 2 | `0002_workspace-authority` | 结构变更，带快照 |
+| 3 | `0003_transaction-context` | 结构变更 + 上下文/审计函数，带快照 |
+| 4 | `0004_tenant-rls` | 仅授权与策略，自定义迁移 |
+| 5 | `0005_workspace-provisioning-audit-fix` | 仅函数替换，自定义迁移 |
+| 6 | `0006_canvas_document_mode` | 画布模式与删除回执，带快照 |
+
+全部测试都执行 journal 顺序的 Drizzle 迁移器（以 `schema_owner` 身份），没有按文件名排序的自制加载器。`0006_snapshot.json` 的 `prevId` 等于 `0005_snapshot.json` 的 `id`；新列与三个约束只出现在 0006。全新安装与遗留属主升级是两条独立测试路径。
+
+## 测试证据
+
+本次 Task 7 亲自执行（Node v22.23.2，Testcontainers 拉起 `postgres:18-alpine`，全部使用 `app_api` / `app_worker` / `app_maintenance` 生产等价连接）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `bun --cwd server run test` | 17 个文件、317 个用例全部通过 |
+| `bun --cwd server run check:boundaries` | `module boundaries: ok` |
+| `git diff --check` | 无问题 |
+
+Task 6 的独立验收（Acceptance round 1/2，由独立验收代理执行）结论为 APPROVE，Critical 0、Important 0、Minor 3（均不阻断）。该轮独立运行的证据包括：完整 server 套件 17 文件 317/317；`test/canvases/schema.test.ts` 24/24；`test/canvases/routes.test.ts` 24/24；`test/database/tenant-isolation.test.ts` 49/49；`test/database/migration-upgrade.test.ts` 7/7；以及独立容器上的 29/29 条对抗性 PostgreSQL 探针，覆盖回执伪造/改写/复活、跨租户与授权边界、0005 → 0006 迁移故障回滚与重试。
+
+实现代理的自测只作为开发证据，不计入验收结论。
+
+## 残余风险
+
+- **浏览器范围**：原生 IndexedDB 事务/CAS 恢复、`web` typecheck/构建及 Chrome、Firefox 真实证据均已完成，详见 [Gate 0 前端验证记录](/zh-CN/docs/progress/gate-0-frontend-verification)。Safari 已明确豁免，状态是未验证而不是通过。
+- **运行环境差异**：本地验证使用 Node v22.23.2，生产基线设想是 Node 24 LTS，发布前需要在目标版本复跑完整套件。
+- **既有类型错误**：`server` 的严格 TypeScript 检查目前有 15 个报错（3 个在 `src/error-handler.ts`，12 个在测试与测试辅助代码），不在本计划范围内，尚未清理。
+- **超级用户边界**：数据库超级用户仍可禁用触发器或改写复制角色以绕过删除回执不变量；四个运行期角色都没有该能力。
+- **前端现状**：登录后的 Canvas 快照与 revision 已由服务端权威保存，原生 IndexedDB 只承担本地恢复；媒体字节与“我的素材”仍以浏览器存储为主，AI API Key 也仍由前端直连上游。本页不代表已完成 Asset 切换或密钥托管。
+- **未开始的后续 Gate**：积分钱包与账本、对象存储与素材生命周期、可靠 AI 任务队列、Provider Adapter 与 Yjs 实时协同都还没有实现。
+- **部署未验证**：本页所有证据来自本地自动化测试，不包含生产部署、容量或故障演练结论。

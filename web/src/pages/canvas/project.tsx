@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, SetStateAction } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Group, Video } from "lucide-react";
 import { saveAs } from "file-saver";
@@ -43,6 +43,7 @@ import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
+import { useCanvasProjectSync } from "@/pages/canvas/hooks/use-canvas-project-sync";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
@@ -69,6 +70,7 @@ import {
 import { getNodeDefinition, isBuiltinNodeType as isBuiltinType, useNodeRegistryVersion } from "@/lib/canvas/node-registry";
 import { registerBuiltinNodes } from "@/components/canvas/nodes/builtin-nodes";
 import { CanvasPluginManagerModal } from "@/components/canvas/canvas-plugin-manager-modal";
+import { CanvasConflictBar } from "@/components/canvas/canvas-conflict-bar";
 import { CanvasRefreshShell } from "@/components/canvas/canvas-refresh-shell";
 import { CanvasTopBar } from "@/components/canvas/canvas-top-bar";
 import { ConnectionCreateMenu, NodeCreateMenu, type PendingConnectionCreate } from "@/components/canvas/canvas-create-menus";
@@ -82,6 +84,7 @@ import {
     type CanvasNodeText,
     type CanvasNodeMetadata,
     type CanvasNodeTypeId,
+    type CanvasProject,
     type ConnectionHandle,
     type ContextMenuState,
     type Position,
@@ -116,6 +119,10 @@ type CanvasGenerationRequest = {
     originNodeId: string;
     runningNodeId: string;
     controller: AbortController;
+    /** 发起这次生成的画布：迟到结果只能改写它自己的画布。 */
+    projectId: string;
+    /** 发起时的闸门代际：闸门关闭或换画布后代际推进，旧结果一律不得再写 React 状态。 */
+    gateGeneration: number;
 };
 
 const VIDEO_NODE_MAX_WIDTH = 420;
@@ -128,6 +135,33 @@ const NODE_STATUS_IDLE = "idle" as const;
 const NODE_STATUS_LOADING = "loading" as const;
 const NODE_STATUS_SUCCESS = "success" as const;
 const NODE_STATUS_ERROR = "error" as const;
+const CANVAS_HYDRATION_TIMEOUT_MS = 5_000;
+
+function hydrateWithFallback<T>(promise: Promise<T>, fallback: T): Promise<T> {
+    return new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            resolve(fallback);
+        }, CANVAS_HYDRATION_TIMEOUT_MS);
+        promise.then(
+            (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve(value);
+            },
+            () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve(fallback);
+            },
+        );
+    });
+}
+
 export default function CanvasPage() {
     const [mounted, setMounted] = useState(false);
 
@@ -156,17 +190,18 @@ function InfiniteCanvasPage() {
     const agentPanelOpen = useAgentStore((state) => state.panelOpen);
     const toggleAgentPanel = useAgentStore((state) => state.togglePanel);
     const openAgentPanel = useAgentStore((state) => state.openPanel);
-    const containerRef = useRef<HTMLDivElement>(null);
+    const containerRef = useRef<HTMLDivElement | null>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const uploadTargetRef = useRef<{ nodeId?: string; position?: Position } | null>(null);
     const clipboardRef = useRef<CanvasClipboard | null>(null);
     const historyRef = useRef<{ past: CanvasHistoryEntry[]; future: CanvasHistoryEntry[] }>({ past: [], future: [] });
     const lastHistoryRef = useRef<CanvasHistoryEntry | null>(null);
     const historyCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const viewportSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const applyingHistoryRef = useRef(false);
     const historyPausedRef = useRef(false);
-    const didInitialCenterRef = useRef(false);
+    const shouldCenterRef = useRef(false);
+    /** 初始居中产生的视口不算用户编辑：靠引用相等把它从保存路径里排除。 */
+    const centeredViewportRef = useRef<ViewportTransform | null>(null);
     const rafRef = useRef<number | null>(null);
     const nodeDraggingRef = useRef(false);
     const dragRef = useRef<{
@@ -189,13 +224,12 @@ function InfiniteCanvasPage() {
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
     const cleanupAssetImages = useAssetStore((state) => state.cleanupImages);
-    const hydrated = useCanvasStore((state) => state.hydrated);
     const createProject = useCanvasStore((state) => state.createProject);
-    const openProject = useCanvasStore((state) => state.openProject);
     const updateProject = useCanvasStore((state) => state.updateProject);
+    const flushProject = useCanvasStore((state) => state.flushProject);
     const renameProject = useCanvasStore((state) => state.renameProject);
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
-    const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
+    const loadProjectsForExport = useCanvasStore((state) => state.loadProjectsForExport);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [connections, setConnections] = useState<CanvasConnection[]>([]);
@@ -220,7 +254,6 @@ function InfiniteCanvasPage() {
     const [showImageInfo, setShowImageInfo] = useState(false);
     const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
-    const [projectLoaded, setProjectLoaded] = useState(false);
     const [toolbarNodeId, setToolbarNodeId] = useState<string | null>(null);
     const [nodeImageSettingsOpen, setNodeImageSettingsOpen] = useState(false);
     const [dialogNodeId, setDialogNodeId] = useState<string | null>(null);
@@ -254,6 +287,8 @@ function InfiniteCanvasPage() {
     const selectionBoxRef = useRef(selectionBox);
     const pendingConnectionCreateRef = useRef(pendingConnectionCreate);
     const generationRequestsRef = useRef(new Map<string, CanvasGenerationRequest>());
+    /** Agent 闸门的当前归属，由 useAgentBridge 在每次渲染回填；生成流程在每个 await 之后据此校验所有权。 */
+    const generationOwnerRef = useRef<{ projectId: string; gateGeneration: number; ownsGate: () => boolean }>({ projectId, gateGeneration: 0, ownsGate: () => false });
 
     const createHistoryEntry = useCallback(
         (): CanvasHistoryEntry => ({
@@ -267,9 +302,13 @@ function InfiniteCanvasPage() {
         [activeChatId, backgroundMode, chatSessions, showImageInfo],
     );
 
+    /**
+     * retained 是仍然要保留引用的数据，released 是本次明确不再需要的节点/会话。
+     * 只有出现在 released 且不在任何保留集合（当前画布、撤销历史、资产库）里的媒体键才会被删除。
+     */
     const cleanupCanvasFiles = useCallback(
-        (extra?: unknown) => {
-            cleanupAssetImages({ extra, history: historyRef.current, lastHistory: lastHistoryRef.current });
+        (retained: unknown, released: unknown) => {
+            cleanupAssetImages({ extra: retained, history: historyRef.current, lastHistory: lastHistoryRef.current }, released);
         },
         [cleanupAssetImages],
     );
@@ -277,14 +316,61 @@ function InfiniteCanvasPage() {
     const startGenerationRequest = useCallback((targetNodeId: string, originNodeId: string, runningId = originNodeId, controller = new AbortController()) => {
         const previous = generationRequestsRef.current.get(targetNodeId);
         if (previous?.controller !== controller) previous?.controller.abort();
-        generationRequestsRef.current.set(targetNodeId, { targetNodeId, originNodeId, runningNodeId: runningId, controller });
+        const owner = generationOwnerRef.current;
+        /** 每次生成都绑定发起时的画布与闸门代际，节点 ID 相同也不会互相冒充。 */
+        generationRequestsRef.current.set(targetNodeId, { targetNodeId, originNodeId, runningNodeId: runningId, controller, projectId: owner.projectId, gateGeneration: owner.gateGeneration });
         return controller;
+    }, []);
+
+    /** 这次生成是否仍属于当前画布与当前闸门代际；每个 await 之后、写任何状态之前都必须过一遍。 */
+    const ownsGeneration = useCallback((controller: AbortController) => {
+        const owner = generationOwnerRef.current;
+        if (!owner.ownsGate() || controller.signal.aborted) return false;
+        const request = [...generationRequestsRef.current.values()].find((item) => item.controller === controller);
+        /**
+         * 登记表里已经没有这条：可能是正常收尾时自己摘除的（finally），也可能被同节点的新一次生成顶替。
+         * 后者在顶替时就 abort 过，已被上面的 signal 检查挡住，因此这里按仍然拥有处理，
+         * 否则 finally 中的运行态清理永远不会执行。
+         */
+        if (!request) return true;
+        return request.projectId === owner.projectId && request.gateGeneration === owner.gateGeneration;
     }, []);
 
     const finishGenerationRequest = useCallback((targetNodeId: string, controller: AbortController) => {
         const request = generationRequestsRef.current.get(targetNodeId);
+        /** 只清理自己那一条：迟到的 A 不得删掉 B 上同名节点正在跑的请求。 */
         if (request?.controller === controller) generationRequestsRef.current.delete(targetNodeId);
     }, []);
+
+    /**
+     * 在生成请求登记之前就要跨 await 的场景（例如重试的补水与引用解析）：
+     * 先捕获当前归属，await 之后用返回的判定函数确认画布与闸门代际都没变。
+     */
+    const captureGenerationOwner = useCallback(() => {
+        const captured = generationOwnerRef.current;
+        return () => {
+            const owner = generationOwnerRef.current;
+            return owner.ownsGate() && owner.projectId === captured.projectId && owner.gateGeneration === captured.gateGeneration;
+        };
+    }, []);
+
+    /** 归属校验通过才写节点：await 之后的每一次 React 写都必须经过它。 */
+    const setOwnedNodes = useCallback(
+        (controller: AbortController, updater: SetStateAction<CanvasNodeData[]>) => {
+            if (!ownsGeneration(controller)) return;
+            setNodes(updater);
+        },
+        [ownsGeneration],
+    );
+
+    /** 归属校验通过才执行提示、运行态清理等副作用。 */
+    const runOwned = useCallback(
+        (controller: AbortController, run: () => void) => {
+            if (!ownsGeneration(controller)) return;
+            run();
+        },
+        [ownsGeneration],
+    );
 
     const stopGenerationByRunningId = useCallback((runningId: string) => {
         const affectedNodeIds = new Set<string>();
@@ -329,51 +415,58 @@ function InfiniteCanvasPage() {
         [modal, stopGenerationByRunningId, t],
     );
 
-    useEffect(() => {
-        if (!hydrated) return;
-        setProjectLoaded(false);
-        const project = openProject(projectId);
-        if (!project) {
-            navigate("/canvas", { replace: true });
-            return;
+    const hydrateProject = useCallback(async (project: CanvasProject): Promise<CanvasProject> => {
+        const serverNodes = resetInterruptedGeneration(project.nodes);
+        const serverSessions = project.chatSessions || [];
+        const [nodes, chatSessions] = await Promise.all([
+            hydrateWithFallback(hydrateCanvasImages(serverNodes), serverNodes),
+            hydrateWithFallback(hydrateAssistantImages(serverSessions), serverSessions),
+        ]);
+        /** 补水失败或超时用未补水内容继续，绝不永远停在闸门上。 */
+        return { ...project, nodes, chatSessions };
+    }, []);
+
+    const applyProjectToCanvas = useCallback((project: CanvasProject) => {
+        historyPausedRef.current = true;
+        setNodes(project.nodes);
+        setConnections(project.connections);
+        setChatSessions(project.chatSessions);
+        setActiveChatId(project.activeChatId);
+        setBackgroundMode(project.backgroundMode);
+        setShowImageInfo(project.showImageInfo);
+        setViewport(project.viewport);
+        historyRef.current = { past: [], future: [] };
+        if (historyCommitTimerRef.current) {
+            clearTimeout(historyCommitTimerRef.current);
+            historyCommitTimerRef.current = null;
         }
-
-        const restore = async () => {
-            const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
-            const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
-            setNodes(restoredNodes);
-            setConnections(project.connections);
-            setChatSessions(restoredSessions);
-            setActiveChatId(project.activeChatId || null);
-            setBackgroundMode(project.backgroundMode);
-            setShowImageInfo(project.showImageInfo || false);
-            setViewport(project.viewport);
-            historyRef.current = { past: [], future: [] };
-            if (historyCommitTimerRef.current) {
-                clearTimeout(historyCommitTimerRef.current);
-                historyCommitTimerRef.current = null;
-            }
-            lastHistoryRef.current = {
-                nodes: restoredNodes,
-                connections: project.connections,
-                chatSessions: restoredSessions,
-                activeChatId: project.activeChatId || null,
-                backgroundMode: project.backgroundMode,
-                showImageInfo: project.showImageInfo || false,
-            };
-            setHistoryState({ canUndo: false, canRedo: false });
-            setProjectLoaded(true);
+        lastHistoryRef.current = {
+            nodes: project.nodes,
+            connections: project.connections,
+            chatSessions: project.chatSessions,
+            activeChatId: project.activeChatId,
+            backgroundMode: project.backgroundMode,
+            showImageInfo: project.showImageInfo,
         };
-        void restore();
-    }, [hydrated, navigate, openProject, projectId]);
+        setHistoryState({ canUndo: false, canRedo: false });
+        historyPausedRef.current = false;
+        /** 服务端视口是权威：只有恰为 {0,0,1} 才允许一次初始居中。 */
+        shouldCenterRef.current = project.viewport.x === 0 && project.viewport.y === 0 && project.viewport.k === 1;
+    }, []);
+
+    const { ready, status: syncStatus, errorKey: syncErrorKey, title: projectTitle, reopen, reloadServerCopy } = useCanvasProjectSync({
+        projectId,
+        hydrate: hydrateProject,
+        applyToCanvas: applyProjectToCanvas,
+    });
 
     useEffect(() => {
-        if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;
+        if (!ready || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;
         if (!searchParams.has("agentUrl") && !localAgentEnabled && !fragmentBootstrap) openAgentPanel();
-    }, [fragmentBootstrap, localAgentEnabled, openAgentPanel, projectLoaded, searchParams]);
+    }, [fragmentBootstrap, localAgentEnabled, openAgentPanel, ready, searchParams]);
 
     useEffect(() => {
-        if (!projectLoaded || applyingHistoryRef.current || historyPausedRef.current) return;
+        if (!ready || applyingHistoryRef.current || historyPausedRef.current) return;
         const next = createHistoryEntry();
         const previous = lastHistoryRef.current;
         if (
@@ -404,28 +497,43 @@ function InfiniteCanvasPage() {
                 historyCommitTimerRef.current = null;
             }
         };
-    }, [activeChatId, backgroundMode, chatSessions, connections, createHistoryEntry, nodes, projectLoaded, showImageInfo]);
+    }, [activeChatId, backgroundMode, chatSessions, connections, createHistoryEntry, nodes, ready, showImageInfo]);
 
     useEffect(() => {
-        if (!projectLoaded || historyPausedRef.current) return;
+        if (!ready) return;
+        /** 会话自己做引用比较，页面不再判断「这次变更要不要保存」。 */
         updateProject(projectId, { nodes, connections, chatSessions, activeChatId, backgroundMode, showImageInfo });
-    }, [activeChatId, backgroundMode, chatSessions, connections, nodes, projectId, projectLoaded, showImageInfo, updateProject]);
+    }, [activeChatId, backgroundMode, chatSessions, connections, nodes, projectId, ready, showImageInfo, updateProject]);
 
     useEffect(() => {
         if (!dialogNodeId) setNodeImageSettingsOpen(false);
     }, [dialogNodeId]);
 
+    /** 离开或隐藏时只做 best-effort flush；耐久性来自 120 ms 内已排程的本地草稿。 */
     useEffect(() => {
-        if (!projectLoaded) return;
-        if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
-        viewportSaveTimerRef.current = setTimeout(() => {
-            updateProject(projectId, { viewport: viewportRef.current });
-            viewportSaveTimerRef.current = null;
-        }, 500);
-        return () => {
-            if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+        if (!ready) return;
+        const flush = () => void flushProject(projectId);
+        const flushWhenHidden = () => {
+            if (document.visibilityState === "hidden") flush();
         };
-    }, [projectId, projectLoaded, updateProject, viewport]);
+        window.addEventListener("pagehide", flush);
+        document.addEventListener("visibilitychange", flushWhenHidden);
+        return () => {
+            window.removeEventListener("pagehide", flush);
+            document.removeEventListener("visibilitychange", flushWhenHidden);
+            flush();
+        };
+    }, [flushProject, projectId, ready]);
+
+    useEffect(() => {
+        if (!ready) return;
+        /** 视口不再有页面级二级防抖，直接交给会话的 120 ms / 400 ms 合并。 */
+        if (centeredViewportRef.current === viewport) {
+            centeredViewportRef.current = null;
+            return;
+        }
+        updateProject(projectId, { viewport });
+    }, [projectId, ready, updateProject, viewport]);
 
     useLayoutEffect(() => {
         nodesRef.current = nodes;
@@ -441,23 +549,26 @@ function InfiniteCanvasPage() {
         selectionBoxRef.current = selectionBox;
     }, [selectionBox]);
 
-    useEffect(() => {
-        const el = containerRef.current;
-        if (!el) return;
-
-        const updateSize = () => {
-            const rect = el.getBoundingClientRect();
+    /** 闸门先关后开，容器是后挂载的，空依赖 useEffect 会导致 observer 永不安装。 */
+    const attachCanvasContainer = useCallback((node: HTMLDivElement | null) => {
+        containerRef.current = node;
+        if (!node) return;
+        const measure = () => {
+            const rect = node.getBoundingClientRect();
             setSize({ width: rect.width, height: rect.height });
-            if (!didInitialCenterRef.current) {
-                didInitialCenterRef.current = true;
-                setViewport({ x: rect.width / 2, y: rect.height / 2, k: 1 });
-            }
+            if (!shouldCenterRef.current) return;
+            shouldCenterRef.current = false;
+            const centered = { x: rect.width / 2, y: rect.height / 2, k: 1 };
+            centeredViewportRef.current = centered;
+            setViewport(centered);
         };
-
-        updateSize();
-        const resizeObserver = new ResizeObserver(updateSize);
-        resizeObserver.observe(el);
-        return () => resizeObserver.disconnect();
+        measure();
+        const observer = new ResizeObserver(measure);
+        observer.observe(node);
+        return () => {
+            observer.disconnect();
+            containerRef.current = null;
+        };
     }, []);
 
     const screenToCanvas = useCallback((clientX: number, clientY: number) => {
@@ -660,9 +771,10 @@ function InfiniteCanvasPage() {
         return map;
     }, [connections, nodeById]);
     const referenceConnectedNodeIds = useMemo(() => new Set([referencePickerNodeId, ...(referencePickerNodeId ? connectedNodesByNodeId.get(referencePickerNodeId)?.flatMap((node) => node.type === CanvasNodeType.Group ? [node.id, ...getGroupResourceNodes(node.id, nodes).map((child) => child.id)] : [node.id]) || [] : [])].filter((id): id is string => Boolean(id))), [connectedNodesByNodeId, nodes, referencePickerNodeId]);
-    const { applyAgentOps } = useAgentBridge({
+    const { applyAgentOps, gateGeneration: agentGateGeneration, ownsGate: ownsAgentGate } = useAgentBridge({
+        enabled: ready,
         projectId,
-        title: currentProject?.title,
+        title: projectTitle,
         nodes,
         connections,
         selectedNodeIds,
@@ -679,6 +791,19 @@ function InfiniteCanvasPage() {
         setViewport,
         setContextMenu,
     });
+    generationOwnerRef.current = { projectId, gateGeneration: agentGateGeneration, ownsGate: ownsAgentGate };
+
+    /**
+     * 闸门关闭或切换画布时，中止本页仍在跑的生成并清空登记表。
+     * 否则在 A 上启动的生成会在 B 就绪后继续写 B 的节点、清 B 的运行态或弹 B 的提示。
+     */
+    useEffect(() => {
+        const requests = generationRequestsRef.current;
+        return () => {
+            requests.forEach((request) => request.controller.abort());
+            requests.clear();
+        };
+    }, [projectId, agentGateGeneration]);
 
     const { pluginHost, renderPluginPanel, buildNodeToolbarItems } = usePluginHost({
         effectiveConfig,
@@ -751,7 +876,7 @@ function InfiniteCanvasPage() {
             setReferencePickerNodeId((current) => (current && allIds.has(current) ? null : current));
             setExpandedBatchNodeIds((current) => new Set([...current].filter((nodeId) => !allIds.has(nodeId))));
             setContextMenu((current) => (current?.type === "node" && allIds.has(current.nodeId) ? null : current));
-            cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions });
+            cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions }, { nodes: nodesRef.current.filter((node) => allIds.has(node.id)) });
         },
         [chatSessions, cleanupCanvasFiles, projectId],
     );
@@ -811,6 +936,7 @@ function InfiniteCanvasPage() {
     }, [cancelPendingConnectionCreate]);
 
     const clearCanvas = useCallback(() => {
+        const released = nodesRef.current;
         setNodes([]);
         setConnections([]);
         setInfoNodeId(null);
@@ -821,7 +947,7 @@ function InfiniteCanvasPage() {
         setRunningNodeId(null);
         deselectCanvas();
         setClearConfirmOpen(false);
-        cleanupCanvasFiles({ projectId, nodes: [], chatSessions: [] });
+        cleanupCanvasFiles({ projectId, nodes: [], chatSessions: [] }, { nodes: released });
     }, [cleanupCanvasFiles, deselectCanvas, projectId]);
 
     const duplicateNode = useCallback((nodeId: string) => {
@@ -1010,19 +1136,37 @@ function InfiniteCanvasPage() {
         applyHistory(next);
     }, [applyHistory]);
 
-    const createAndOpenProject = useCallback(() => {
-        const id = createProject(t("canvas.defaultTitle", { count: useCanvasStore.getState().projects.length + 1 }));
-        navigate(`/canvas/${id}`);
-    }, [createProject, navigate, t]);
+    const createAndOpenProject = useCallback(async () => {
+        /**
+         * 只发起 best-effort 落盘，不等待网络：新建绝不排在另一张画布的保存后面。
+         * A 的最终保存由 detached 收尾负责（7.4），失败时写 A 自己的 marker。
+         */
+        void flushProject(projectId);
+        const result = await createProject(t("canvas.defaultTitle", { count: useCanvasStore.getState().summaries.length + 1 }));
+        /** 账号或 Workspace 已切换时这条结果属于旧作用域：既不导航也不提示失败。 */
+        if (result.status === "scope-changed") return;
+        if (result.status === "failed") return message.error(t(result.messageKey));
+        navigate(`/canvas/${result.canvasId}`);
+    }, [createProject, flushProject, message, navigate, projectId, t]);
 
-    const deleteCurrentProject = useCallback(() => {
-        deleteProjects([projectId]);
-        cleanupAssetImages();
-        navigate("/canvas");
-    }, [cleanupAssetImages, deleteProjects, navigate, projectId]);
+    const deleteCurrentProject = useCallback(async () => {
+        try {
+            const { failed, localCleanupPending } = await deleteProjects([projectId]);
+            if (failed.length) return message.error(t("canvas.deleteFailed"));
+            if (localCleanupPending.length) message.warning(t("canvas.deleteLocalCleanupPending"));
+            navigate("/canvas");
+        } catch {
+            message.error(t("canvas.deleteFailed"));
+        }
+    }, [deleteProjects, message, navigate, projectId, t]);
 
     const exportCurrentProject = useCallback(async () => {
-        const project = useCanvasStore.getState().projects.find((item) => item.id === projectId);
+        let project: CanvasProject | undefined;
+        try {
+            [project] = await loadProjectsForExport([projectId]);
+        } catch {
+            return message.error(t("canvas.sidePanel.exportFailed"));
+        }
         if (!project) return message.error(t("canvas.projectPage.notFound"));
         const hide = message.loading(t("canvas.projectPage.exporting"), 0);
         try {
@@ -1034,7 +1178,7 @@ function InfiniteCanvasPage() {
         } finally {
             hide();
         }
-    }, [message, projectId, t]);
+    }, [loadProjectsForExport, message, projectId, t]);
 
     const handleCanvasMouseDown = useCallback(
         (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1830,18 +1974,20 @@ function InfiniteCanvasPage() {
                 const image = await requestEdit(generationConfig, prompt, [source], { id: `${node.id}-mask`, name: "mask.png", type: "image/png", dataUrl: payload.maskDataUrl }, { signal: controller.signal }).then((items) => items[0]);
                 const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
                 const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
+                setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.maskFailed");
-                message.error(errorDetails);
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
+                runOwned(controller, () => {
+                    message.error(errorDetails);
+                    setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
+                });
             } finally {
                 finishGenerationRequest(childId, controller);
-                setRunningNodeId(null);
+                runOwned(controller, () => setRunningNodeId(null));
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
 
     const upscaleImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageUpscaleParams) => {
@@ -1912,17 +2058,17 @@ function InfiniteCanvasPage() {
                 ).then((items) => items[0]);
                 const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
                 const size = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
+                setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
+                setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
             } finally {
                 finishGenerationRequest(childId, controller);
-                setRunningNodeId(null);
+                runOwned(controller, () => setRunningNodeId(null));
             }
         },
-        [effectiveConfig, finishGenerationRequest, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, openConfigDialog, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -2092,15 +2238,20 @@ function InfiniteCanvasPage() {
     );
 
     const startTitleEditing = useCallback(() => {
-        setTitleDraft(currentProject?.title || t("canvas.projectPage.untitledCanvas"));
+        setTitleDraft(projectTitle || t("canvas.projectPage.untitledCanvas"));
         setTitleEditing(true);
-    }, [currentProject?.title, t]);
+    }, [projectTitle, t]);
 
     const finishTitleEditing = useCallback(() => {
         const nextTitle = titleDraft.trim();
-        if (nextTitle) renameProject(projectId, nextTitle);
         setTitleEditing(false);
-    }, [projectId, renameProject, titleDraft]);
+        if (!nextTitle) return;
+        void renameProject(projectId, nextTitle).then((result) => {
+            /** 冲突或恢复阻断时标题只落本地草稿，必须说清楚，不能提示成功。 */
+            if (result.status === "local-only") message.warning(t("canvas.rename.localOnly"));
+            if (result.status === "failed") message.error(t(result.messageKey));
+        });
+    }, [message, projectId, renameProject, t, titleDraft]);
 
     const preventCanvasContextMenu = useCallback((event: ReactMouseEvent) => {
         if ((event.target as HTMLElement).closest("[data-node-id]")) return;
@@ -2134,15 +2285,17 @@ function InfiniteCanvasPage() {
                         ? await requestEdit({ ...generationConfig, count: "1" }, context.prompt, refs, undefined, { signal: controller.signal }).then((items) => items[0])
                         : await requestGeneration({ ...generationConfig, count: "1" }, context.prompt, { signal: controller.signal }).then((items) => items[0]);
                     const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
-                    setNodes((prev) =>
+                    setOwnedNodes(controller, (prev) =>
                         prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, ...imageMetadata(uploaded), prompt: scene, model: generationConfig.model, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)),
                     );
-                    setDialogNodeId(null);
+                    runOwned(controller, () => setDialogNodeId(null));
                 } catch (error) {
                     if (!isGenerationCanceled(error)) {
                         const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                        message.error(errorDetails);
-                        setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
+                        runOwned(controller, () => {
+                            message.error(errorDetails);
+                            setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
+                        });
                     }
                 } finally {
                     finishGenerationRequest(nodeId, controller);
@@ -2158,9 +2311,9 @@ function InfiniteCanvasPage() {
                 buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, editingTextNode ? t("canvas.projectPage.editTextPrompt", { source: sourceTextContent, prompt }) : prompt),
             );
             const effectivePrompt = generationContext.prompt.trim();
-            if (runController.signal.aborted) {
+            /** 补水期间可能已经切走或被同节点的新一次生成顶替：归属丢失就地收手，不写节点、也不清别人的运行态。 */
+            if (!ownsGeneration(runController)) {
                 finishGenerationRequest(nodeId, runController);
-                setRunningNodeId(null);
                 return;
             }
             const markSourceStatus = sourceNode?.type !== CanvasNodeType.Image && !editingTextNode;
@@ -2261,7 +2414,7 @@ function InfiniteCanvasPage() {
                                 const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
                                 const imageSize = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
                                 const item: CanvasNodeImage = { id: imageId, status: NODE_STATUS_SUCCESS, content: uploaded.url, storageKey: uploaded.storageKey, naturalWidth: uploaded.width, naturalHeight: uploaded.height, bytes: uploaded.bytes, mimeType: uploaded.mimeType };
-                                setNodes((prev) =>
+                                setOwnedNodes(controller, (prev) =>
                                     prev.map((node) => {
                                         if (node.id !== rootId) return node;
                                         const images = node.metadata?.images?.map((image) => (image.id === imageId ? item : image)) || [];
@@ -2286,27 +2439,25 @@ function InfiniteCanvasPage() {
                                     }),
                                 );
                                 hasSuccess = true;
-                                if (isConfigNode) setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)));
+                                if (isConfigNode) setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)));
                                 return true;
                             } catch (error) {
                                 if (isGenerationCanceled(error)) return false;
                                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
                                 if (!firstError) firstError = errorDetails;
                                 hasFailure = true;
-                                setNodes((prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } } : node)));
+                                setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } } : node)));
                             }
                             return false;
                         }),
                     );
                     if (rootId !== nodeId) finishGenerationRequest(rootId, controller);
-                    if (controller.signal.aborted) {
-                        setNodes((prev) => prev.map((node) => (node.id === nodeId && isConfigNode && node.metadata?.status === NODE_STATUS_LOADING ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_IDLE, errorDetails: undefined } } : node)));
-                        return;
-                    }
+                    /** 已被中止或已切走：配置节点的 loading 复位由中止方（stopGenerationByRunningId）负责，这里不再写任何状态。 */
+                    if (!ownsGeneration(controller)) return;
                     if (hasFailure) {
-                        message.error(hasSuccess ? t("canvas.projectPage.partialFailed") : firstError || t("canvas.projectPage.generationFailed"));
+                        runOwned(controller, () => message.error(hasSuccess ? t("canvas.projectPage.partialFailed") : firstError || t("canvas.projectPage.generationFailed")));
                     }
-                    setNodes((prev) =>
+                    setOwnedNodes(controller, (prev) =>
                         prev.map((node) =>
                             node.id === nodeId && isConfigNode
                                 ? { ...node, metadata: { ...node.metadata, status: hasSuccess ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: hasSuccess ? undefined : t("canvas.projectPage.generationFailed") } }
@@ -2355,7 +2506,7 @@ function InfiniteCanvasPage() {
                             await requestVideoGeneration(generationConfig, effectivePrompt, generationContext.referenceImages, { signal: controller.signal }),
                         );
                         const videoSize = fitNodeSize(video.width || spec.width, video.height || spec.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
-                        setNodes((prev) =>
+                        setOwnedNodes(controller, (prev) =>
                             prev.map((node) =>
                                 node.id === videoId
                                     ? {
@@ -2409,7 +2560,7 @@ function InfiniteCanvasPage() {
                     const controller = startGenerationRequest(audioId, nodeId, nodeId, runController);
                     try {
                         const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, effectivePrompt, { signal: controller.signal }), generationConfig.audioFormat);
-                        setNodes((prev) => prev.map((node) => (node.id === audioId ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: effectivePrompt, ...buildAudioGenerationMetadata(generationConfig) } } : node)));
+                        setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === audioId ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: effectivePrompt, ...buildAudioGenerationMetadata(generationConfig) } } : node)));
                     } finally {
                         finishGenerationRequest(audioId, controller);
                     }
@@ -2463,7 +2614,7 @@ function InfiniteCanvasPage() {
                                 buildNodeResponseMessages({ ...generationContext, prompt: effectivePrompt }),
                                 (text) => {
                                     streamed = text;
-                                    setNodes((prev) =>
+                                    setOwnedNodes(controller, (prev) =>
                                         prev.map((node) =>
                                             node.id === rootId
                                                 ? {
@@ -2481,7 +2632,7 @@ function InfiniteCanvasPage() {
                                 { signal: controller.signal },
                             );
                             const content = answer || streamed;
-                            setNodes((prev) =>
+                            setOwnedNodes(controller, (prev) =>
                                 prev.map((node) =>
                                     node.id === rootId
                                         ? {
@@ -2499,19 +2650,19 @@ function InfiniteCanvasPage() {
                         } catch (error) {
                             if (isGenerationCanceled(error)) return null;
                             const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                            setNodes((prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, texts: node.metadata?.texts?.map((item) => (item.id === textId ? { ...item, status: NODE_STATUS_ERROR, errorDetails } : item)) } } : node)));
+                            setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, texts: node.metadata?.texts?.map((item) => (item.id === textId ? { ...item, status: NODE_STATUS_ERROR, errorDetails } : item)) } } : node)));
                             return { id: textId, status: NODE_STATUS_ERROR, content: "", errorDetails } satisfies CanvasNodeText;
                         }
                     }),
                 );
                 if (rootId !== nodeId) finishGenerationRequest(rootId, controller);
-                if (controller.signal.aborted) return;
+                if (!ownsGeneration(controller)) return;
                 const completedTexts = results.flatMap((item) => (item?.status === NODE_STATUS_SUCCESS ? [item] : []));
                 const failedTexts = results.filter((item) => item?.status === NODE_STATUS_ERROR);
                 const firstText = completedTexts[0];
                 if (completedTexts.length <= 1) setExpandedBatchNodeIds((current) => new Set([...current].filter((id) => id !== rootId)));
                 if (failedTexts.length) message.error(firstText ? t("canvas.projectPage.partialTextFailed") : failedTexts[0]?.errorDetails || t("canvas.projectPage.generationFailed"));
-                setNodes((prev) =>
+                setOwnedNodes(controller, (prev) =>
                     prev.map((node) => {
                         if (node.id === rootId) {
                             const primaryText = completedTexts.find((text) => text.id === node.metadata?.primaryTextId) || firstText;
@@ -2533,16 +2684,16 @@ function InfiniteCanvasPage() {
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                message.error(errorDetails);
-                setNodes((prev) =>
+                runOwned(runController, () => message.error(errorDetails));
+                setOwnedNodes(runController, (prev) =>
                     prev.map((node) => (node.id === nodeId || pendingChildIds.includes(node.id) ? (node.id === nodeId && !markSourceStatus ? node : { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } }) : node)),
                 );
             } finally {
                 finishGenerationRequest(nodeId, runController);
-                setRunningNodeId(null);
+                runOwned(runController, () => setRunningNodeId(null));
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, ownsGeneration, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2569,7 +2720,10 @@ function InfiniteCanvasPage() {
                 return;
             }
 
+            /** 补水与引用解析都在请求登记之前，因此先捕获归属，await 之后据此判断这次重试是否还属于当前画布。 */
+            const stillOwned = captureGenerationOwner();
             const context = hasSavedImageMetadata ? null : await hydrateNodeGenerationContext(buildNodeGenerationContext(sourceNode.id, nodesRef.current, connectionsRef.current, sourceNode.metadata?.prompt || node.metadata?.prompt || ""));
+            if (!stillOwned()) return;
             const prompt = (savedImageMetadata?.prompt || context?.prompt || "").trim();
             if (!prompt) {
                 message.warning(t("canvas.projectPage.retryPromptMissing"));
@@ -2579,6 +2733,7 @@ function InfiniteCanvasPage() {
             const useReferenceImages = generationType ? generationType === "edit" : Boolean(context?.referenceImages.length);
             const retryReferenceImages =
                 hasSavedImageMetadata && savedImageMetadata ? await resolveMetadataReferences(savedImageMetadata) : useReferenceImages ? (context?.referenceImages.length ? context.referenceImages : sourceNodeReferenceImages(sourceNode)) : [];
+            if (!stillOwned()) return;
             if (useReferenceImages && !retryReferenceImages) {
                 message.error(t("canvas.projectPage.referenceMissing"));
                 setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: item.metadata?.content ? undefined : t("canvas.projectPage.referenceMissing"), images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails: t("canvas.projectPage.referenceMissing") } : image)) } } : item)));
@@ -2599,17 +2754,17 @@ function InfiniteCanvasPage() {
                         buildNodeResponseMessages({ ...context, prompt }),
                         (text) => {
                             streamed = text;
-                            setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: text, status: NODE_STATUS_LOADING } } : item)));
+                            setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: text, status: NODE_STATUS_LOADING } } : item)));
                         },
                         { signal: controller.signal },
                     );
-                    setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: answer || streamed, prompt, status: NODE_STATUS_SUCCESS } } : item)));
+                    setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: answer || streamed, prompt, status: NODE_STATUS_SUCCESS } } : item)));
                     return;
                 }
                 if (node.type === CanvasNodeType.Video) {
                     const video = await storeGeneratedVideo(await requestVideoGeneration(generationConfig, prompt, retryImages, { signal: controller.signal }));
                     const videoSize = fitNodeSize(video.width || node.width, video.height || node.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
-                    setNodes((prev) =>
+                    setOwnedNodes(controller, (prev) =>
                         prev.map((item) =>
                             item.id === node.id
                                 ? {
@@ -2636,7 +2791,7 @@ function InfiniteCanvasPage() {
                 }
                 if (node.type === CanvasNodeType.Audio) {
                     const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, prompt, { signal: controller.signal }), generationConfig.audioFormat);
-                    setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(generationConfig) } } : item)));
+                    setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(generationConfig) } } : item)));
                     return;
                 }
 
@@ -2666,7 +2821,7 @@ function InfiniteCanvasPage() {
                           references: savedImageMetadata.references,
                       }
                     : buildImageGenerationMetadata(useReferenceImages ? "edit" : "generation", generationConfig, 1, retryImages);
-                setNodes((prev) =>
+                setOwnedNodes(controller, (prev) =>
                     prev.map((item) => {
                         if (item.id !== node.id) return item;
                         const makePrimary = !imageId || !item.metadata?.content;
@@ -2690,14 +2845,14 @@ function InfiniteCanvasPage() {
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                message.error(errorDetails);
-                setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: item.metadata?.content ? undefined : errorDetails, images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } } : item)));
+                runOwned(controller, () => message.error(errorDetails));
+                setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: item.metadata?.content ? undefined : errorDetails, images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } } : item)));
             } finally {
                 finishGenerationRequest(node.id, controller);
-                setRunningNodeId(null);
+                runOwned(controller, () => setRunningNodeId(null));
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [captureGenerationOwner, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {
@@ -2909,14 +3064,23 @@ function InfiniteCanvasPage() {
         [configInputsById, confirmStopGeneration, handleConfigNodeChange, handleGenerateNode, runningNodeId],
     );
 
-    if (!projectLoaded) return <CanvasRefreshShell />;
+    if (syncStatus === "error")
+        return (
+            <main className="flex h-full flex-col items-center justify-center gap-3 text-sm" style={{ background: theme.canvas.background, color: theme.node.muted }}>
+                <p>{t(syncErrorKey || "canvas.openFailed")}</p>
+                <button type="button" onClick={reopen} className="rounded-md px-3 py-1 font-medium transition hover:bg-black/5 dark:hover:bg-white/10">
+                    {t("canvas.retry")}
+                </button>
+            </main>
+        );
+    if (!ready) return <CanvasRefreshShell />;
 
     return (
         <main className="flex h-full min-h-0 overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
             <CanvasSidePanel nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={focusNode} onPreviewNode={setPreviewNodeId} onInsertAsset={handleAssetInsert} />
             <section className="relative min-w-0 flex-1 overflow-hidden">
                 <CanvasTopBar
-                    title={currentProject?.title || t("canvas.projectPage.untitledCanvas")}
+                    title={projectTitle || t("canvas.projectPage.untitledCanvas")}
                     titleDraft={titleDraft}
                     isTitleEditing={titleEditing}
                     onTitleDraftChange={setTitleDraft}
@@ -2927,8 +3091,8 @@ function InfiniteCanvasPage() {
                     canRedo={historyState.canRedo}
                     onHome={() => navigate("/")}
                     onProjects={() => navigate("/canvas")}
-                    onCreateProject={createAndOpenProject}
-                    onDeleteProject={deleteCurrentProject}
+                    onCreateProject={() => void createAndOpenProject()}
+                    onDeleteProject={() => void deleteCurrentProject()}
                     onExportProject={exportCurrentProject}
                     onImportImage={() => handleUploadRequest()}
                     onOpenPlugins={() => setPluginManagerOpen(true)}
@@ -2937,10 +3101,13 @@ function InfiniteCanvasPage() {
                     agentOpen={agentPanelOpen}
                     compactAgentStatus={{ connected: localAgentConnected, enabled: localAgentEnabled, activity: localAgentActivity }}
                     onToggleAgent={toggleAgentPanel}
+                    onReloadCanvas={reopen}
                 />
 
+                <CanvasConflictBar projectId={projectId} onReloadServerCopy={reloadServerCopy} />
+
                 <InfiniteCanvas
-                    containerRef={containerRef}
+                    containerRef={attachCanvasContainer}
                     viewport={viewport}
                     tool={canvasTool}
                     backgroundMode={backgroundMode}

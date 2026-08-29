@@ -5,34 +5,36 @@ description: Run Infinite Canvas in a few steps
 
 # Quick Start
 
-To try the project, deploy or start the `web/` frontend.
+This backend branch requires the Fastify API and PostgreSQL in addition to `web/`.
 
-## Deploy with Vercel
+<Callout type="warn">
+The current Docker, Vercel, and Render configurations publish only the static frontend. They are unavailable for this backend branch and must not be treated as production deployments until the later deployment plan adds the API process and same-origin reverse proxy.
+</Callout>
 
-Import the repository into Vercel. The root `vercel.json` builds `web/`. AI requests are sent directly from the browser to your OpenAI-compatible endpoint, so no additional application server is required.
+## Vercel (not available yet)
+
+Do not import this branch with the current root `vercel.json`: it builds only `web/`, so authentication and `/api/v1` requests will fail.
 
 ## Run locally
 
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas/web
+cd infinite-canvas
 bun install
-bun run dev
 ```
+
+Provision PostgreSQL, copy the required values from `.env.example`, apply the current server migration, then run `bun run dev:api` and `bun run dev:web` in separate terminals.
 
 Open `http://localhost:3000`.
 
-## Run with Docker
+## Docker and Render (not available yet)
 
-```bash
-docker build -t infinite-canvas .
-docker run --rm -p 3000:3000 infinite-canvas
-```
+The tracked image and Render blueprint are static-only and do not include the API, PostgreSQL migration release step, or reverse proxy required by this branch.
 
 ## First-time setup
 
 - Open Settings and enter your `Base URL`, `API Key`, and model names.
 - Open `/prompts` to fetch prompt repositories directly from the browser and cache them in IndexedDB.
-- Configure WebDAV if you want to synchronize canvases, assets, and generation history across devices.
+- Configure WebDAV only for the remaining supported local-data domains. It is no longer the authority for Canvas projects.
 
-Canvas projects and My Assets are primarily stored in the browser. The API key is also stored locally and used by the browser to call OpenAI-compatible endpoints directly.
+Authenticated Canvas snapshots and revisions are server-authoritative. Native IndexedDB stores only recovery drafts and local UI state; media bytes and My Assets remain browser-local until the Asset cutover. The API key is also still stored locally and used by the browser to call OpenAI-compatible endpoints directly during this transition.

@@ -5,21 +5,25 @@ description: 用最少步骤把无限画布跑起来
 
 # 快速开始
 
-如果你只是想先把项目跑起来，优先部署或启动 `web/` 前端。
+当前后端分支除了 `web/`，还必须运行 Fastify API 和 PostgreSQL。
 
-## Vercel 部署
+<Callout type="warn">
+仓库现有 Docker、Vercel 与 Render 配置只发布静态前端，当前不能用于本后端分支，也不能视为生产部署。后续部署计划补齐 API 进程和同源反向代理后才能使用。
+</Callout>
 
-在 Vercel 中导入仓库即可，根目录 `vercel.json` 会构建 `web/`。当前版本的 AI 请求由浏览器前台直连用户自己的 OpenAI 兼容地址，不需要额外配置服务端。
+## Vercel（暂不可用）
+
+不要直接用当前根目录 `vercel.json` 导入本分支：它只构建 `web/`，认证和 `/api/v1` 请求都会失败。
 
 ## 本地启动
 
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
 cd infinite-canvas
-cd web
 bun install
-bun run dev
 ```
+
+请先准备 PostgreSQL，按 `.env.example` 配置环境变量并应用当前服务端迁移，再分别运行 `bun run dev:api` 与 `bun run dev:web`。
 
 启动后访问：
 
@@ -27,22 +31,17 @@ bun run dev
 http://localhost:3000
 ```
 
-## Docker 启动
+## Docker 与 Render（暂不可用）
 
-如果你需要基于当前源码构建镜像：
-
-```bash
-docker build -t infinite-canvas .
-docker run --rm -p 3000:3000 infinite-canvas
-```
+当前镜像和 Render Blueprint 都只包含静态前端，尚未提供本分支所需的 API、PostgreSQL 迁移发布步骤和反向代理。
 
 ## 首次使用建议
 
 - 先打开右上角配置弹窗，填入自己的 `Base URL`、`API Key` 和模型名。
 - 如果需要提示词仓库内容，打开 `/prompts` 会由浏览器前端直连拉取并缓存到 IndexedDB。
-- 如果需要跨设备同步画布、素材和生成记录，可在配置弹窗中填写 WebDAV。
+- WebDAV 只用于当前仍支持的本地数据域，不再是 Canvas 项目的权威同步方式。
 
 ## 说明
 
-- 当前画布项目和“我的素材”主要保存在浏览器本地，WebDAV 同步需要用户自行配置。
+- 登录后的 Canvas 快照与 revision 由服务端权威保存；原生 IndexedDB 只保存恢复草稿与本机 UI 状态，媒体字节和“我的素材”在 Asset 切换前仍保存在浏览器。
 - AI API Key 保存在浏览器本地，并由前端直接请求 OpenAI 兼容接口。

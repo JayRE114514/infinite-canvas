@@ -8,6 +8,8 @@ data/
 *.tsbuildinfo
 .DS_Store
 .idea
+.worktrees/
+.scratch/
 web/dist
 
 **/dist

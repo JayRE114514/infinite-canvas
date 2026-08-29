@@ -1,18 +1,20 @@
 import { create } from "zustand";
 
-export type LocalUser = {
+export type AuthenticatedUser = {
     id: string;
-    username: string;
-    displayName: string;
-    avatarUrl: string;
+    name: string;
+    email: string;
+    image: string | null;
 };
 
 type UserStore = {
-    user: LocalUser | null;
-    clearSession: () => void;
+    user: AuthenticatedUser | null;
+    setUser: (user: AuthenticatedUser) => void;
+    clearUser: () => void;
 };
 
 export const useUserStore = create<UserStore>()((set) => ({
     user: null,
-    clearSession: () => set({ user: null }),
+    setUser: (user) => set({ user }),
+    clearUser: () => set({ user: null }),
 }));

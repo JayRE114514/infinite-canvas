@@ -1,135 +1,127 @@
 import { create } from "zustand";
-import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 
-import { nanoid } from "nanoid";
-import i18n from "@/i18n";
-import { localForageStorage } from "@/lib/localforage-storage";
-import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
-import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
+import type { CanvasProjectSummary } from "@/lib/canvas/canvas-snapshot";
+import { clampCanvasTitle } from "@/lib/canvas/canvas-snapshot";
+import { canvasSyncManager } from "@/services/canvas-sync/canvas-sync-manager";
+import { sameCanvasScope, type CanvasCreateResult, type CanvasDeleteResult, type CanvasProjectPatch, type CanvasRenameResult, type CanvasRetryRecoveryResult, type CanvasSyncView } from "@/services/canvas-sync/types";
+import type { CanvasProject, CanvasScope } from "@/types/canvas";
 
-export type CanvasProject = {
-    id: string;
-    title: string;
-    createdAt: string;
-    updatedAt: string;
-    nodes: CanvasNodeData[];
-    connections: CanvasConnection[];
-    chatSessions: CanvasAssistantSession[];
-    activeChatId: string | null;
-    backgroundMode: CanvasBackgroundMode;
-    showImageInfo: boolean;
-    viewport: ViewportTransform;
-};
-
+/** 视图适配器：只保存可渲染状态并把动作转发给 manager，不持有计时器、修订号或本地存储逻辑。 */
 type CanvasStore = {
-    hydrated: boolean;
-    projects: CanvasProject[];
-    createProject: (title?: string) => string;
-    importProject: (project: Partial<CanvasProject>) => string;
-    openProject: (id: string) => CanvasProject | null;
-    renameProject: (id: string, title: string) => void;
-    deleteProjects: (ids: string[]) => void;
-    replaceProjects: (projects: CanvasProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport">>) => void;
+    scope: CanvasScope | null;
+    listStatus: "idle" | "loading" | "ready" | "error";
+    listError: string | null;
+    summaries: CanvasProjectSummary[];
+    activeCanvasId: string | null;
+    /** 由活动会话推送；无活动会话为 null。 */
+    sync: CanvasSyncView | null;
+    setScope: (scope: CanvasScope | null) => void;
+    refreshList: () => Promise<void>;
+    createProject: (title: string) => Promise<CanvasCreateResult>;
+    importProject: (source: Partial<CanvasProject>, fallbackTitle: string) => Promise<CanvasCreateResult>;
+    renameProject: (canvasId: string, title: string) => Promise<CanvasRenameResult>;
+    deleteProjects: (canvasIds: string[]) => Promise<CanvasDeleteResult>;
+    loadProjectsForExport: (canvasIds: string[]) => Promise<CanvasProject[]>;
+    updateProject: (canvasId: string, patch: CanvasProjectPatch) => void;
+    flushProject: (canvasId: string) => Promise<void>;
+    retrySave: (canvasId: string) => Promise<void>;
+    retryRecovery: (canvasId: string) => Promise<CanvasRetryRecoveryResult>;
+    exportConflictDrafts: (canvasId: string) => Promise<CanvasProject[]>;
+    /** 非响应式读取活动画布内容，供素材回收与导出使用；不进入 React 订阅。 */
+    getActiveProject: () => CanvasProject | null;
 };
 
-const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
-const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
-type PersistedCanvasState = Pick<CanvasStore, "projects">;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let queuedPersistState: PersistedCanvasState | null = null;
+export const useCanvasStore = create<CanvasStore>()((set, get) => {
+    /** 动作一律带 canvasId：切画布瞬间组件发出的调用不会打到别的画布上。 */
+    const sessionFor = (canvasId: string) => {
+        const session = canvasSyncManager.getActiveSession();
+        return session && session.canvasId === canvasId && get().activeCanvasId === canvasId ? session : null;
+    };
 
-const canvasStorage: PersistStorage<CanvasStore> = {
-    getItem: async (name) => {
-        const value = await localForageStorage.getItem(name);
-        if (!value) return null;
-        const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
-        queuedPersistState = parsed.state as PersistedCanvasState;
-        return parsed;
-    },
-    setItem: (name, value) => {
-        const nextState = value.state as PersistedCanvasState;
-        if (queuedPersistState && queuedPersistState.projects === nextState.projects) return;
-        queuedPersistState = nextState;
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-            saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
-        }, 400);
-    },
-    removeItem: (name) => localForageStorage.removeItem(name),
-};
+    return {
+        scope: null,
+        listStatus: "idle",
+        listError: null,
+        summaries: [],
+        activeCanvasId: null,
+        sync: null,
 
-export const useCanvasStore = create<CanvasStore>()(
-    persist(
-        (set, get) => ({
-            hydrated: false,
-            projects: [],
-            createProject: (title = i18n.t("canvas.project.untitled")) => {
-                const now = new Date().toISOString();
-                const id = nanoid();
-                const project: CanvasProject = {
-                    id,
-                    title,
-                    createdAt: now,
-                    updatedAt: now,
-                    nodes: [],
-                    connections: [],
-                    chatSessions: [],
-                    activeChatId: null,
-                    backgroundMode: "lines",
-                    showImageInfo: false,
-                    viewport: initialViewport,
-                };
-                set((state) => ({ projects: [project, ...state.projects] }));
-                return id;
-            },
-            importProject: (source) => {
-                const now = new Date().toISOString();
-                const project: CanvasProject = {
-                    id: nanoid(),
-                    title: source.title || i18n.t("canvas.project.imported"),
-                    createdAt: source.createdAt || now,
-                    updatedAt: now,
-                    nodes: source.nodes || [],
-                    connections: source.connections || [],
-                    chatSessions: source.chatSessions || [],
-                    activeChatId: source.activeChatId || null,
-                    backgroundMode: source.backgroundMode || "lines",
-                    showImageInfo: source.showImageInfo || false,
-                    viewport: source.viewport || initialViewport,
-                };
-                set((state) => ({ projects: [project, ...state.projects] }));
-                return project.id;
-            },
-            openProject: (id) => {
-                return get().projects.find((item) => item.id === id) || null;
-            },
-            renameProject: (id, title) =>
-                set((state) => ({
-                    projects: state.projects.map((project) => (project.id === id ? { ...project, title: title.trim() || project.title, updatedAt: new Date().toISOString() } : project)),
-                })),
-            deleteProjects: (ids) =>
-                set((state) => {
-                    const projects = state.projects.filter((project) => !ids.includes(project.id));
-                    return { projects };
-                }),
-            replaceProjects: (projects) => set({ projects }),
-            updateProject: (id, patch) =>
-                set((state) => ({
-                    projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
-                })),
-        }),
-        {
-            name: CANVAS_STORE_KEY,
-            storage: canvasStorage,
-            partialize: (state) =>
-                ({
-                    projects: state.projects,
-                }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
-            },
+        setScope: (scope) => {
+            /** 幂等判断交给 manager：它持有作用域令牌，首次的 null 也必须让它完成初始化，适配器不得替它拦下。 */
+            canvasSyncManager.setScope(scope);
+            const current = get().scope;
+            /** 视图状态没变就不写 store，避免多余的重渲染；令牌失效已经由上面的 manager 调用完成。 */
+            if ((current === null && scope === null) || sameCanvasScope(current, scope)) return;
+            set({ scope, summaries: [], listStatus: "idle", listError: null });
         },
-    ),
-);
+
+        refreshList: async () => {
+            if (!get().scope) return;
+            set({ listStatus: "loading", listError: null });
+            const result = await canvasSyncManager.listCanvases();
+            /** 迟到结果按作用域丢弃：新的作用域已经把 listStatus 重置为 idle 并会自己拉一次。 */
+            if (result.status === "scope-changed") return;
+            if (result.status === "failed") {
+                set({ listStatus: "error", listError: result.messageKey, summaries: [] });
+                return;
+            }
+            set({ summaries: result.summaries, listStatus: "ready" });
+        },
+
+        createProject: async (title) => {
+            const result = await canvasSyncManager.createCanvas(title);
+            if (result.status === "created") set({ summaries: [result.summary, ...get().summaries] });
+            return result;
+        },
+
+        importProject: async (source, fallbackTitle) => {
+            const result = await canvasSyncManager.importCanvas(source, fallbackTitle);
+            if (result.status === "created") set({ summaries: [result.summary, ...get().summaries] });
+            return result;
+        },
+
+        renameProject: async (canvasId, title) => {
+            const result = await canvasSyncManager.renameCanvas(canvasId, title);
+            if (result.status === "saved") set({ summaries: get().summaries.map((item) => (item.id === canvasId ? result.summary : item)) });
+            /** 活动画布改名尚未落库，列表标题先按截断后的输入乐观更新，revision 与时间戳等下一次列表刷新。 */
+            if (result.status === "scheduled" || result.status === "local-only") {
+                const trimmed = clampCanvasTitle(title);
+                set({ summaries: get().summaries.map((item) => (item.id === canvasId ? { ...item, title: trimmed } : item)) });
+            }
+            return result;
+        },
+
+        deleteProjects: async (canvasIds) => {
+            const scopeAtCall = get().scope;
+            const result = await canvasSyncManager.deleteCanvases(canvasIds);
+            /** 作用域已变时仍返回真实结果，只是不写 store。 */
+            if (!sameCanvasScope(scopeAtCall, get().scope)) return result;
+            if (result.deleted.length) set({ summaries: get().summaries.filter((item) => !result.deleted.includes(item.id)) });
+            return result;
+        },
+
+        loadProjectsForExport: (canvasIds) => canvasSyncManager.loadForExport(canvasIds),
+        updateProject: (canvasId, patch) => {
+            sessionFor(canvasId)?.update(patch);
+        },
+        flushProject: async (canvasId) => {
+            await sessionFor(canvasId)?.flush();
+        },
+        retrySave: async (canvasId) => {
+            await sessionFor(canvasId)?.retrySave();
+        },
+        retryRecovery: async (canvasId) => (await sessionFor(canvasId)?.retryRecovery()) ?? "failed",
+        exportConflictDrafts: async (canvasId) => (await sessionFor(canvasId)?.exportConflictDrafts()) ?? [],
+        getActiveProject: () => canvasSyncManager.getActiveSession()?.content ?? null,
+    };
+});
+
+/** 会话视图是唯一真相：manager 在会话安装、替换与视图变化时通知，这里只做一次浅比较后写入。 */
+canvasSyncManager.subscribe(() => {
+    const session = canvasSyncManager.getActiveSession();
+    const activeCanvasId = session?.canvasId ?? null;
+    const sync: CanvasSyncView | null = session?.view ?? null;
+    const state = useCanvasStore.getState();
+    if (state.activeCanvasId === activeCanvasId && state.sync === sync) return;
+    useCanvasStore.setState({ activeCanvasId, sync });
+});

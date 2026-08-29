@@ -21,22 +21,47 @@ export default function CanvasPage() {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const inputRef = useRef<HTMLInputElement>(null);
-    const autoOpenRef = useRef(false);
-    const hydrated = useCanvasStore((state) => state.hydrated);
-    const projects = useCanvasStore((state) => state.projects);
+    const autoOpenRef = useRef("");
+    const scope = useCanvasStore((state) => state.scope);
+    const listStatus = useCanvasStore((state) => state.listStatus);
+    const listError = useCanvasStore((state) => state.listError);
+    const summaries = useCanvasStore((state) => state.summaries);
+    const refreshList = useCanvasStore((state) => state.refreshList);
     const createProject = useCanvasStore((state) => state.createProject);
     const importProject = useCanvasStore((state) => state.importProject);
+    const loadProjectsForExport = useCanvasStore((state) => state.loadProjectsForExport);
     const selectedIds = useCanvasUiStore((state) => state.selectedProjectIds);
     const setDeleteIds = useCanvasUiStore((state) => state.setDeleteProjectIds);
 
     const mode = searchParams.get("mode");
     const agentMode = mode === "new" || mode === "recent" || mode === "choose";
     const agentQuery = agentMode ? `?${searchParams.toString()}` : "";
+    const ready = Boolean(scope) && listStatus === "ready";
+    const autoOpenScopeKey = scope ? JSON.stringify([scope.userId, scope.workspaceId]) : "";
     const enterProject = (id: string) => {
         const agentHash = hasAgentUrlBootstrap(window.location.hash) ? window.location.hash : "";
         navigate(`/canvas/${id}${agentQuery}${agentHash}`, { replace: Boolean(agentHash) });
     };
-    const createAndEnter = () => enterProject(createProject(t("canvas.defaultTitle", { count: projects.length + 1 })));
+    /** 新建必须由用户显式触发，服务端返回 id 后才导航，避免拿到本地临时 id 后再对不上服务端画布。 */
+    const createAndEnter = async () => {
+        const result = await createProject(t("canvas.defaultTitle", { count: summaries.length + 1 }));
+        if (result.status === "created") {
+            enterProject(result.canvasId);
+            return true;
+        }
+        /** 账号或 Workspace 已切换：既不导航也不提示失败，新作用域会自己再发起一次。 */
+        if (result.status === "failed") message.error(t(result.messageKey));
+        return false;
+    };
+    const exportProjects = async (ids: string[]) => {
+        try {
+            const projects = await loadProjectsForExport(ids);
+            if (!projects.length) return;
+            await exportCanvasProjects(projects, `${t("canvas.title")}-${projects.length}`);
+        } catch {
+            message.error(t("canvas.exportFailed"));
+        }
+    };
     const importCanvas = async (file?: File) => {
         if (!file) return;
         try {
@@ -54,8 +79,20 @@ export default function CanvasPage() {
                     }),
                 ),
             );
-            data.projects.forEach((item) => importProject(item.project));
-            message.success(t("canvas.imported", { count: data.projects.length }));
+            /** 导入是显式上传：逐个创建服务端画布并分别记账，避免「已创建若干却提示全失败」或谎报全部成功。 */
+            let created = 0;
+            let failed = 0;
+            for (const item of data.projects) {
+                const result = await importProject(item.project, t("canvas.project.imported"));
+                /** 切换作用域后剩下的画布不再属于当前列表，直接停止，不计为失败。 */
+                if (result.status === "scope-changed") break;
+                if (result.status === "created") created += 1;
+                else failed += 1;
+            }
+            if (created) message.success(t("canvas.imported", { count: created }));
+            if (failed) message.error(t("canvas.importPartialFailed", { count: failed }));
+            if (!created && !failed) return;
+            await refreshList();
         } catch {
             message.error(t("canvas.importFailed"));
         } finally {
@@ -64,12 +101,34 @@ export default function CanvasPage() {
     };
 
     useEffect(() => {
-        if (!hydrated || autoOpenRef.current || (mode !== "new" && mode !== "recent")) return;
-        autoOpenRef.current = true;
-        enterProject(mode === "new" ? createProject(t("canvas.defaultTitle", { count: projects.length + 1 })) : projects[0]?.id || createProject(t("canvas.defaultTitle", { count: projects.length + 1 })));
-    }, [createProject, hydrated, mode, projects, t]);
+        if (scope && listStatus === "idle") void refreshList();
+    }, [listStatus, refreshList, scope]);
 
-    if (hydrated && (mode === "new" || mode === "recent")) return <main className="flex h-full items-center justify-center bg-background text-sm text-stone-500">{t("canvas.opening")}</main>;
+    /** Agent 的 mode=new / mode=recent 保持原语义，只是改为等服务端列表就绪后再决定打开哪个画布。 */
+    useEffect(() => {
+        if (!autoOpenScopeKey) {
+            autoOpenRef.current = "";
+            return;
+        }
+        if (!ready || autoOpenRef.current === autoOpenScopeKey || (mode !== "new" && mode !== "recent")) return;
+        autoOpenRef.current = autoOpenScopeKey;
+        void (async () => {
+            const recentId = mode === "recent" ? summaries[0]?.id : undefined;
+            if (recentId) {
+                enterProject(recentId);
+                return;
+            }
+            const opened = await createAndEnter();
+            const currentScope = useCanvasStore.getState().scope;
+            const currentScopeKey = currentScope ? JSON.stringify([currentScope.userId, currentScope.workspaceId]) : "";
+            if (!opened && currentScopeKey === autoOpenScopeKey && autoOpenRef.current === autoOpenScopeKey && window.location.pathname === "/canvas") {
+                autoOpenRef.current = "";
+                navigate("/canvas", { replace: true });
+            }
+        })();
+    }, [autoOpenScopeKey, mode, ready, summaries]);
+
+    if (mode === "new" || mode === "recent") return <main className="flex h-full items-center justify-center bg-background text-sm text-stone-500">{t("canvas.opening")}</main>;
 
     return (
         <main className="h-full overflow-auto bg-background text-stone-950 dark:text-stone-100">
@@ -82,41 +141,48 @@ export default function CanvasPage() {
                     <div className="flex items-center gap-2">
                         {selectedIds.length ? (
                             <>
-                                <Button disabled={!hydrated} icon={<Download className="size-4" />} onClick={() => void exportCanvasProjects(projects.filter((project) => selectedIds.includes(project.id)), `${t("canvas.title")}-${selectedIds.length}`)}>
+                                <Button disabled={!ready} icon={<Download className="size-4" />} onClick={() => void exportProjects(selectedIds)}>
                                     {t("canvas.exportSelected")}
                                 </Button>
-                                <Button disabled={!hydrated} onClick={() => setDeleteIds(selectedIds)}>
+                                <Button disabled={!ready} onClick={() => setDeleteIds(selectedIds)}>
                                     {t("canvas.deleteSelected")}
                                 </Button>
                             </>
                         ) : null}
-                        {projects.length ? (
-                            <Button disabled={!hydrated} onClick={() => setDeleteIds(projects.map((project) => project.id))}>
+                        {summaries.length ? (
+                            <Button disabled={!ready} onClick={() => setDeleteIds(summaries.map((summary) => summary.id))}>
                                 {t("canvas.deleteAll")}
                             </Button>
                         ) : null}
-                        <Button disabled={!hydrated} icon={<FileUp className="size-4" />} onClick={() => inputRef.current?.click()}>
+                        <Button disabled={!ready} icon={<FileUp className="size-4" />} onClick={() => inputRef.current?.click()}>
                             {t("canvas.import")}
                         </Button>
-                        <Button disabled={!hydrated} type="primary" icon={<Plus className="size-4" />} onClick={createAndEnter}>
+                        <Button disabled={!ready} type="primary" icon={<Plus className="size-4" />} onClick={() => void createAndEnter()}>
                             {t("canvas.create")}
                         </Button>
                     </div>
                 </header>
 
-                {!hydrated ? (
+                {listStatus === "error" ? (
+                    <section className="flex min-h-[360px] flex-col items-center justify-center gap-3 border-y border-stone-200 text-sm text-stone-500 dark:border-stone-800">
+                        <p>{t(listError || "canvas.listFailed")}</p>
+                        <Button type="text" className="hover:bg-black/5 dark:hover:bg-white/10" onClick={() => void refreshList()}>
+                            {t("canvas.retry")}
+                        </Button>
+                    </section>
+                ) : !ready ? (
                     <section className="flex min-h-[360px] items-center justify-center border-y border-stone-200 text-sm text-stone-500 dark:border-stone-800">{t("canvas.loading")}</section>
-                ) : projects.length ? (
+                ) : summaries.length ? (
                     <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
-                        {projects.map((project) => (
-                            <CanvasProjectCard key={project.id} project={project} />
+                        {summaries.map((summary) => (
+                            <CanvasProjectCard key={summary.id} summary={summary} />
                         ))}
                     </div>
                 ) : (
                     <section className="flex min-h-[360px] flex-col items-center justify-center border-y border-stone-200 text-center dark:border-stone-800">
                         <h2 className="text-xl font-medium">{t("canvas.empty")}</h2>
                         <p className="mt-3 text-sm text-stone-500">{t("canvas.emptyDescription")}</p>
-                        <Button type="primary" className="mt-6" icon={<Plus className="size-4" />} onClick={createAndEnter}>
+                        <Button type="primary" className="mt-6" icon={<Plus className="size-4" />} onClick={() => void createAndEnter()}>
                             {t("canvas.create")}
                         </Button>
                     </section>

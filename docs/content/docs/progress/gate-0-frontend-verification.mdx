@@ -1,0 +1,57 @@
+---
+title: Gate 0 Frontend Verification
+description: Real-browser evidence for native IndexedDB CAS canvas recovery
+---
+
+# Gate 0 Frontend Verification Record
+
+This record preserves the Git-tracked evidence for the browser half of Gate 0. It covers native IndexedDB recovery and its cloud-canvas policy seams; it does not claim that every cloud-canvas workflow or a production deployment has passed acceptance.
+
+## Accepted scope
+
+- Chrome and Firefox were manually verified in real browsers.
+- The user explicitly waived macOS Safari testing. Safari is **unverified**, not passed.
+- `fake-indexeddb` tests are development evidence only and never substitute for the browser results below.
+
+## Automated evidence
+
+| Milestone evidence | Result |
+| --- | --- |
+| Independent affected-suite review | 9 files, 65 tests passed |
+| Deletion request/receipt boundary | 10 files, 68 tests passed |
+| Type repairs and focused regressions | 21 tests passed; `web` typecheck exited 0 |
+| Canonical snapshot boundary | 17 tests passed; `web` typecheck exited 0 |
+| Recovery retry ownership seam | 46 affected sync/recovery tests passed; `web` typecheck exited 0 |
+| Final web build | exited 0 |
+
+The independent review found and repaired four policy-seam defects that the first passing suite had treated as expected behavior: cross-tab draft identity reuse, age-only garbage collection, a server-confirmed delete reported as failure, and unsafe recovered-row retirement. A write-sequence CAS now protects retirement from deleting another live tab's row.
+
+## Chrome evidence
+
+Manual checks covered:
+
+- recovery database version 1 with exactly `drafts`, `epochs`, and `markers`;
+- separate draft identities for concurrent tabs and no silent cross-tab overwrite;
+- exact deletion-receipt proof before local tombstoning or cleanup;
+- pending drafts surviving garbage collection while eligible synced drafts are collected;
+- malformed epoch/marker state failing closed without losing the pending draft;
+- viewport persisted only in `localUi`, with the document viewport and server revision unchanged;
+- a deliberately killed renderer process recovering the pending sentinel into a new owned synced row, retiring the source row by CAS, and preserving a healthy epoch.
+
+The corruption/retry path also verified that explicit recheck mints and adopts fresh ownership facts before cloud saving resumes; a failed persistence proof remains blocked.
+
+## Firefox evidence
+
+The same canvas (`1a87c7eb-7d49-4392-9461-717a23f4072f`) was used to verify:
+
+- the exact recovery database layout and absence of the legacy recovery store;
+- local viewport isolation from the document snapshot;
+- two offline tabs producing two distinct pending rows with no cross-contamination;
+- conflict cleanup after explicitly loading the server version;
+- renderer-crash durability in an isolated content process.
+
+For the crash check, the test tab was uniquely titled `GATE0 FIREFOX CRASH TAB`. After explicit user confirmation, only its content process PID `3020309` was ended; the normal canvas process `3020267` and Firefox parent `3019649` remained untouched. The pending source row `dWLEmh7y70tPWTtxAKDhTt` at write sequence 2 survived the crash. Reload restored its sentinel into new owned row `-hpjZCz1y0iFU8cXM6HWP` at write sequence 3, CAS-retired the source row, left zero markers, and retained a healthy epoch. The server revision advanced from 7 to 8 after synchronization.
+
+## Conclusion and remaining work
+
+Gate 0 is closed for the user-approved Chrome and Firefox scope. Safari remains explicitly unverified. Detailed cloud-canvas product scenarios remain in [Pending Tests](/docs/progress/pending-test), and this result makes no capacity, production deployment, or multi-user collaboration claim.

@@ -7,9 +7,10 @@ description: Major features available in the current project
 
 ## Canvas projects
 
-- Create, rename, duplicate, delete, import, and export canvas projects.
-- Persist projects in the browser and optionally synchronize them with WebDAV.
-- Keep viewport, background, nodes, connections, and assistant sessions with each project.
+- Create, rename, delete, import, and export canvas projects.
+- Persist authenticated Canvas snapshots and revisions on the platform server, with conditional saves that never silently overwrite a revision conflict.
+- Keep per-session recovery drafts in a separate native IndexedDB database; those drafts are local recovery data, not a second Canvas authority.
+- Keep background, nodes, connections, and assistant sessions in the cloud snapshot; keep the viewport in local recovery UI state.
 
 ## Infinite canvas
 
@@ -43,7 +44,7 @@ See [Codex App Plugin](/docs/overview/codex-app-plugin) for installation and usa
 
 ## Plugin system
 
-Canvas plugins can contribute node types, rendering, inspectors, serialization, migration, toolbar actions, and optional AI generation capabilities. Built-in and local plugins are managed through the canvas UI.
+Canvas plugins can contribute node types, rendering, inspectors, serialization, migration, toolbar actions, and optional AI generation capabilities. The supported platform policy allows only plugins maintained and published by the project owner. The legacy arbitrary-URL installer still present in the development source is unsupported and must be disabled or removed before release.
 
 ## Prompts and assets
 
@@ -58,10 +59,11 @@ See [Third-party Prompt Sources](/docs/overview/third-party-prompt-repositories)
 
 - Export and import channel, model, generation, prompt-source, and WebDAV settings.
 - Store application data and API credentials locally in the browser.
-- Use WebDAV for optional cross-device synchronization.
+- Use WebDAV only for remaining supported local-data domains; it is not the Canvas authority.
 
 ## Current limitations
 
-- The project is frontend-first and does not provide built-in cloud accounts or cloud storage.
+- Authenticated Canvas metadata is cloud-backed, but media bytes and My Assets remain browser-local until the server-side Asset lifecycle is complete.
 - API keys remain in browser storage and requests are sent directly to configured providers.
+- The legacy arbitrary-URL node-plugin installer is not part of the approved product policy and remains a release-blocking removal task.
 - Production Docker static-resource paths still require broader deployment verification.

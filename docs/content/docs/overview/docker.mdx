@@ -5,21 +5,15 @@ description: Deploy Infinite Canvas with Docker Compose
 
 # Docker Deployment
 
-## Use the published image
+<Callout type="warn">
+Docker deployment is not available for the current backend branch. The tracked image and Compose files publish only the static frontend; they do not run the Fastify API or provide its same-origin reverse proxy.
+</Callout>
 
-```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-docker compose up -d
-```
+## Current application image
 
-Open `http://localhost:3000`.
+Do not use the published image or build the root Dockerfile for this branch. They are missing the API process, PostgreSQL migration release step, backend secrets, and `/api` proxy required for authentication and Workspace APIs. They are not a production deployment.
 
-## Build locally
-
-```bash
-docker compose -f docker-compose.local.yml up -d --build
-```
+The later deployment plan will split or compose the web/API processes and define the reverse proxy. Until then, use the local development workflow in [Quick Start](/docs/overview/quick-start).
 
 ## Documentation image
 
@@ -37,11 +31,11 @@ cd docs
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-The main application container only runs Next.js. Canvases, My Assets, generation history, and API keys are stored in the browser by default, while prompt repositories are fetched directly by the frontend. No persistent data volume is required for this data.
+The documentation container is independent of the unavailable main-application deployment described above.
 
 ## Optional analytics
 
-No analytics are enabled by default. A deployment can enable GA4, Baidu Analytics, or both at runtime:
+The legacy static-only image has optional analytics configuration, but that image cannot run this backend branch. No analytics are enabled by default:
 
 | Variable | Description |
 | --- | --- |

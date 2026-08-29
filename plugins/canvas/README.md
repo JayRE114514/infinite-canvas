@@ -1,6 +1,8 @@
 # Infinite Canvas 画布节点插件
 
-给画布扩展自定义节点。每个插件是一个**独立目录**,用 **TypeScript** 编写,自带 `package.json` / `build.mjs` / `src/index.tsx` / `dist/`,互不耦合,可单独构建、发布、升级。
+给画布扩展由项目所有者维护的自定义节点。每个插件是一个**独立目录**,用 **TypeScript** 编写,自带 `package.json` / `build.mjs` / `src/index.tsx` / `dist/`,互不耦合,可单独构建、发布、升级。
+
+平台政策不允许普通用户通过 URL、上传文件或远程模块安装任意第三方执行代码。第三方开发者可以 fork MIT 源码并为自己的发行版维护插件，但托管平台只加载项目所有者审查并发布的产物。当前源码中的旧 URL 安装路径属于发布前待禁用或移除的遗留实现，不是支持能力。
 
 内置节点只有文本、图片、视频、音频、生成配置、组六种;其余节点(Markdown、SVG、HTML、3D 全景、便利贴……)都是插件。
 
@@ -43,11 +45,11 @@ npm run build   # → dist/<name>.js,并同步到 web/public/plugins/<name>.js
 npm run dev     # watch,改动自动构建并同步
 ```
 
-把 `dist/<name>.js` 托管到任意静态地址(CDN、GitHub Raw、对象存储),用户在画布「节点插件」管理器填该 URL 安装。升级时重新构建覆盖同一 URL,用户点「更新」即可。
+项目所有者构建后把 `dist/<name>.js` 发布到所有者控制的官方注册表；普通用户只能从该注册表选择已发布插件。fork 维护者可以把注册表指向自己控制的发行源。
 
 ## 官方插件注册表
 
-本项目官方插件由 CI 集中构建后发布到孤儿分支 `plugins-dist`(**构建产物不进 git**),画布「节点插件」面板顶部的**官方插件**区经 jsDelivr 从该分支远程拉取并一键安装;第三方插件仍走下方「第三方插件」的 JS URL 安装。构建脚本与发布说明见 [`registry/`](./registry/README.md);清单地址可用 `VITE_PLUGIN_REGISTRY_URL` 覆盖成自建来源。
+本项目官方插件由 CI 集中构建后发布到孤儿分支 `plugins-dist`(**构建产物不进 git**),画布「节点插件」面板经 jsDelivr 从该分支读取所有者发布的清单。构建脚本与发布说明见 [`registry/`](./registry/README.md);`VITE_PLUGIN_REGISTRY_URL` 只供项目所有者或 fork 维护者在构建时指定受控发行源，不能作为普通用户运行时安装入口。
 
 ## 本地开发
 

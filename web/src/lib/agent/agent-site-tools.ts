@@ -56,7 +56,7 @@ type GenerationStatusItem = { id: string; source: "canvas" | "image" | "video"; 
 export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navigate: NavigateFunction, context: SiteToolContext = {}): Promise<unknown> {
     switch (name) {
         case "canvas_list_projects":
-            return listCanvasProjects(input);
+            return await listCanvasProjects(input);
         case "generation_get_status":
             return getGenerationStatus(input, context.canvasSnapshot);
         case "workbench_image_get_config":
@@ -128,21 +128,38 @@ function compactPrompt(prompt: unknown) {
     return value ? `${value.slice(0, 200)}${value.length > 200 ? "..." : ""}` : undefined;
 }
 
-function listCanvasProjects(input: SiteToolInput) {
-    const { projects, hydrated } = useCanvasStore.getState();
-    if (!hydrated) throw new Error(siteText("canvasLoading"));
+/** 列表以服务端为权威：没有有效作用域时直接报未就绪，其余情况先确保拉过一次列表再分页。 */
+async function listCanvasProjects(input: SiteToolInput) {
+    const store = useCanvasStore.getState();
+    if (!store.scope) throw new Error(siteText("canvasLoading"));
+    /** 已经有一次刷新在飞就等它，不要再发一次重复请求。 */
+    if (store.listStatus === "loading") await waitForCanvasList();
+    else if (store.listStatus !== "ready") await store.refreshList();
+    const { summaries, listStatus, listError } = useCanvasStore.getState();
+    if (listStatus !== "ready") throw new Error(listError || siteText("canvasLoading"));
     const keyword = String(input.keyword || "").trim().toLowerCase();
-    const filtered = keyword ? projects.filter((project) => project.title.toLowerCase().includes(keyword)) : projects;
+    const filtered = keyword ? summaries.filter((summary) => summary.title.toLowerCase().includes(keyword)) : summaries;
     const { page, pageSize, start, end } = paginate(input, filtered.length, 20);
-    const items = filtered.slice(start, end).map((project) => ({
-        id: project.id,
-        title: project.title,
-        createdAt: project.createdAt,
-        updatedAt: project.updatedAt,
-        nodeCount: project.nodes.length,
-        connectionCount: project.connections.length,
+    const items = filtered.slice(start, end).map((summary) => ({
+        id: summary.id,
+        title: summary.title,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        revision: summary.revision,
+        nodeCount: summary.nodeCount ?? undefined,
+        connectionCount: summary.connectionCount ?? undefined,
     }));
     return { total: filtered.length, page, pageSize, items, hint: siteText("canvasHint") };
+}
+
+function waitForCanvasList() {
+    return new Promise<void>((resolve) => {
+        const unsubscribe = useCanvasStore.subscribe((state) => {
+            if (state.listStatus === "loading") return;
+            unsubscribe();
+            resolve();
+        });
+    });
 }
 
 function getImageConfig() {

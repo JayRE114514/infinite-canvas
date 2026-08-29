@@ -1,6 +1,6 @@
 # 官方插件注册表(集中构建 + 远程发布)
 
-本目录**只放构建脚本**,不放构建产物。官方插件由 CI 构建后发布到孤儿分支 `plugins-dist`,画布经 jsDelivr 从该分支远程拉取并一键安装。第三方插件不进本流程,由用户自行填 JS URL 安装。
+本目录**只放构建脚本**,不放构建产物。由项目所有者维护的插件经 CI 构建后发布到孤儿分支 `plugins-dist`,画布经 jsDelivr 从该受控清单读取。平台不提供普通用户安装任意第三方插件的流程。
 
 ```
 registry/
@@ -24,7 +24,7 @@ registry/
 https://cdn.jsdelivr.net/gh/basketikun/infinite-canvas@plugins-dist/official-plugins.json
 ```
 
-清单里每条的 `entry`(相对文件名)由前端解析成与清单同目录的绝对 URL,再走既有 URL 安装流程。jsDelivr 对分支有缓存(约数小时),需要立即生效可对该分支目录做 purge。
+清单里每条的 `entry`(相对文件名)由前端解析成与清单同目录的绝对 URL。当前底层仍复用旧 URL 加载实现，但普通用户入口必须在发布前禁用或移除，只允许所有者发布清单触发。jsDelivr 对分支有缓存(约数小时),需要立即生效可对该分支目录做 purge。
 
 ## 新增 / 更新官方插件
 

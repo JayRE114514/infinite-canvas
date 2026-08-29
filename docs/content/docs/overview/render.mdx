@@ -5,12 +5,10 @@ description: Deploy Infinite Canvas with Render
 
 # Deploy on Render
 
-[Deploy to Render](https://render.com/deploy?repo=https://github.com/basketikun/infinite-canvas)
+<Callout type="warn">
+Render deployment is not available for the current backend branch.
+</Callout>
 
-1. Select **Deploy to Render**.
-2. Sign in and connect GitHub as prompted.
-3. Confirm the deployment.
+The tracked Render configuration deploys only the static frontend. It does not provide the Fastify API, PostgreSQL migration release step, backend secrets, or the same-origin reverse proxy required for `/api/auth` and `/api/v1`.
 
-When deployment finishes, open the assigned `.onrender.com` domain.
-
-The default configuration uses Render's free Web Service. It sleeps after a period of inactivity and wakes on the next request. Application data is primarily stored in the browser, and prompt repositories are fetched by the frontend. The free tier is suitable for evaluation and demos; use Vercel or configure WebDAV for longer-term use.
+Do not use the existing Deploy to Render link for this branch or treat a static Render service as a production deployment. The later deployment plan will supply the API and reverse-proxy topology.

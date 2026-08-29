@@ -5,29 +5,15 @@ description: 使用 Docker Compose 部署无限画布
 
 # Docker 部署
 
-如果你希望在自己的机器或服务器上运行项目，可以直接使用 Docker Compose。
+<Callout type="warn">
+当前后端分支暂不支持 Docker 部署。仓库已有镜像和 Compose 文件只发布静态前端，不会启动 Fastify API，也没有同源反向代理。
+</Callout>
 
-## 使用发布镜像
+## 当前主应用镜像
 
-```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-docker compose up -d
-```
+请不要使用发布镜像或根目录 Dockerfile 部署本分支。它们缺少 API 进程、PostgreSQL 迁移发布步骤、后端 Secret 和认证/Workspace 接口所需的 `/api` 反向代理，不能作为生产部署。
 
-启动后访问：
-
-```text
-http://localhost:3000
-```
-
-## 本地构建镜像
-
-如果需要基于当前源码构建镜像：
-
-```bash
-docker compose -f docker-compose.local.yml up -d --build
-```
+后续部署计划会拆分或编排 Web/API 进程并定义反向代理。在此之前，请按[快速开始](/zh-CN/docs/overview/quick-start)使用本地开发方式。
 
 ## 文档站镜像
 
@@ -47,13 +33,11 @@ cd docs
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-## 数据说明
-
-当前主应用镜像只启动 Next.js。画布、我的素材、生成记录和 AI API Key 默认保存在浏览器本地；第三方提示词由浏览器前端直连拉取，不需要额外挂载数据目录。
+文档站容器独立于上述暂不可用的主应用部署。
 
 ## 统计分析（可选）
 
-项目**默认不接入任何统计**：不设置下列环境变量时，页面不会加载任何统计脚本，也不会发送任何外部请求。你在自己的部署上想查看流量时，设置对应环境变量即可，无需修改代码或重新构建镜像——镜像启动时会据此生成运行期配置。
+旧的静态前端镜像保留可选统计配置，但该镜像不能运行当前后端分支。项目**默认不接入任何统计**：不设置下列环境变量时，页面不会加载任何统计脚本，也不会发送任何外部请求。
 
 统计按「每家一个独立变量」配置：**填了谁就启用谁，可同时启用多家**（例如 GA4 + 百度一起开）。仅支持 GA4 与百度，两者都只接受 ID，脚本地址由代码固定拼接，不接受任意脚本地址或内联 JS。
 

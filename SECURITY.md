@@ -33,24 +33,23 @@ Please include:
 
 ### Canvas node plugins
 
-The canvas supports third-party node plugins loaded from a remote URL. By
-design, an installed plugin's code runs directly inside the web app with full
-access to the page, including locally stored data such as AI API keys. This is
-an intentional trade-off for extensibility, and the installer shows a warning
-before installing. Therefore:
+The supported platform policy permits only executable plugins maintained,
+reviewed, and published by the project owner. Ordinary users must not be able
+to install JavaScript from an arbitrary URL, upload executable plugin code, or
+inject a Provider Adapter. The development source still contains a legacy URL
+installer; it is an acknowledged pre-release removal task and is not a
+supported trust model.
 
-- Only install plugins from sources you trust.
-- Reports that a *malicious plugin* can access page data or API keys are **out
-  of scope** — that is the documented behavior of the trust model.
-- Reports **in scope** include: the app loading/executing plugin code without
-  the install confirmation, a plugin escaping its declared node type to break
-  core app integrity in ways not implied by "runs in the page", or the plugin
-  source cache being writable by an unrelated origin.
+Reports **in scope** include an ordinary user bypassing the owner-published
+registry or allowlist, substitution of an owner-published plugin artifact, a
+plugin source cache being writable by an unrelated origin, or a shipped plugin
+escaping the platform's documented business permissions. Fork maintainers who
+deliberately change this policy own the security model of their deployment.
 
 Examples of in-scope reports:
 
 - Cross-site scripting or token exfiltration in the web app.
-- Exposure of locally stored API keys or synced canvas data caused by project
+- Exposure of locally stored API keys or cloud Canvas data caused by project
   code.
 - Unsafe file handling, import/export behavior, or WebDAV proxy behavior.
 - Authentication, authorization, or access-control flaws in project-managed
@@ -77,4 +76,3 @@ this community project.
 
 Please allow time for investigation and remediation before publishing details.
 Credit will be given on request unless you prefer to remain anonymous.
-

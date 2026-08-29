@@ -11,6 +11,7 @@ type CanvasUiStore = {
     toggleSelectedProjectId: (id: string, selected: boolean) => void;
     setDeleteProjectIds: (ids: string[]) => void;
     removeSelectedProjectIds: (ids: string[]) => void;
+    clearScopeState: () => void;
 };
 
 export const useCanvasUiStore = create<CanvasUiStore>((set) => ({
@@ -24,4 +25,5 @@ export const useCanvasUiStore = create<CanvasUiStore>((set) => ({
     toggleSelectedProjectId: (id, selected) => set((state) => ({ selectedProjectIds: selected ? [...new Set([...state.selectedProjectIds, id])] : state.selectedProjectIds.filter((item) => item !== id) })),
     setDeleteProjectIds: (deleteProjectIds) => set({ deleteProjectIds }),
     removeSelectedProjectIds: (ids) => set((state) => ({ selectedProjectIds: state.selectedProjectIds.filter((id) => !ids.includes(id)) })),
+    clearScopeState: () => set({ editingProjectId: null, editingProjectTitle: "", selectedProjectIds: [], deleteProjectIds: [] }),
 }));

@@ -4,7 +4,9 @@ import { Button, Dropdown, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { UserStatusActions } from "@/components/layout/user-status-actions";
+import { CanvasSaveStatus } from "@/components/canvas/canvas-save-status";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { CANVAS_TITLE_MAX_LENGTH } from "@/lib/canvas/canvas-snapshot";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { DOCS_URL } from "@/constant/env";
@@ -31,6 +33,7 @@ export function CanvasTopBar({
     agentOpen,
     compactAgentStatus,
     onToggleAgent,
+    onReloadCanvas,
 }: {
     title: string;
     titleDraft: string;
@@ -53,6 +56,7 @@ export function CanvasTopBar({
     agentOpen: boolean;
     compactAgentStatus: { connected: boolean; enabled: boolean; activity: string };
     onToggleAgent: () => void;
+    onReloadCanvas: () => void;
 }) {
     const colorTheme = useThemeStore((state) => state.theme);
     const { t } = useTranslation();
@@ -114,6 +118,7 @@ export function CanvasTopBar({
                         {isTitleEditing ? (
                             <input
                                 autoFocus
+                                maxLength={CANVAS_TITLE_MAX_LENGTH}
                                 value={titleDraft}
                                 onChange={(event) => onTitleDraftChange(event.target.value)}
                                 onBlur={onFinishTitleEditing}
@@ -136,6 +141,7 @@ export function CanvasTopBar({
                         )}
                     </div>
                     <CompactAgentStatus status={compactAgentStatus} onClick={onToggleAgent} />
+                    <CanvasSaveStatus onReloadCanvas={onReloadCanvas} />
                 </div>
 
                 <div className="pointer-events-auto flex items-center gap-1.5">
