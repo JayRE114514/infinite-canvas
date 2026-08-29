@@ -46,7 +46,7 @@ describe("session guard", () => {
 });
 
 describe("email and password registration", () => {
-    it("creates an email/password user through Better Auth", async () => {
+    it("creates a usable account and personal workspace without email verification", async () => {
         const { app, mailer } = await openAuthApp();
 
         const signUp = await app.inject({
@@ -57,76 +57,18 @@ describe("email and password registration", () => {
         });
 
         expect(signUp.statusCode).toBe(200);
-        expect(mailer.messages).toHaveLength(1);
-        expect(mailer.messages[0]?.email).toBe("user@example.com");
-
-        const verificationUrl = new URL(mailer.messages[0]!.verificationUrl);
-        await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
-
-        const signIn = await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-in/email",
-            headers: { origin: APP_ORIGIN },
-            payload: { email: "user@example.com", password: PASSWORD },
-        });
-
-        expect(signIn.statusCode).toBe(200);
-        expect(signIn.headers["set-cookie"]).toBeDefined();
-        expect(String(signIn.headers["set-cookie"])).not.toContain("; Secure");
-    }, 60_000);
-
-    it("refuses sign-in until the address is verified", async () => {
-        const { app, mailer } = await openAuthApp();
-
-        await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-up/email",
-            headers: { origin: APP_ORIGIN },
-            payload: { name: "未验证用户", email: "pending@example.com", password: PASSWORD },
-        });
-
-        expect(mailer.messages).toHaveLength(1);
-
-        const signIn = await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-in/email",
-            headers: { origin: APP_ORIGIN },
-            payload: { email: "pending@example.com", password: PASSWORD },
-        });
-
-        expect(signIn.statusCode).toBe(403);
-        expect(signIn.headers["set-cookie"]).toBeUndefined();
-    }, 60_000);
-
-    it("accepts the session cookie on the protected workspace list", async () => {
-        const { app, mailer } = await openAuthApp();
-
-        await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-up/email",
-            headers: { origin: APP_ORIGIN },
-            payload: { name: "已验证用户", email: "member@example.com", password: PASSWORD },
-        });
-        const verificationUrl = new URL(mailer.messages[0]!.verificationUrl);
-        await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
-
-        const signIn = await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-in/email",
-            headers: { origin: APP_ORIGIN },
-            payload: { email: "member@example.com", password: PASSWORD },
-        });
-        const cookie = cookieHeader(signIn.headers["set-cookie"]);
-
+        expect(mailer.messages).toHaveLength(0);
+        const cookie = cookieHeader(signUp.headers["set-cookie"]);
         expect(cookie).not.toBe("");
 
-        const response = await app.inject({ method: "GET", url: "/api/v1/workspaces", headers: { cookie } });
+        const workspaces = await app.inject({ method: "GET", url: "/api/v1/workspaces", headers: { cookie } });
 
-        expect(response.statusCode).toBe(200);
-        expect(response.json().workspaces).toEqual([
+        expect(workspaces.statusCode).toBe(200);
+        expect(workspaces.json().workspaces).toEqual([
             expect.objectContaining({ type: "personal", role: "owner" }),
         ]);
     }, 60_000);
+
 });
 
 describe("auth route mounting", () => {
@@ -178,28 +120,20 @@ describe("auth route mounting", () => {
     }, 60_000);
 
     it("sets Secure, HttpOnly, SameSite=Lax session cookies in production", async () => {
-        const { app, mailer } = await openAuthApp({ nodeEnv: "production", appOrigin: PRODUCTION_ORIGIN });
+        const { app } = await openAuthApp({ nodeEnv: "production", appOrigin: PRODUCTION_ORIGIN });
 
-        await app.inject({
+        const signUp = await app.inject({
             method: "POST",
             url: "/api/auth/sign-up/email",
             headers: { origin: PRODUCTION_ORIGIN },
             payload: { name: "生产用户", email: "production@example.com", password: PASSWORD },
         });
-        const verificationUrl = new URL(mailer.messages[0]!.verificationUrl);
-        await app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
-        const signIn = await app.inject({
-            method: "POST",
-            url: "/api/auth/sign-in/email",
-            headers: { origin: PRODUCTION_ORIGIN },
-            payload: { email: "production@example.com", password: PASSWORD },
-        });
-        const setCookies = Array.isArray(signIn.headers["set-cookie"])
-            ? signIn.headers["set-cookie"]
-            : [signIn.headers["set-cookie"]].filter((value): value is string => Boolean(value));
+        const setCookies = Array.isArray(signUp.headers["set-cookie"])
+            ? signUp.headers["set-cookie"]
+            : [signUp.headers["set-cookie"]].filter((value): value is string => Boolean(value));
         const sessionCookie = setCookies.find((value) => value.includes("session_token="));
 
-        expect(signIn.statusCode).toBe(200);
+        expect(signUp.statusCode).toBe(200);
         expect(sessionCookie).toContain("Secure");
         expect(sessionCookie).toContain("HttpOnly");
         expect(sessionCookie).toContain("SameSite=Lax");

@@ -28,20 +28,18 @@ export class MemoryMailer implements Mailer {
 
 export type AuthApp = Awaited<ReturnType<typeof buildApp>>;
 export type VerifiedUser = { cookie: string; userId: string };
-export type UnverifiedUser = { userId: string; verificationUrl: string };
 
 export function cookieHeader(setCookie: string | string[] | undefined): string {
     const cookies = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
     return cookies.map((cookie) => cookie.split(";")[0]).join("; ");
 }
 
-/** 只完成注册并返回最新验证链接，供验证回调与失败恢复用例控制提交时点。 */
-export async function registerUserWithoutVerification(
+/** 注册并取得真实 Better Auth 会话；当前策略在注册时直接将账号置为可用。 */
+export async function registerVerifiedUser(
     app: AuthApp,
-    mailer: MemoryMailer,
+    _mailer: MemoryMailer,
     user: { name: string; email: string },
-): Promise<UnverifiedUser> {
-    const before = mailer.messages.length;
+): Promise<VerifiedUser> {
     const signUp = await app.inject({
         method: "POST",
         url: "/api/auth/sign-up/email",
@@ -50,41 +48,10 @@ export async function registerUserWithoutVerification(
     });
 
     expect(signUp.statusCode).toBe(200);
-    expect(mailer.messages).toHaveLength(before + 1);
-    return {
-        userId: signUp.json().user.id as string,
-        verificationUrl: mailer.messages[before]!.verificationUrl,
-    };
-}
-
-/** 通过真实 Better Auth GET 端点消费指定验证链接，并把响应交给故障用例断言。 */
-export function verifyLatestEmail(app: AuthApp, user: UnverifiedUser) {
-    const verificationUrl = new URL(user.verificationUrl);
-    return app.inject({ method: "GET", url: verificationUrl.pathname + verificationUrl.search });
-}
-
-/** 注册、验证并登录真实 Better Auth 用户。 */
-export async function registerVerifiedUser(
-    app: AuthApp,
-    mailer: MemoryMailer,
-    user: { name: string; email: string },
-): Promise<VerifiedUser> {
-    const registered = await registerUserWithoutVerification(app, mailer, user);
-    const verified = await verifyLatestEmail(app, registered);
-    expect(verified.statusCode).toBe(302);
-
-    const signIn = await app.inject({
-        method: "POST",
-        url: "/api/auth/sign-in/email",
-        headers: { origin: APP_ORIGIN },
-        payload: { email: user.email, password: PASSWORD },
-    });
-
-    expect(signIn.statusCode).toBe(200);
-    const cookie = cookieHeader(signIn.headers["set-cookie"]);
+    const cookie = cookieHeader(signUp.headers["set-cookie"]);
     expect(cookie).not.toBe("");
 
-    return { cookie, userId: registered.userId };
+    return { cookie, userId: signUp.json().user.id as string };
 }
 
 /** 每个测试文件独享容器，且无论断言或构造在哪一步失败都回收 app、连接池和容器。 */

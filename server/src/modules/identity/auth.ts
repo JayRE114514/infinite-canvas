@@ -9,7 +9,7 @@ import type { AuthDependencies } from "./types.js";
  * Workspace 的创建、成员与邀请全部由 Workspaces 模块在应用事务中自有，
  * 这里不再挂载 Organization 插件，也没有任何组织业务钩子。
  */
-export function createAuth({ db, config, mailer, onEmailVerified }: AuthDependencies) {
+export function createAuth({ db, config, onEmailVerified }: AuthDependencies) {
     return betterAuth({
         basePath: "/api/auth",
         secret: config.betterAuthSecret,
@@ -18,14 +18,16 @@ export function createAuth({ db, config, mailer, onEmailVerified }: AuthDependen
         advanced: { useSecureCookies: config.nodeEnv === "production" },
         // 表名已通过 modelName 显式指定，usePlural 会再次追加 s，必须保持关闭。
         database: drizzleAdapter(db, { provider: "pg", schema: authSchema, usePlural: false }),
-        emailAndPassword: { enabled: true, requireEmailVerification: true },
-        emailVerification: {
-            sendOnSignUp: true,
-            sendVerificationEmail: async ({ user, url }) => {
-                await mailer.sendVerification(user.email, url);
-            },
-            afterEmailVerification: async (user) => {
-                await onEmailVerified({ id: user.id, name: user.name, email: user.email });
+        emailAndPassword: { enabled: true, requireEmailVerification: false },
+        databaseHooks: {
+            user: {
+                create: {
+                    // 注册即视为账号可用，不发送验证邮件；沿用已验证用户的权限与个人空间不变量。
+                    before: async (user) => ({ data: { ...user, emailVerified: true } }),
+                    after: async (user) => {
+                        await onEmailVerified({ id: user.id, name: user.name, email: user.email });
+                    },
+                },
             },
         },
         user: { modelName: "users" },

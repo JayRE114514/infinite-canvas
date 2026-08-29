@@ -69,7 +69,6 @@ export async function buildApp(options: BuildAppOptions = {}) {
             const auth = createAuth({
                 db: resolved.database.db,
                 config: options.config,
-                mailer,
                 onEmailVerified,
             });
 

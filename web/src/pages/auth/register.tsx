@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Alert, Button, Form, Input } from "antd";
-import { CheckCircle2 } from "lucide-react";
-import { Link, Navigate, useSearchParams } from "react-router-dom";
+import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { AuthPageLoading, AuthPageShell } from "@/pages/auth/auth-page-shell";
@@ -17,10 +16,10 @@ type RegisterValues = {
 export default function RegisterPage() {
     const { t } = useTranslation();
     const [searchParams] = useSearchParams();
+    const navigate = useNavigate();
     const { data: session, isPending } = authClient.useSession();
     const [submitting, setSubmitting] = useState(false);
     const [errorKey, setErrorKey] = useState("");
-    const [verificationEmail, setVerificationEmail] = useState("");
     const returnTo = resolveSafeReturnTo(searchParams.get("returnTo"), window.location.origin);
 
     if (isPending) return <AuthPageLoading />;
@@ -33,31 +32,15 @@ export default function RegisterPage() {
             unwrapAuthResponse(
                 await authClient.signUp.email({
                     ...values,
-                    callbackURL: new URL(returnTo, window.location.origin).toString(),
                     fetchOptions: { credentials: "include" },
                 }),
             );
-            setVerificationEmail(values.email);
+            navigate(returnTo, { replace: true });
         } catch (error) {
             setErrorKey(authErrorTranslationKey(error, "auth.errors.registerFailed"));
         } finally {
             setSubmitting(false);
         }
-    }
-
-    if (verificationEmail) {
-        return (
-            <AuthPageShell eyebrow={t("auth.register.successEyebrow")} title={t("auth.register.successTitle")} description={t("auth.register.successDescription")}>
-                <div className="flex size-11 items-center justify-center rounded-full bg-secondary text-foreground">
-                    <CheckCircle2 className="size-5" aria-hidden />
-                </div>
-                <p className="mt-5 break-all text-sm font-medium text-foreground">{verificationEmail}</p>
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">{t("auth.register.successHint")}</p>
-                <Link className="mt-7 inline-flex h-10 items-center justify-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-85" to={`/login?returnTo=${encodeURIComponent(returnTo)}`}>
-                    {t("auth.register.backToLogin")}
-                </Link>
-            </AuthPageShell>
-        );
     }
 
     return (

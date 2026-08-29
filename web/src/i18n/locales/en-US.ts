@@ -70,15 +70,10 @@ export default {
         register: {
             eyebrow: "Create account",
             title: "Start your creative space",
-            description: "Verify your email after registering and we will prepare your personal Workspace.",
+            description: "Register with an email and password to enter your personal Workspace immediately.",
             submit: "Create account",
             hasAccount: "Already have an account?",
             login: "Back to sign in",
-            successEyebrow: "Verify your email",
-            successTitle: "Verification email sent",
-            successDescription: "Open the secure link in the email to verify your address, then sign in.",
-            successHint: "If it is not in your inbox, check spam or try again later.",
-            backToLogin: "Back to sign in",
         },
         invitation: {
             eyebrow: "Team invitation",
@@ -131,7 +126,7 @@ export default {
         loading: "Loading Workspaces…",
         loadFailed: "Unable to load Workspaces",
         emptyTitle: "No Workspace is available",
-        emptyDescription: "Retry now. Your personal Workspace is created on the first load after email verification.",
+        emptyDescription: "Retry now. Your personal Workspace is created during registration.",
         roles: { owner: "Owner", admin: "Admin", member: "Member" },
         switcher: {
             title: "Workspaces",
@@ -141,7 +136,7 @@ export default {
         },
         create: {
             title: "Create a team Workspace",
-            description: "A team Workspace can include other accounts with verified email addresses.",
+            description: "A team Workspace can include other accounts.",
             name: "Name",
             namePlaceholder: "For example: Visual team",
             nameRequired: "Enter a Workspace name",
@@ -158,7 +153,7 @@ export default {
             personalTitle: "Personal Workspace",
             personalDescription: "A personal Workspace contains only its owner. Create a team Workspace to collaborate.",
             inviteTitle: "Invite a member",
-            inviteDescription: "They must sign in with the verified email that receives this invitation.",
+            inviteDescription: "They must sign in with the email account that receives this invitation.",
             emailPlaceholder: "member@example.com",
             role: "Role",
             invite: "Send invite",

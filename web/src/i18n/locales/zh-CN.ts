@@ -70,15 +70,10 @@ export default {
         register: {
             eyebrow: "创建账号",
             title: "开始你的创作空间",
-            description: "注册后请先验证邮箱，我们会为你准备一个个人 Workspace。",
+            description: "使用邮箱和密码注册后即可直接进入个人 Workspace。",
             submit: "创建账号",
             hasAccount: "已经有账号？",
             login: "返回登录",
-            successEyebrow: "验证邮箱",
-            successTitle: "验证邮件已发送",
-            successDescription: "打开邮件中的安全链接完成邮箱验证，然后即可登录。",
-            successHint: "如果没有看到邮件，请检查垃圾邮件目录或稍后再试。",
-            backToLogin: "返回登录",
         },
         invitation: {
             eyebrow: "团队邀请",
@@ -131,7 +126,7 @@ export default {
         loading: "正在加载 Workspace…",
         loadFailed: "无法加载 Workspace",
         emptyTitle: "暂时没有可用的 Workspace",
-        emptyDescription: "请重试；验证邮箱后的首次加载会自动创建个人 Workspace。",
+        emptyDescription: "请重试；注册成功时会自动创建个人 Workspace。",
         roles: { owner: "所有者", admin: "管理员", member: "成员" },
         switcher: {
             title: "Workspace",
@@ -141,7 +136,7 @@ export default {
         },
         create: {
             title: "创建团队 Workspace",
-            description: "团队 Workspace 可邀请其他已验证邮箱的账号共同使用。",
+            description: "团队 Workspace 可邀请其他账号共同使用。",
             name: "名称",
             namePlaceholder: "例如：视觉团队",
             nameRequired: "请输入 Workspace 名称",
@@ -158,7 +153,7 @@ export default {
             personalTitle: "个人 Workspace",
             personalDescription: "个人 Workspace 只包含所有者。如需协作，请创建团队 Workspace。",
             inviteTitle: "邀请成员",
-            inviteDescription: "对方需要使用收到邀请的已验证邮箱登录并接受邀请。",
+            inviteDescription: "对方需要使用收到邀请的邮箱账号登录并接受邀请。",
             emailPlaceholder: "member@example.com",
             role: "角色",
             invite: "发送邀请",
