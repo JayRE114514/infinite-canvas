@@ -29,6 +29,7 @@ const APPLICATION_TABLES = [
     "admin_operations",
     "global_audit_logs",
     "workspace_provisioning_audits",
+    "assets",
 ] as const;
 const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVILEGES)[number][]>> = {
     users: ["SELECT", "INSERT", "UPDATE", "DELETE"],
@@ -40,6 +41,7 @@ const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVI
     workspace_invitations: ["SELECT", "INSERT"],
     canvases: ["SELECT", "INSERT"],
     workspace_audit_logs: ["INSERT"],
+    assets: ["SELECT", "INSERT"],
 };
 
 const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
@@ -47,6 +49,7 @@ const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> =
     workspace_invitations: ["status"],
     // document_mode/deletion_receipt_id 不在可写列表：前者只在创建时由服务端写入，后者由触发器生成。
     canvases: ["title", "snapshot_json", "revision", "updated_by", "updated_at", "deleted_at"],
+    assets: ["status", "staging_object_key", "byte_size", "etag", "updated_at"],
 };
 
 const API_FUNCTIONS = [

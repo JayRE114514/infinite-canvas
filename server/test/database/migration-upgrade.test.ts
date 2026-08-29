@@ -32,6 +32,7 @@ const PRE_CANVAS_MODE_TAGS = [
     "0004_tenant-rls",
     "0005_workspace-provisioning-audit-fix",
 ];
+const PRE_ASSETS_TAGS = [...PRE_CANVAS_MODE_TAGS, "0006_canvas_document_mode", "0007_admin-purpose-closed-world"];
 
 let postgres: StartedRoleDatabase | undefined;
 const openPools: Pool[] = [];
@@ -208,13 +209,14 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7, snapshot8] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
             readSnapshot("0005"),
             readSnapshot("0006"),
             readSnapshot("0007"),
+            readSnapshot("0008"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -243,6 +245,13 @@ describe("immutable migration history", () => {
                 tag: "0007_admin-purpose-closed-world",
                 breakpoints: true,
             },
+            {
+                idx: 8,
+                version: "7",
+                when: 1788010528238,
+                tag: "0008_assets",
+                breakpoints: true,
+            },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
@@ -250,6 +259,7 @@ describe("immutable migration history", () => {
         expect(snapshot5.prevId).toBe(snapshot4.id);
         expect(snapshot6.prevId).toBe(snapshot5.id);
         expect(snapshot7.prevId).toBe(snapshot6.id);
+        expect(snapshot8.prevId).toBe(snapshot7.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -308,6 +318,32 @@ describe("immutable migration history", () => {
 
         // 0007 只替换 begin_admin_operation 的用途判定，不触碰任何表结构。
         expect(normalize(snapshot7)).toEqual(normalize(snapshot6));
+
+        const assetTable = snapshot8.tables["public.assets"]!;
+        expect(Object.keys(assetTable.columns)).toEqual([
+            "id",
+            "workspace_id",
+            "kind",
+            "status",
+            "file_name",
+            "content_type",
+            "byte_size",
+            "staging_object_key",
+            "final_object_key",
+            "etag",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]);
+        expect(Object.keys(assetTable.checkConstraints)).toEqual(
+            expect.arrayContaining(["assets_kind_check", "assets_status_check", "assets_state_coherent"]),
+        );
+
+        const withoutAssets = ({ id: _id, prevId: _prevId, tables, ...rest }: typeof snapshot8) => ({
+            ...rest,
+            tables: Object.fromEntries(Object.entries(tables).filter(([name]) => name !== "public.assets")),
+        });
+        expect(withoutAssets(snapshot8)).toEqual(normalize(snapshot7));
     });
 });
 
@@ -348,6 +384,32 @@ describe("fresh install as schema_owner", () => {
                 }
             })(),
         ).resolves.toBeUndefined();
+    }, 120_000);
+});
+
+describe("0008 Asset upgrade", () => {
+    it("upgrades a real 0007 schema with a forced-RLS Asset table and explicit API grants", async () => {
+        const admin = openPool(roles().admin);
+        await resetToSchemaOwner(admin);
+        await runMigrationsAsRole(roles().schemaOwner, PRE_ASSETS_TAGS);
+
+        await expect(admin.query("select 1 from public.assets")).rejects.toMatchObject({ code: "42P01" });
+        await runMigrations(roles().schemaOwner);
+
+        const boundary = await admin.query(`
+            select c.relrowsecurity, c.relforcerowsecurity,
+                   has_table_privilege('app_api', c.oid, 'SELECT') as api_select,
+                   has_table_privilege('app_api', c.oid, 'INSERT') as api_insert,
+                   has_table_privilege('app_worker', c.oid, 'SELECT') as worker_select
+            from pg_class c where c.oid = 'public.assets'::regclass
+        `);
+        expect(boundary.rows).toEqual([{
+            relrowsecurity: true,
+            relforcerowsecurity: true,
+            api_select: true,
+            api_insert: true,
+            worker_select: false,
+        }]);
     }, 120_000);
 });
 

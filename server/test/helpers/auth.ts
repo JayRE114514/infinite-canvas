@@ -99,7 +99,7 @@ export function createAuthTestHarness() {
         return postgres;
     }
 
-    function config(overrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}): AppConfig {
+    function config(overrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {}, includeCos = false): AppConfig {
         return loadConfig({
             NODE_ENV: overrides.nodeEnv ?? "test",
             DATABASE_URL_API: roles().api,
@@ -107,6 +107,15 @@ export function createAuthTestHarness() {
             APP_ORIGIN: overrides.appOrigin ?? APP_ORIGIN,
             SMTP_HOST: "localhost",
             SMTP_FROM: "no-reply@example.com",
+            ...(includeCos
+                ? {
+                      COS_SECRET_ID: "test-secret-id",
+                      COS_SECRET_KEY: "test-secret-key",
+                      COS_BUCKET: "test-assets-1250000000",
+                      COS_REGION: "ap-guangzhou",
+                      COS_SIGNED_URL_TTL_SECONDS: "300",
+                  }
+                : {}),
         });
     }
 
@@ -125,7 +134,7 @@ export function createAuthTestHarness() {
 
         async openAuthApp(
             configOverrides: { nodeEnv?: AppConfig["nodeEnv"]; appOrigin?: string } = {},
-            appOverrides: Pick<BuildAppOptions, "logger"> = {},
+            appOverrides: Pick<BuildAppOptions, "logger" | "objectStorage"> = {},
         ) {
             const mailer = new MemoryMailer();
             const current = roles();
@@ -151,7 +160,13 @@ export function createAuthTestHarness() {
             // 测试夹具的播种与提交后断言使用一次性容器管理员，绝不计作 RLS 证据。
             const adminPool = new Pool({ connectionString: current.admin, max: 4 });
             openPools.push(adminPool);
-            const app = await openApp({ logger: appOverrides.logger ?? false, config: config(configOverrides), database, mailer });
+            const app = await openApp({
+                logger: appOverrides.logger ?? false,
+                config: config(configOverrides, Boolean(appOverrides.objectStorage)),
+                database,
+                mailer,
+                objectStorage: appOverrides.objectStorage,
+            });
             return { app, mailer, database, adminPool };
         },
 

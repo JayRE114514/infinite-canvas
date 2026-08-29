@@ -132,4 +132,38 @@ describe("loadConfig", () => {
 
         expect(config.smtp).toMatchObject({ user: "mailer", password: "secret" });
     });
+
+    describe("Tencent COS", () => {
+        const cosEnv = {
+            COS_SECRET_ID: "secret-id",
+            COS_SECRET_KEY: "secret-key",
+            COS_BUCKET: "assets-1250000000",
+            COS_REGION: "ap-guangzhou",
+            COS_SIGNED_URL_TTL_SECONDS: "300",
+        };
+
+        it("accepts an omitted COS block", () => {
+            expect(loadConfig(baseEnv)).not.toHaveProperty("cos");
+        });
+
+        it("parses a complete COS block", () => {
+            expect(loadConfig({ ...baseEnv, ...cosEnv }).cos).toEqual({
+                secretId: "secret-id",
+                secretKey: "secret-key",
+                bucket: "assets-1250000000",
+                region: "ap-guangzhou",
+                signedUrlTtlSeconds: 300,
+            });
+        });
+
+        it.each(Object.keys(cosEnv))("rejects a partial COS block missing %s", (name) => {
+            expect(() => loadConfig({ ...baseEnv, ...cosEnv, [name]: undefined })).toThrow("COS configuration");
+        });
+
+        it.each(["0", "-1", "1.5", "abc", ""])("rejects non-positive integer COS_SIGNED_URL_TTL_SECONDS=%j", (value) => {
+            expect(() => loadConfig({ ...baseEnv, ...cosEnv, COS_SIGNED_URL_TTL_SECONDS: value })).toThrow(
+                "COS_SIGNED_URL_TTL_SECONDS",
+            );
+        });
+    });
 });

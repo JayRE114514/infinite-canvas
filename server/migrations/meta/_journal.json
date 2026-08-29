@@ -57,6 +57,13 @@
       "when": 1787910000000,
       "tag": "0007_admin-purpose-closed-world",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788010528238,
+      "tag": "0008_assets",
+      "breakpoints": true
     }
   ]
 }

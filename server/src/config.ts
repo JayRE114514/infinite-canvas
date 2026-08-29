@@ -5,6 +5,14 @@ export type DatabaseLoginRole = "schema_owner" | "app_api" | "app_worker" | "app
 
 export type DatabaseConfig = { url: string; poolMax: number; expectedRole: DatabaseLoginRole };
 
+export type TencentCosConfig = {
+    secretId: string;
+    secretKey: string;
+    bucket: string;
+    region: string;
+    signedUrlTtlSeconds: number;
+};
+
 export type RuntimeDatabaseUrlName = "DATABASE_URL_API" | "DATABASE_URL_WORKER" | "DATABASE_URL_MAINTENANCE";
 
 export type AppConfig = {
@@ -14,6 +22,7 @@ export type AppConfig = {
     betterAuthSecret: string;
     database: DatabaseConfig;
     smtp: { host: string; port: number; user: string; password: string; from: string };
+    cos?: TencentCosConfig;
 };
 
 const NODE_ENVS: readonly NodeEnv[] = ["development", "test", "production"];
@@ -41,6 +50,37 @@ function integerInRange(name: string, rawValue: string | undefined, fallback: nu
 
 function boundedPool(rawValue: string | undefined): number {
     return integerInRange("DB_POOL_MAX", rawValue, 10, 1, 50);
+}
+
+function loadTencentCosConfig(env: NodeJS.ProcessEnv): TencentCosConfig | undefined {
+    const names = [
+        "COS_SECRET_ID",
+        "COS_SECRET_KEY",
+        "COS_BUCKET",
+        "COS_REGION",
+        "COS_SIGNED_URL_TTL_SECONDS",
+    ] as const;
+    if (!names.some((name) => env[name] !== undefined)) return undefined;
+
+    const values = names.map((name) => env[name]?.trim());
+    const missing = names.filter((_name, index) => !values[index]);
+    if (missing.length > 0) {
+        throw new Error(`COS configuration requires all variables; missing: ${missing.join(", ")}`);
+    }
+
+    const ttlRaw = values[4]!;
+    const signedUrlTtlSeconds = Number(ttlRaw);
+    if (!Number.isInteger(signedUrlTtlSeconds) || signedUrlTtlSeconds <= 0) {
+        throw new Error("COS_SIGNED_URL_TTL_SECONDS must be a positive integer");
+    }
+
+    return {
+        secretId: values[0]!,
+        secretKey: values[1]!,
+        bucket: values[2]!,
+        region: values[3]!,
+        signedUrlTtlSeconds,
+    };
 }
 
 /** 每个进程只解析自己那一份凭据，不接受 URL 列表。 */
@@ -82,6 +122,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         throw new Error(`BETTER_AUTH_SECRET must be at least ${SECRET_MIN_LENGTH} characters`);
     }
 
+    const cos = loadTencentCosConfig(env);
+
     return {
         nodeEnv,
         port: integerInRange("PORT", env.PORT, 4000, 1, 65535),
@@ -95,5 +137,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
             password: env.SMTP_PASSWORD ?? "",
             from: required("SMTP_FROM"),
         },
+        ...(cos ? { cos } : {}),
     };
 }
