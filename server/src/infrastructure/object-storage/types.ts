@@ -20,5 +20,6 @@ export interface ObjectStorage {
         expectedContentType: string;
     }): Promise<StoredObject>;
     createReadUrl(input: { key: string; expiresInSeconds: number }): Promise<string>;
-    putResult(input: { key: string; contentType: string; bytes: Uint8Array }): Promise<StoredObject>;
+    /** Atomically creates one immutable result per owner, or returns the already verified authoritative object. */
+    putResult(input: { key: string; ownerId: string; contentType: string; bytes: Uint8Array }): Promise<StoredObject>;
 }

@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
+
 import COS from "cos-nodejs-sdk-v5";
 import { describe, expect, it } from "vitest";
 
 import { createTencentCosStorage } from "../../src/infrastructure/object-storage/tencent-cos.js";
+import { ObjectStorageVerificationError } from "../../src/infrastructure/object-storage/types.js";
 
 const config = {
     secretId: "secret-id",
@@ -20,6 +23,7 @@ function fakeClient() {
     let signedUrlResult: Partial<COS.GetObjectUrlResult> = { Url: "https://signed.example/object" };
     let signedUrlError: Error | undefined;
     let copyError: Error | undefined;
+    let putError: Error | undefined;
     const client = {
         getObjectUrl(
             input: Record<string, unknown>,
@@ -56,6 +60,7 @@ function fakeClient() {
         },
         async putObject(input: Record<string, unknown>) {
             calls.push({ method: "putObject", input });
+            if (putError) throw putError;
             return {};
         },
     };
@@ -71,6 +76,25 @@ function fakeClient() {
         },
         setCopyError(error: Error) {
             copyError = error;
+        },
+        setPutError(error: Error) {
+            putError = error;
+        },
+    };
+}
+
+function missingObject() {
+    return Object.assign(new Error("not found"), { statusCode: 404, code: "NoSuchKey" });
+}
+
+function resultHead(bytes: Uint8Array, contentType = "video/mp4", ownerId = "generation-1"): COS.HeadObjectResult {
+    return {
+        ETag: "result-etag",
+        headers: {
+            "content-type": contentType,
+            "content-length": String(bytes.byteLength),
+            "x-cos-meta-sha256": createHash("sha256").update(bytes).digest("hex"),
+            "x-cos-meta-result-owner": ownerId,
         },
     };
 }
@@ -195,10 +219,13 @@ describe("Tencent COS storage", () => {
 
     it("verifies putResult and signs fresh reads", async () => {
         const fake = fakeClient();
-        fake.heads.splice(0, 2, { ETag: "result-etag", headers: { "content-type": "video/mp4", "content-length": "3" } });
+        const bytes = new Uint8Array([1, 2, 3]);
+        fake.heads.splice(0, 2, missingObject(), resultHead(bytes));
         const storage = createTencentCosStorage(config, fake.client);
 
-        await expect(storage.putResult({ key: "result", contentType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) })).resolves.toEqual({
+        await expect(
+            storage.putResult({ key: "result", ownerId: "generation-1", contentType: "video/mp4", bytes }),
+        ).resolves.toEqual({
             key: "result",
             contentType: "video/mp4",
             byteSize: 3,
@@ -207,7 +234,92 @@ describe("Tencent COS storage", () => {
         await expect(storage.createReadUrl({ key: "result", expiresInSeconds: 300 })).resolves.toBe(
             "https://signed.example/object",
         );
-        expect(fake.calls[0]).toMatchObject({ method: "putObject", input: { Key: "result", ContentLength: 3, ContentType: "video/mp4" } });
-        expect(fake.calls.at(-1)).toMatchObject({ method: "getObjectUrl", input: { Key: "result", Method: "GET", Expires: 300 } });
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject", "putObject", "headObject", "getObjectUrl"]);
+        expect(fake.calls[1]).toMatchObject({
+            method: "putObject",
+            input: {
+                Key: "result",
+                ContentLength: 3,
+                ContentType: "video/mp4",
+                Headers: {
+                    "If-None-Match": "*",
+                    "x-cos-forbid-overwrite": "true",
+                    "x-cos-meta-sha256": createHash("sha256").update(bytes).digest("hex"),
+                    "x-cos-meta-result-owner": "generation-1",
+                },
+            },
+        });
+        expect(fake.calls.at(-1)).toMatchObject({
+            method: "getObjectUrl",
+            input: { Key: "result", Method: "GET", Expires: 300 },
+        });
+    });
+
+    it("reuses the authoritative object for an identical result replay without another PUT", async () => {
+        const fake = fakeClient();
+        const bytes = new Uint8Array([1, 2, 3]);
+        fake.heads.splice(0, 2, resultHead(bytes));
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.putResult({ key: "result", ownerId: "generation-1", contentType: "video/mp4", bytes }),
+        ).resolves.toMatchObject({
+            key: "result",
+            contentType: "video/mp4",
+            byteSize: 3,
+        });
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject"]);
+    });
+
+    it("keeps the first trustworthy result authoritative when a later download differs", async () => {
+        const fake = fakeClient();
+        const bytes = new Uint8Array([1, 2, 3]);
+        fake.heads.splice(0, 2, resultHead(new Uint8Array([9, 9, 9, 9]), "video/webm"));
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.putResult({ key: "result", ownerId: "generation-1", contentType: "video/mp4", bytes }),
+        ).resolves.toMatchObject({ key: "result", contentType: "video/webm", byteSize: 4 });
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject"]);
+    });
+
+    it.each([
+        [{ "x-cos-meta-sha256": undefined }, "missing digest"],
+        [{ "x-cos-meta-result-owner": "another-generation" }, "wrong owner"],
+        [{ "content-type": "image/png" }, "non-video content"],
+        [{ "x-cos-meta-sha256": "not-a-digest" }, "invalid digest"],
+        [{ "content-length": "-1" }, "invalid byte size"],
+    ])("rejects an existing result with untrusted metadata: %s", async (changes, _label) => {
+        const fake = fakeClient();
+        const bytes = new Uint8Array([1, 2, 3]);
+        const existing = resultHead(bytes);
+        existing.headers = { ...existing.headers, ...changes };
+        fake.heads.splice(0, 2, existing);
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.putResult({ key: "result", ownerId: "generation-1", contentType: "video/mp4", bytes }),
+        ).rejects.toBeInstanceOf(ObjectStorageVerificationError);
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject"]);
+    });
+
+    it.each([
+        [409, "FileAlreadyExists", "official COS create-once conflict"],
+        [412, "PreconditionFailed", "HTTP precondition conflict"],
+        [undefined, undefined, "lost PUT response"],
+    ])("reconciles the authoritative object after %s/%s (%s)", async (statusCode, code, _label) => {
+        const fake = fakeClient();
+        const bytes = new Uint8Array([1, 2, 3]);
+        fake.heads.splice(0, 2, missingObject(), resultHead(bytes));
+        fake.setPutError(Object.assign(new Error("conditional PUT did not return success"), { statusCode, code }));
+        const storage = createTencentCosStorage(config, fake.client);
+
+        await expect(
+            storage.putResult({ key: "result", ownerId: "generation-1", contentType: "video/mp4", bytes }),
+        ).resolves.toMatchObject({
+            key: "result",
+            byteSize: 3,
+        });
+        expect(fake.calls.map((call) => call.method)).toEqual(["headObject", "putObject", "headObject"]);
     });
 });

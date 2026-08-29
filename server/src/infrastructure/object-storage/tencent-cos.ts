@@ -1,9 +1,19 @@
+import { createHash } from "node:crypto";
+
 import COS from "cos-nodejs-sdk-v5";
 
 import type { TencentCosConfig } from "../../config.js";
 import { ObjectStorageVerificationError, type ObjectStorage, type StoredObject } from "./types.js";
 
-type CosObjectMetadata = { contentType: string; byteSize: number; etag?: string };
+type CosObjectMetadata = {
+    contentType: string;
+    byteSize: number;
+    etag?: string;
+    sha256?: string;
+    resultOwner?: string;
+};
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 function header(headers: COS.Headers | undefined, name: string): unknown {
     if (!headers) return undefined;
@@ -18,11 +28,41 @@ function metadata(data: COS.HeadObjectResult): CosObjectMetadata {
     if (typeof contentType !== "string" || !Number.isSafeInteger(byteSize) || byteSize < 0) {
         throw new ObjectStorageVerificationError();
     }
-    return { contentType, byteSize, ...(data.ETag ? { etag: data.ETag } : {}) };
+    const sha256 = header(data.headers, "x-cos-meta-sha256");
+    const resultOwner = header(data.headers, "x-cos-meta-result-owner");
+    return {
+        contentType,
+        byteSize,
+        ...(data.ETag ? { etag: data.ETag } : {}),
+        ...(typeof sha256 === "string" ? { sha256 } : {}),
+        ...(typeof resultOwner === "string" ? { resultOwner } : {}),
+    };
 }
 
-function assertMetadata(actual: CosObjectMetadata, expectedContentType: string, expectedByteSize?: number): void {
-    if (actual.contentType !== expectedContentType || (expectedByteSize !== undefined && actual.byteSize !== expectedByteSize)) {
+function assertMetadata(
+    actual: CosObjectMetadata,
+    expectedContentType: string,
+    expectedByteSize?: number,
+    expectedSha256?: string,
+    expectedOwner?: string,
+): void {
+    if (
+        actual.contentType !== expectedContentType ||
+        (expectedByteSize !== undefined && actual.byteSize !== expectedByteSize) ||
+        (expectedSha256 !== undefined && actual.sha256 !== expectedSha256) ||
+        (expectedOwner !== undefined && actual.resultOwner !== expectedOwner)
+    ) {
+        throw new ObjectStorageVerificationError();
+    }
+}
+
+function assertAuthoritativeResult(actual: CosObjectMetadata, ownerId: string): void {
+    if (
+        !actual.contentType.startsWith("video/") ||
+        !actual.sha256 ||
+        !SHA256_PATTERN.test(actual.sha256) ||
+        actual.resultOwner !== ownerId
+    ) {
         throw new ObjectStorageVerificationError();
     }
 }
@@ -42,6 +82,12 @@ export function createTencentCosStorage(
     client = new COS({ SecretId: config.secretId, SecretKey: config.secretKey }),
 ): ObjectStorage {
     const object = (Key: string) => ({ Bucket: config.bucket, Region: config.region, Key });
+    const storedObject = (key: string, found: CosObjectMetadata): StoredObject => ({
+        key,
+        contentType: found.contentType,
+        byteSize: found.byteSize,
+        ...(found.etag ? { etag: found.etag } : {}),
+    });
     const signedUrl = (
         Key: string,
         Method: "GET" | "PUT",
@@ -68,10 +114,16 @@ export function createTencentCosStorage(
             );
         });
 
-    const verified = async (key: string, expectedContentType: string, expectedByteSize?: number): Promise<StoredObject> => {
+    const verified = async (
+        key: string,
+        expectedContentType: string,
+        expectedByteSize?: number,
+        expectedSha256?: string,
+        expectedOwner?: string,
+    ): Promise<StoredObject> => {
         const found = metadata(await client.headObject(object(key)));
-        assertMetadata(found, expectedContentType, expectedByteSize);
-        return { key, ...found };
+        assertMetadata(found, expectedContentType, expectedByteSize, expectedSha256, expectedOwner);
+        return storedObject(key, found);
     };
     const reconcileFinal = async (
         key: string,
@@ -87,6 +139,16 @@ export function createTencentCosStorage(
     };
     const deleteStaging = async (key: string): Promise<void> => {
         await client.deleteObject(object(key)).catch(() => {});
+    };
+    const reconcileResult = async (key: string, ownerId: string): Promise<StoredObject | undefined> => {
+        try {
+            const found = metadata(await client.headObject(object(key)));
+            assertAuthoritativeResult(found, ownerId);
+            return storedObject(key, found);
+        } catch (error) {
+            if (isNotFound(error)) return undefined;
+            throw error;
+        }
     };
 
     return {
@@ -133,14 +195,30 @@ export function createTencentCosStorage(
             return await signedUrl(key, "GET", expiresInSeconds);
         },
 
-        async putResult({ key, contentType, bytes }) {
-            await client.putObject({
-                ...object(key),
-                Body: Buffer.from(bytes),
-                ContentLength: bytes.byteLength,
-                ContentType: contentType,
-            });
-            return verified(key, contentType, bytes.byteLength);
+        async putResult({ key, ownerId, contentType, bytes }) {
+            const existing = await reconcileResult(key, ownerId);
+            if (existing) return existing;
+
+            const sha256 = createHash("sha256").update(bytes).digest("hex");
+            try {
+                await client.putObject({
+                    ...object(key),
+                    Body: Buffer.from(bytes),
+                    ContentLength: bytes.byteLength,
+                    ContentType: contentType,
+                    Headers: {
+                        "If-None-Match": "*",
+                        "x-cos-forbid-overwrite": "true",
+                        "x-cos-meta-sha256": sha256,
+                        "x-cos-meta-result-owner": ownerId,
+                    },
+                });
+            } catch (error) {
+                const reconciled = await reconcileResult(key, ownerId);
+                if (reconciled) return reconciled;
+                throw error;
+            }
+            return verified(key, contentType, bytes.byteLength, sha256, ownerId);
         },
     };
 }

@@ -12,7 +12,11 @@ import { AppError } from "../../errors.js";
 import { hashCanonicalRequest } from "../../infrastructure/idempotency.js";
 import { withTenantTransaction, withUserTransaction } from "../../infrastructure/database/transactions.js";
 import type { AppDatabase, AppTransaction } from "../../infrastructure/database/types.js";
-import type { ObjectStorage, StoredObject } from "../../infrastructure/object-storage/types.js";
+import {
+    ObjectStorageVerificationError,
+    type ObjectStorage,
+    type StoredObject,
+} from "../../infrastructure/object-storage/types.js";
 import { assets } from "../assets/schema.js";
 import { getReadyAssets, type ReadyAssetObject } from "../assets/service.js";
 import { requireActiveWorkspace } from "../workspaces/authorization.js";
@@ -377,13 +381,30 @@ async function persistPollOutcome(
     });
 }
 
-function storedResultMatches(stored: StoredObject, key: string, contentType: string, byteSize: number): boolean {
+function storedResultMatches(stored: StoredObject, key: string): boolean {
     return (
         stored.key === key &&
-        stored.contentType === contentType &&
-        stored.byteSize === byteSize &&
+        stored.contentType.startsWith("video/") &&
         Number.isSafeInteger(stored.byteSize) &&
         stored.byteSize >= 0
+    );
+}
+
+function persistedResultAssetMatches(
+    row: typeof assets.$inferSelect | undefined,
+    workspaceId: string,
+    stored: StoredObject,
+): boolean {
+    return Boolean(
+        row &&
+        row.workspaceId === workspaceId &&
+        row.kind === "video" &&
+        row.status === "ready" &&
+        row.contentType === stored.contentType &&
+        row.byteSize === stored.byteSize &&
+        row.stagingObjectKey === null &&
+        row.finalObjectKey === stored.key &&
+        row.etag === (stored.etag ?? null),
     );
 }
 
@@ -399,19 +420,30 @@ async function persistSuccessfulResult(
     try {
         return await withTenantTransaction(db, tenant, async (tx, access) => {
             requireActiveWorkspace(access);
-            await tx.insert(assets).values({
-                id: assetId,
-                workspaceId: access.workspaceId,
-                kind: "video",
-                status: "ready",
-                fileName: `artbox-${leased.id}.${contentType === "video/webm" ? "webm" : "mp4"}`,
-                contentType,
-                byteSize: stored.byteSize,
-                stagingObjectKey: null,
-                finalObjectKey,
-                etag: stored.etag ?? null,
-                createdBy: access.userId,
-            });
+            await tx
+                .insert(assets)
+                .values({
+                    id: assetId,
+                    workspaceId: access.workspaceId,
+                    kind: "video",
+                    status: "ready",
+                    fileName: `artbox-${leased.id}.${contentType === "video/webm" ? "webm" : "mp4"}`,
+                    contentType,
+                    byteSize: stored.byteSize,
+                    stagingObjectKey: null,
+                    finalObjectKey,
+                    etag: stored.etag ?? null,
+                    createdBy: access.userId,
+                })
+                .onConflictDoNothing();
+            const [resultAsset] = await tx
+                .select()
+                .from(assets)
+                .where(and(eq(assets.id, assetId), eq(assets.workspaceId, access.workspaceId)))
+                .limit(1);
+            if (!persistedResultAssetMatches(resultAsset, access.workspaceId, stored)) {
+                throw resultError("asset_result_verification_failed", "生成结果存储校验失败", false);
+            }
             const [updated] = await tx
                 .update(artboxVideoGenerations)
                 .set({
@@ -455,14 +487,15 @@ export async function pollArtBoxVideoGeneration(
 
     try {
         const result = await downloadArtBoxResult(outcome.resultUrl, dependencies, dependencies.fetchImpl);
-        const assetId = randomUUID();
-        const finalObjectKey = `assets/final/${assetId}/${randomUUID()}`;
+        const assetId = lease.row.id;
+        const finalObjectKey = `assets/final/${assetId}/artbox-result`;
         const stored = await dependencies.storage.putResult({
             key: finalObjectKey,
+            ownerId: lease.row.id,
             contentType: result.contentType,
             bytes: result.bytes,
         });
-        if (!storedResultMatches(stored, finalObjectKey, result.contentType, result.bytes.byteLength)) {
+        if (!storedResultMatches(stored, finalObjectKey)) {
             throw resultError("asset_result_verification_failed", "生成结果存储校验失败", false);
         }
         return persistSuccessfulResult(
@@ -472,12 +505,14 @@ export async function pollArtBoxVideoGeneration(
             stored,
             assetId,
             finalObjectKey,
-            result.contentType,
+            stored.contentType,
         );
     } catch (error) {
         const failure =
             error instanceof AppError
                 ? { code: error.code, message: error.message, retryable: error.retryable }
+                : error instanceof ObjectStorageVerificationError
+                  ? { code: "asset_result_verification_failed", message: "生成结果存储校验失败", retryable: false }
                 : { code: "asset_result_storage_error", message: "生成结果暂时无法保存", retryable: true };
         return persistPollOutcome(
             db,

@@ -144,6 +144,17 @@ describe("ArtBox configuration", () => {
             "ARTBOX_BASE_URL",
         );
     });
+
+    it("documents the unversioned COS bucket requirement behind atomic result creation", async () => {
+        const deployment = await readFile(
+            new URL("../../../docs/content/docs/development/artbox-cos.zh-CN.mdx", import.meta.url),
+            "utf8",
+        );
+        expect(deployment).toContain("从未开启版本控制");
+        expect(deployment).toContain("x-cos-forbid-overwrite");
+        expect(deployment).toContain("FileAlreadyExists");
+        expect(deployment).toContain("https://cloud.tencent.com/document/product/436/7749");
+    });
 });
 
 describe("ArtBox migration invariants", () => {

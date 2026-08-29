@@ -44,9 +44,10 @@ description: 用服务端 Provider Key、私有 COS 和同源 /api 接入画布�
 ## 2. COS 存储桶与 CORS
 
 1. 将 Bucket 设为私有读写，不要配置公网匿名读。上传、预览和 Provider 读取均依赖短时签名 URL。
-2. 给 API 服务账号授予 `assets/staging/` 和 `assets/final/` 前缀下所需的最小读取、写入、HEAD/校验、复制和删除 staging 权限；不要使用 Bucket 管理员长期 Key。
-3. 在 COS CORS 中分别列出真实 Web origin，例如生产 `https://canvas.example.com` 和本地 `http://localhost:3000`。不要使用 `*`。
-4. 允许 `PUT`、`GET`、`HEAD`，允许请求头 `Content-Type`。当创建 Asset 接口返回其他必需签名请求头时，再精确加入那些头。当前上传使用 `credentials: omit`，无需开放 CORS 凭证。
+2. ArtBox 结果 Bucket 必须从未开启版本控制；不要对已开启或曾暂停版本控制的 Bucket 部署此结果写入路径。服务端依据[腾讯 COS PUT Object 官方说明](https://cloud.tencent.com/document/product/436/7749)，使用 `x-cos-forbid-overwrite: true` 原子创建结果对象：同名对象已存在时 COS 返回 `409 FileAlreadyExists`，服务端只 HEAD 校验并复用首个对象，不会覆盖。`If-None-Match: *` 仅作为额外防护，不是这一不变量的依据。若现有 Bucket 不满足条件，请新建从未启用版本控制的私有 Bucket 并迁移后再启用 ArtBox。
+3. 给 API 服务账号授予 `assets/staging/` 和 `assets/final/` 前缀下所需的最小读取、写入、HEAD/校验、复制和删除 staging 权限；不要使用 Bucket 管理员长期 Key。
+4. 在 COS CORS 中分别列出真实 Web origin，例如生产 `https://canvas.example.com` 和本地 `http://localhost:3000`。不要使用 `*`。
+5. 允许 `PUT`、`GET`、`HEAD`，允许请求头 `Content-Type`。当创建 Asset 接口返回其他必需签名请求头时，再精确加入那些头。当前上传使用 `credentials: omit`，无需开放 CORS 凭证。
 
 `ARTBOX_RESULT_ALLOWED_HOSTS` 填的是 ArtBox 任务完成后返回的视频 URL hostname，不一定是 `ARTBOX_BASE_URL` 的 hostname。先用供应商提供的真实结果确认 CDN hostname，再将其精确加入允许列表。
 

@@ -115,7 +115,7 @@ describe("ArtBox result ingestion boundary", () => {
 
 class FakeStorage implements ObjectStorage {
     readonly readUrls: string[] = [];
-    readonly results: { key: string; contentType: string; bytes: Uint8Array }[] = [];
+    readonly results: { key: string; ownerId: string; contentType: string; bytes: Uint8Array }[] = [];
     beforeNetwork: () => Promise<void> = async () => {};
 
     async createUpload(): Promise<never> {
@@ -130,10 +130,43 @@ class FakeStorage implements ObjectStorage {
         this.readUrls.push(url);
         return url;
     }
-    async putResult(input: { key: string; contentType: string; bytes: Uint8Array }): Promise<StoredObject> {
+    async putResult(input: { key: string; ownerId: string; contentType: string; bytes: Uint8Array }): Promise<StoredObject> {
         await this.beforeNetwork();
         this.results.push(input);
         return { key: input.key, contentType: input.contentType, byteSize: input.bytes.byteLength, etag: "result-etag" };
+    }
+}
+
+class DeferredCreateOnceStorage extends FakeStorage {
+    readonly createdKeys = new Set<string>();
+    private readonly objects = new Map<string, StoredObject>();
+    private firstCreatedResolve: () => void = () => {};
+    private releaseFirstResolve: () => void = () => {};
+    readonly firstCreated = new Promise<void>((resolve) => (this.firstCreatedResolve = resolve));
+    private readonly firstRelease = new Promise<void>((resolve) => (this.releaseFirstResolve = resolve));
+
+    override async putResult(input: {
+        key: string;
+        ownerId: string;
+        contentType: string;
+        bytes: Uint8Array;
+    }): Promise<StoredObject> {
+        this.results.push(input);
+        let stored = this.objects.get(input.key);
+        if (!stored) {
+            stored = { key: input.key, contentType: input.contentType, byteSize: input.bytes.byteLength, etag: "result-etag" };
+            this.objects.set(input.key, stored);
+            this.createdKeys.add(input.key);
+        }
+        if (this.results.length === 1) {
+            this.firstCreatedResolve();
+            await this.firstRelease;
+        }
+        return stored;
+    }
+
+    releaseFirst() {
+        this.releaseFirstResolve();
     }
 }
 
@@ -606,6 +639,79 @@ describe("ArtBox Workspace lifecycle", () => {
         expect(adapter.poll).toHaveBeenCalledTimes(1);
         release();
         await expect(first).resolves.toMatchObject({ status: "queued" });
+    }, 90_000);
+
+    it("reuses one generation-scoped result when the first poll lease expires during COS persistence", async () => {
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-expired-result-lease" }) as const),
+            poll: vi.fn(async () => ({ kind: "succeeded", resultUrl: "https://results.artbox.test/video.mp4" }) as const),
+        };
+        const storage = new DeferredCreateOnceStorage();
+        let downloadCount = 0;
+        const deps = dependencies(adapter, storage, async () => {
+            downloadCount += 1;
+            return downloadCount === 1
+                ? videoResponse([1, 2, 3, 4], { "content-type": "video/webm" })
+                : videoResponse([9, 9, 9]);
+        });
+        const queued = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "expired-result-lease-key",
+            deps,
+        );
+
+        const stalePoll = pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        await storage.firstCreated;
+        await admin.query(
+            `update public.artbox_video_generations
+             set poll_lease_until = now() - interval '1 second', updated_at = now()
+             where id = $1`,
+            [queued.id],
+        );
+
+        let winner: Awaited<ReturnType<typeof pollArtBoxVideoGeneration>>;
+        try {
+            winner = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+        } finally {
+            storage.releaseFirst();
+        }
+        const stale = await stalePoll;
+        const expectedKey = `assets/final/${queued.id}/artbox-result`;
+
+        expect(winner).toMatchObject({ status: "succeeded", resultAssetId: queued.id });
+        expect(stale).toEqual(winner);
+        expect(adapter.poll).toHaveBeenCalledTimes(2);
+        expect(storage.results.map((result) => result.key)).toEqual([expectedKey, expectedKey]);
+        expect(storage.results.map((result) => result.ownerId)).toEqual([queued.id, queued.id]);
+        expect(storage.results.map((result) => [result.contentType, result.bytes.byteLength])).toEqual([
+            ["video/webm", 4],
+            ["video/mp4", 3],
+        ]);
+        expect(storage.createdKeys).toEqual(new Set([expectedKey]));
+        const stored = await admin.query(
+            `select g.status, g.result_asset_id, a.id as asset_id, a.status as asset_status,
+                    a.final_object_key, a.content_type, a.byte_size, a.file_name,
+                    count(*) over ()::int as asset_count
+             from public.artbox_video_generations g
+             join public.assets a on a.id = g.result_asset_id
+             where g.id = $1`,
+            [queued.id],
+        );
+        expect(stored.rows).toEqual([
+            {
+                status: "succeeded",
+                result_asset_id: queued.id,
+                asset_id: queued.id,
+                asset_status: "ready",
+                final_object_key: expectedKey,
+                content_type: "video/webm",
+                byte_size: "4",
+                file_name: `artbox-${queued.id}.webm`,
+                asset_count: 1,
+            },
+        ]);
     }, 90_000);
 
     it("uses the PostgreSQL clock so a skewed application clock cannot steal an active lease", async () => {
