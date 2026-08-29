@@ -10,6 +10,7 @@ import {
     withTenantTransaction,
     withUserTransaction,
     withWorkerTransaction,
+    WORKSPACE_ADMIN_PURPOSES,
 } from "../../src/infrastructure/database/transactions.js";
 import type { DatabaseHandle } from "../../src/infrastructure/database/types.js";
 import { adoptOwnedWorkspaceContext } from "../../src/modules/workspaces/context.js";
@@ -247,6 +248,66 @@ describe("admin operation binding", () => {
                 async () => "unreachable",
             ),
         ).rejects.toMatchObject({ cause: { code: "22023" } });
+    });
+
+    // 闭世界门槛：曾经登记在白名单里、但缺少窄口执行函数 / 审计 CHECK / 审计 RLS 的用途
+    // 必须在 begin 阶段就被拒绝，不能只依赖 TypeScript 类型收窄。
+    it.each([
+        "wallet_adjust",
+        "wallet_status_write",
+        "billing_confirm_charge",
+        "billing_confirm_no_charge",
+        "ledger_compensate",
+        "workspace_export",
+    ])("refuses the unimplemented workspace purpose %s and commits no operation", async (purpose) => {
+        const countOperations = async () =>
+            (
+                await adminPool().query<{ count: number }>(
+                    "select count(*)::int as count from public.admin_operations",
+                )
+            ).rows[0]!.count;
+        const before = await countOperations();
+
+        await expect(
+            withPlatformAdminTransaction(
+                apiHandle().db,
+                {
+                    userId: users.admin,
+                    requestId: randomUUID(),
+                    target: { kind: "workspace", workspaceId: workspaceA },
+                    purpose: purpose as never,
+                },
+                async () => "unreachable",
+            ),
+        ).rejects.toMatchObject({ cause: { code: "22023" } });
+
+        expect(await countOperations()).toBe(before);
+    });
+
+    // 平台级目标当前没有任何四层齐备的用途：global_audit_logs 既无 action CHECK，
+    // 也未启用 RLS，更没有窄口执行函数，因此在数据库边界一律拒绝。
+    it.each(["user_read", "model_read", "model_write", "provider_route_read", "provider_route_write"])(
+        "refuses the platform-target purpose %s at the database boundary",
+        async (purpose) => {
+            await expect(
+                withUserTransaction(apiHandle().db, users.admin, (tx) =>
+                    tx.execute(
+                        sql`select public.begin_admin_operation('platform', null, ${purpose}, ${randomUUID()})`,
+                    ),
+                ),
+            ).rejects.toMatchObject({ cause: { code: "22023" } });
+        },
+    );
+
+    // TypeScript 可执行用途必须与数据库实际审计能力逐项一致，防止两侧再次漂移。
+    it("keeps the TypeScript purpose list equal to the audited database capability", async () => {
+        const constraint = await adminPool().query<{ definition: string }>(
+            `select pg_get_constraintdef(oid) as definition
+             from pg_constraint where conname = 'workspace_audit_logs_action_allowed'`,
+        );
+        const actions = [...constraint.rows[0]!.definition.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
+
+        expect(actions.sort()).toEqual([...WORKSPACE_ADMIN_PURPOSES].sort());
     });
 
     it("makes every audit and operation table append-only at the database boundary", async () => {
@@ -489,18 +550,27 @@ describe("admin operation binding", () => {
 
     it("rejects wrong-purpose, wrong-xid and wrong-user operation execution", async () => {
         const purposeWorkspaceId = await seedWorkspace(users.memberA);
-        await expect(
-            withPlatformAdminTransaction(
-                apiHandle().db,
-                {
-                    userId: users.admin,
-                    requestId: randomUUID(),
-                    target: { kind: "workspace", workspaceId: purposeWorkspaceId },
-                    purpose: "workspace_export",
-                },
-                (tx) => tx.execute(sql`select * from public.execute_workspace_admin_operation()`),
-            ),
-        ).rejects.toMatchObject({ cause: { code: "42501" } });
+        // begin_admin_operation 现在已在白名单层拒绝未实现用途，该状态不再能从应用路径到达。
+        // 这里改为在数据库边界伪造一条同 xid 的未实现用途操作，证明窄口执行函数
+        // 自身仍然独立失败关闭，不依赖 begin 的白名单作为唯一防线。
+        const forged = await seedPool().connect();
+        try {
+            await forged.query("begin");
+            await forged.query("select set_config('app.user_id', $1, true)", [users.admin]);
+            const operation = await forged.query<{ id: string }>(
+                `insert into public.admin_operations
+                    (admin_user_id, target_kind, target_workspace_id, purpose, request_id, transaction_xid)
+                 values ($1, 'workspace', $2, 'workspace_export', $3, pg_current_xact_id()) returning id`,
+                [users.admin, purposeWorkspaceId, randomUUID()],
+            );
+            await forged.query("select set_config('app.admin_operation_id', $1, true)", [operation.rows[0]!.id]);
+            await expect(
+                forged.query("select * from public.execute_workspace_admin_operation()"),
+            ).rejects.toMatchObject({ code: "42501" });
+        } finally {
+            await forged.query("rollback").catch(() => {});
+            forged.release();
+        }
 
         const xidWorkspaceId = await seedWorkspace(users.memberA);
         const oldOperationId = await withPlatformAdminTransaction(

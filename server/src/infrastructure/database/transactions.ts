@@ -11,38 +11,31 @@ import type { AppDatabase, AppTransaction } from "./types.js";
  * 只使用 set_config(..., true)，绝不设置会话级变量，因此连接归还后不残留上下文。
  */
 
-/** Gate 0 固定的管理员用途词表；本 Gate 只实现空间读取与状态流转。 */
-export const PLATFORM_ADMIN_PURPOSES = [
-    "user_read",
-    "model_read",
-    "model_write",
-    "provider_route_read",
-    "provider_route_write",
-] as const;
-
+/**
+ * 管理员用途是闭世界集合：只有同时具备 begin 白名单、独立窄口执行函数、
+ * 审计 action CHECK 与审计 INSERT RLS 四层的用途才允许出现在这里。
+ * 当前只有四个 Workspace 生命周期用途齐备，与 0007 迁移后的
+ * begin_admin_operation 和 execute_workspace_admin_operation() 完全一致。
+ * 积分、账务、导出与全部平台级用途只保留在 ADR-0004 与 roadmap 中作为实现差距，
+ * 未补齐四层前不得在此登记，也不得表现为运行期能力。
+ */
 export const WORKSPACE_ADMIN_PURPOSES = [
     "workspace_read",
     "workspace_suspend",
     "workspace_deactivate",
     "workspace_restore",
-    "wallet_adjust",
-    "wallet_status_write",
-    "billing_confirm_charge",
-    "billing_confirm_no_charge",
-    "ledger_compensate",
-    "workspace_export",
 ] as const;
 
-export type PlatformAdminPurpose = (typeof PLATFORM_ADMIN_PURPOSES)[number];
 export type WorkspaceAdminPurpose = (typeof WORKSPACE_ADMIN_PURPOSES)[number];
 
-export type AdminOperationTarget = { kind: "platform" } | { kind: "workspace"; workspaceId: string };
+/** 平台级目标没有任何可执行用途，因此只能表达 Workspace 目标。 */
+export type AdminOperationTarget = { kind: "workspace"; workspaceId: string };
 
 export type PlatformAdminTransactionInput = {
     userId: string;
     requestId: string;
     target: AdminOperationTarget;
-    purpose: PlatformAdminPurpose | WorkspaceAdminPurpose;
+    purpose: WorkspaceAdminPurpose;
 };
 
 export type WorkerTransactionInput<TResource> = {
@@ -117,7 +110,7 @@ export async function withPlatformAdminTransaction<T>(
     return db.transaction(async (tx) => {
         await setLocal(tx, "app.user_id", input.userId);
 
-        const workspaceId = input.target.kind === "workspace" ? input.target.workspaceId : null;
+        const workspaceId = input.target.workspaceId;
         const result = await tx.execute<{ operation_id: string }>(
             sql`select public.begin_admin_operation(${input.target.kind}, ${workspaceId}, ${input.purpose}, ${input.requestId}) as operation_id`,
         );

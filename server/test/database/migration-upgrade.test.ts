@@ -208,12 +208,13 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
             readSnapshot("0005"),
             readSnapshot("0006"),
+            readSnapshot("0007"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -235,12 +236,20 @@ describe("immutable migration history", () => {
                 tag: "0006_canvas_document_mode",
                 breakpoints: true,
             },
+            {
+                idx: 7,
+                version: "7",
+                when: 1787910000000,
+                tag: "0007_admin-purpose-closed-world",
+                breakpoints: true,
+            },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
         expect(snapshot4.prevId).toBe(snapshot3.id);
         expect(snapshot5.prevId).toBe(snapshot4.id);
         expect(snapshot6.prevId).toBe(snapshot5.id);
+        expect(snapshot7.prevId).toBe(snapshot6.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -296,6 +305,9 @@ describe("immutable migration history", () => {
             tables: Object.fromEntries(Object.entries(tables).filter(([name]) => name !== "public.canvases")),
         });
         expect(withoutCanvases(snapshot6)).toEqual(withoutCanvases(snapshot5));
+
+        // 0007 只替换 begin_admin_operation 的用途判定，不触碰任何表结构。
+        expect(normalize(snapshot7)).toEqual(normalize(snapshot6));
     });
 });
 
@@ -448,10 +460,12 @@ describe("0006 populated Canvas upgrade", () => {
 
         const history = await migrationHistory(admin);
         const entry = (await readJournal()).entries.find((candidate) => candidate.tag === "0006_canvas_document_mode")!;
-        expect(history.at(-1)).toMatchObject({
-            hash: migrationHash(await readMigrationSql(entry.tag)),
-            created_at: String(entry.when),
-        });
+        // 0006 之后还有纯函数迁移，因此按内容定位这一条，不再假设它是历史末尾。
+        expect(history.map((row) => ({ hash: row.hash, created_at: row.created_at }))).toEqual(
+            expect.arrayContaining([
+                { hash: migrationHash(await readMigrationSql(entry.tag)), created_at: String(entry.when) },
+            ]),
+        );
     }, 120_000);
 
     it("rolls the whole migration back on a mid-backfill fault and retries cleanly", async () => {
@@ -518,9 +532,10 @@ describe("0006 populated Canvas upgrade", () => {
                 deletion_receipt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
             },
         ]);
-        expect((await migrationHistory(admin)).at(-1)).toMatchObject({
-            hash: migrationHash(await readMigrationSql("0006_canvas_document_mode")),
-        });
+        // 重试后 0006 必须落库；末尾条目是其后的函数迁移，这里只断言 0006 已应用。
+        expect((await migrationHistory(admin)).map((row) => row.hash)).toContain(
+            migrationHash(await readMigrationSql("0006_canvas_document_mode")),
+        );
     }, 120_000);
 });
 
