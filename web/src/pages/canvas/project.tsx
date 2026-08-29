@@ -8,7 +8,9 @@ import { useTranslation } from "react-i18next";
 import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
-import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { boolConfig, defaultConfig, HOSTED_ARTBOX_VIDEO_MODEL, isHostedArtBoxModel, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { useWorkspaceStore } from "@/stores/use-workspace-store";
+import { applyHostedVideoResult, buildHostedVideoRequest, requestHostedArtBoxVideo } from "@/services/hosted-media";
 import { uploadImage } from "@/services/image-storage";
 import { uploadMediaFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -219,6 +221,7 @@ function InfiniteCanvasPage() {
     });
 
     const config = useConfigStore((state) => state.config);
+    const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId) || "";
     const effectiveConfig = useEffectiveConfig();
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
@@ -419,12 +422,12 @@ function InfiniteCanvasPage() {
         const serverNodes = resetInterruptedGeneration(project.nodes);
         const serverSessions = project.chatSessions || [];
         const [nodes, chatSessions] = await Promise.all([
-            hydrateWithFallback(hydrateCanvasImages(serverNodes), serverNodes),
+            hydrateWithFallback(hydrateCanvasImages(serverNodes, activeWorkspaceId), serverNodes),
             hydrateWithFallback(hydrateAssistantImages(serverSessions), serverSessions),
         ]);
         /** 补水失败或超时用未补水内容继续，绝不永远停在闸门上。 */
         return { ...project, nodes, chatSessions };
-    }, []);
+    }, [activeWorkspaceId]);
 
     const applyProjectToCanvas = useCallback((project: CanvasProject) => {
         historyPausedRef.current = true;
@@ -2263,7 +2266,8 @@ function InfiniteCanvasPage() {
         async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
-            if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+            const isHostedVideo = mode === "video" && isHostedArtBoxModel(generationConfig.model);
+            if (!isHostedVideo && !isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
                 return;
             }
@@ -2307,9 +2311,8 @@ function InfiniteCanvasPage() {
             const runController = startGenerationRequest(nodeId, nodeId, nodeId);
             const sourceTextContent = sourceNode?.type === CanvasNodeType.Text ? sourceNode.metadata?.content?.trim() || "" : "";
             const editingTextNode = mode === "text" && Boolean(sourceTextContent);
-            const generationContext = await hydrateNodeGenerationContext(
-                buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, editingTextNode ? t("canvas.projectPage.editTextPrompt", { source: sourceTextContent, prompt }) : prompt),
-            );
+            const rawGenerationContext = buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, editingTextNode ? t("canvas.projectPage.editTextPrompt", { source: sourceTextContent, prompt }) : prompt);
+            const generationContext = isHostedVideo ? rawGenerationContext : await hydrateNodeGenerationContext(rawGenerationContext);
             const effectivePrompt = generationContext.prompt.trim();
             /** 补水期间可能已经切走或被同节点的新一次生成顶替：归属丢失就地收手，不写节点、也不清别人的运行态。 */
             if (!ownsGeneration(runController)) {
@@ -2490,7 +2493,7 @@ function InfiniteCanvasPage() {
                             vquality: generationConfig.vquality,
                             generateAudio: generationConfig.videoGenerateAudio,
                             watermark: generationConfig.videoWatermark,
-                            references: generationReferenceUrls(generationContext),
+                            ...(isHostedVideo ? { hostedPromptTemplate: generationContext.promptTemplate } : { references: generationReferenceUrls(generationContext) }),
                         },
                     };
                     pendingChildIds = [videoId];
@@ -2502,6 +2505,29 @@ function InfiniteCanvasPage() {
                     if (!isEmptyVideoNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: videoId }]);
                     const controller = startGenerationRequest(videoId, nodeId, nodeId, runController);
                     try {
+                        if (isHostedVideo) {
+                            if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
+                            const request = await buildHostedVideoRequest(
+                                {
+                                    workspaceId: activeWorkspaceId,
+                                    model: HOSTED_ARTBOX_VIDEO_MODEL,
+                                    promptTemplate: generationContext.promptTemplate,
+                                    media: generationContext.hostedMedia,
+                                    seconds: generationConfig.videoSeconds,
+                                    aspectRatio: generationConfig.size,
+                                    resolution: generationConfig.vquality,
+                                    generateAudio: boolConfig(generationConfig.videoGenerateAudio, true),
+                                },
+                                undefined,
+                                (source, assetId) => setOwnedNodes(controller, (prev) => prev.map((node) => (node.id === source.nodeId ? { ...node, metadata: { ...node.metadata, assetId } } : node))),
+                                controller.signal,
+                            );
+                            const result = await requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
+                            setOwnedNodes(controller, (prev) =>
+                                applyHostedVideoResult(prev, videoId, result).map((node) => (node.id === videoId ? { ...node, metadata: { ...node.metadata, prompt: effectivePrompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark, hostedBindings: request.bindings, hostedPromptTemplate: request.promptTemplate } } : node)),
+                            );
+                            return;
+                        }
                         const video = await storeGeneratedVideo(
                             await requestVideoGeneration(generationConfig, effectivePrompt, generationContext.referenceImages, { signal: controller.signal }),
                         );
@@ -2693,7 +2719,7 @@ function InfiniteCanvasPage() {
                 runOwned(runController, () => setRunningNodeId(null));
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, ownsGeneration, runOwned, setOwnedNodes, startGenerationRequest, t],
+        [activeWorkspaceId, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, ownsGeneration, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2715,14 +2741,16 @@ function InfiniteCanvasPage() {
                           count: "1",
                       }
                     : { ...buildGenerationConfig(effectiveConfig, sourceNode, node.type === CanvasNodeType.Text ? "text" : node.type === CanvasNodeType.Video ? "video" : node.type === CanvasNodeType.Audio ? "audio" : "image"), count: "1" };
-            if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+            const isHostedVideo = node.type === CanvasNodeType.Video && isHostedArtBoxModel(generationConfig.model);
+            if (!isHostedVideo && !isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
                 return;
             }
 
             /** 补水与引用解析都在请求登记之前，因此先捕获归属，await 之后据此判断这次重试是否还属于当前画布。 */
             const stillOwned = captureGenerationOwner();
-            const context = hasSavedImageMetadata ? null : await hydrateNodeGenerationContext(buildNodeGenerationContext(sourceNode.id, nodesRef.current, connectionsRef.current, sourceNode.metadata?.prompt || node.metadata?.prompt || ""));
+            const rawContext = hasSavedImageMetadata ? null : buildNodeGenerationContext(sourceNode.id, nodesRef.current, connectionsRef.current, node.metadata?.hostedPromptTemplate || sourceNode.metadata?.prompt || node.metadata?.prompt || "");
+            const context = rawContext && !isHostedVideo ? await hydrateNodeGenerationContext(rawContext) : rawContext;
             if (!stillOwned()) return;
             const prompt = (savedImageMetadata?.prompt || context?.prompt || "").trim();
             if (!prompt) {
@@ -2762,6 +2790,18 @@ function InfiniteCanvasPage() {
                     return;
                 }
                 if (node.type === CanvasNodeType.Video) {
+                    if (isHostedVideo && context) {
+                        if (!activeWorkspaceId) throw new Error("Workspace is unavailable");
+                        const request = await buildHostedVideoRequest(
+                            { workspaceId: activeWorkspaceId, model: HOSTED_ARTBOX_VIDEO_MODEL, promptTemplate: context.promptTemplate, media: context.hostedMedia, seconds: generationConfig.videoSeconds, aspectRatio: generationConfig.size, resolution: generationConfig.vquality, generateAudio: boolConfig(generationConfig.videoGenerateAudio, true) },
+                            undefined,
+                            (source, assetId) => setOwnedNodes(controller, (prev) => prev.map((item) => (item.id === source.nodeId ? { ...item, metadata: { ...item.metadata, assetId } } : item))),
+                            controller.signal,
+                        );
+                        const result = await requestHostedArtBoxVideo(activeWorkspaceId, request, { signal: controller.signal });
+                        setOwnedNodes(controller, (prev) => applyHostedVideoResult(prev, node.id, result).map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, prompt, model: generationConfig.model, size: generationConfig.size, seconds: generationConfig.videoSeconds, vquality: generationConfig.vquality, generateAudio: generationConfig.videoGenerateAudio, watermark: generationConfig.videoWatermark, hostedBindings: request.bindings, hostedPromptTemplate: request.promptTemplate } } : item)));
+                        return;
+                    }
                     const video = await storeGeneratedVideo(await requestVideoGeneration(generationConfig, prompt, retryImages, { signal: controller.signal }));
                     const videoSize = fitNodeSize(video.width || node.width, video.height || node.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
                     setOwnedNodes(controller, (prev) =>
@@ -2852,7 +2892,7 @@ function InfiniteCanvasPage() {
                 runOwned(controller, () => setRunningNodeId(null));
             }
         },
-        [captureGenerationOwner, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runOwned, setOwnedNodes, startGenerationRequest, t],
+        [activeWorkspaceId, captureGenerationOwner, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runOwned, setOwnedNodes, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {

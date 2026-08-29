@@ -1,4 +1,5 @@
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import type { HostedMediaBinding } from "@infinite-canvas/contracts";
 
 export type Position = {
     x: number;
@@ -33,6 +34,7 @@ export type CanvasNodeImage = {
     errorDetails?: string;
     content: string;
     storageKey?: string;
+    assetId?: string;
     naturalWidth: number;
     naturalHeight: number;
     bytes: number;
@@ -79,6 +81,9 @@ export type CanvasNodeMetadata = {
     images?: CanvasNodeImage[];
     primaryImageId?: string;
     storageKey?: string;
+    assetId?: string;
+    hostedBindings?: HostedMediaBinding[];
+    hostedPromptTemplate?: string;
     mimeType?: string;
     bytes?: number;
     durationMs?: number;

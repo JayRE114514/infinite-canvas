@@ -2,6 +2,7 @@ import { defaultConfig, resolveModelForCapability, type AiConfig } from "@/store
 import i18n from "@/i18n";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { resolveMediaUrl } from "@/services/file-storage";
+import { readAsset } from "@/services/api/assets";
 import { imageMetadata, referenceUrl } from "@/lib/canvas/canvas-node-factory";
 import type { NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import type { CanvasNodeGenerationMode } from "@/components/canvas/canvas-node-prompt-panel";
@@ -42,14 +43,28 @@ export async function resolveMetadataReferences(metadata: CanvasNodeMetadata) {
     return references.every(Boolean) ? (references as ReferenceImage[]) : null;
 }
 
-export async function hydrateCanvasImages(nodes: CanvasNodeData[]) {
+export async function hydrateCanvasImages(nodes: CanvasNodeData[], workspaceId = "", read: typeof readAsset = readAsset) {
     return Promise.all(
         nodes.map(async (node) => {
             const metadata = node.metadata;
             const content = metadata?.content;
+            const images = await Promise.all(
+                (metadata?.images || []).map(async (image) => {
+                    if (workspaceId && image.assetId) {
+                        const result = await read(workspaceId, image.assetId);
+                        const { storageKey: _storageKey, ...stable } = image;
+                        return { ...stable, content: result.displayUrl, mimeType: result.asset.contentType, bytes: result.asset.byteSize ?? image.bytes };
+                    }
+                    return image.content ? { ...image, content: await resolveImageUrl(image.storageKey, image.content) } : image;
+                }),
+            );
+            if (workspaceId && metadata?.assetId) {
+                const result = await read(workspaceId, metadata.assetId);
+                const { storageKey: _storageKey, ...stable } = metadata;
+                return { ...node, metadata: { ...stable, content: result.displayUrl, mimeType: result.asset.contentType, bytes: result.asset.byteSize ?? metadata.bytes, images } };
+            }
             if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && metadata?.storageKey) return { ...node, metadata: { ...metadata, content: await resolveMediaUrl(metadata.storageKey, content) } };
             if (node.type !== CanvasNodeType.Image || !metadata || !content) return node;
-            const images = await Promise.all((metadata.images || []).map(async (image) => (image.content ? { ...image, content: await resolveImageUrl(image.storageKey, image.content) } : image)));
             if (metadata.storageKey) return { ...node, metadata: { ...metadata, content: await resolveImageUrl(metadata.storageKey, content), images } };
             if (!content.startsWith("data:image/")) return node;
             return { ...node, metadata: { ...metadata, ...imageMetadata(await uploadImage(content)) } };

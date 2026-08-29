@@ -84,6 +84,50 @@ describe("canonical draft snapshot", () => {
         ]);
     });
 
+    it("deeply strips locations only from Asset-backed media", () => {
+        const node = {
+            id: "n1",
+            type: "image",
+            title: "asset",
+            position: { x: 0, y: 0 },
+            width: 1,
+            height: 1,
+            metadata: {
+                assetId: "10000000-0000-4000-8000-000000000001",
+                content: "https://display/temporary",
+                storageKey: "image:local-copy",
+                mimeType: "image/png",
+                images: [
+                    { id: "nested", assetId: "10000000-0000-4000-8000-000000000002", content: "blob:nested", storageKey: "image:nested", status: "success", naturalWidth: 1, naturalHeight: 1, bytes: 1, mimeType: "image/png" },
+                ],
+            },
+        } as unknown as CanvasNodeData;
+        const local = { ...node, id: "local", metadata: { content: "https://local.example/image.png", storageKey: "image:local", mimeType: "image/png" } } as CanvasNodeData;
+
+        const snapshot = projectToSnapshot({ ...project(node), nodes: [node, local] }) as unknown as { nodes: CanvasNodeData[] };
+        expect(snapshot.nodes[0].metadata).toEqual({
+            assetId: "10000000-0000-4000-8000-000000000001",
+            mimeType: "image/png",
+            images: [{ id: "nested", assetId: "10000000-0000-4000-8000-000000000002", status: "success", naturalWidth: 1, naturalHeight: 1, bytes: 1, mimeType: "image/png" }],
+        });
+        expect(snapshot.nodes[1].metadata).toEqual(local.metadata);
+    });
+
+    it("strips display locations from Asset-backed image, video, and audio nodes", () => {
+        const nodes = (["image", "video", "audio"] as const).map((type, index) => ({
+            id: type,
+            type,
+            title: type,
+            position: { x: 0, y: 0 },
+            width: 1,
+            height: 1,
+            metadata: { assetId: `10000000-0000-4000-8000-00000000000${index + 1}`, content: `https://display/${type}`, storageKey: `${type}:local`, mimeType: `${type}/test` },
+        })) as CanvasNodeData[];
+
+        const snapshot = projectToSnapshot({ ...project(nodes[0]), nodes }) as unknown as { nodes: CanvasNodeData[] };
+        expect(snapshot.nodes.map((node) => node.metadata)).toEqual(nodes.map((node) => ({ assetId: node.metadata?.assetId, mimeType: node.metadata?.mimeType })));
+    });
+
     /**
      * Canonicalization only drops `undefined` own properties. Everything else that is not JSON must
      * still reach the validator and be refused, and a cyclic snapshot must be refused rather than

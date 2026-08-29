@@ -63,6 +63,7 @@ export type WebdavSyncConfig = {
 export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
+export const HOSTED_ARTBOX_VIDEO_MODEL = "Artdance 2 Mini-480p";
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
@@ -158,7 +159,19 @@ function findChannelModel(config: AiConfig, value: string): { channel: ModelChan
 }
 
 export function modelCapabilityOf(config: AiConfig, value: string): ModelCapability | undefined {
+    if (isHostedArtBoxModel(value)) return "video";
     return findChannelModel(config, value)?.model.capability;
+}
+
+export function isHostedArtBoxModel(value: string) {
+    return modelOptionName(value).trim() === HOSTED_ARTBOX_VIDEO_MODEL;
+}
+
+/** Canvas-only virtual channel: the hosted capability has no browser endpoint or credential. */
+export function withHostedArtBoxVideoModel(config: AiConfig): AiConfig {
+    if (config.channels.some((channel) => channel.models.some((model) => model.name === HOSTED_ARTBOX_VIDEO_MODEL))) return config;
+    const channel: ModelChannel = { id: "hosted-artbox", name: "ArtBox", baseUrl: "", apiKey: "", apiFormat: "openai", models: [{ name: HOSTED_ARTBOX_VIDEO_MODEL, capability: "video" }] };
+    return { ...config, channels: [...config.channels, channel], models: [...config.models, encodeChannelModel(channel.id, HOSTED_ARTBOX_VIDEO_MODEL)] };
 }
 
 export function modelMatchesCapability(config: AiConfig, value: string, capability?: ModelCapability) {
