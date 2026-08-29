@@ -29,6 +29,7 @@ export type ArtBoxPollOutcome =
 export type ArtBoxAdapter = {
     create(input: ArtBoxCreateInput): Promise<ArtBoxCreateOutcome>;
     poll(remoteTaskId: string): Promise<ArtBoxPollOutcome>;
+    fetchResultContent?(remoteTaskId: string, signal: AbortSignal): Promise<Response>;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -190,6 +191,15 @@ export function createArtBoxAdapter(config: ArtBoxAdapterConfig, fetchImpl: type
     const authorization = `Bearer ${config.apiKey}`;
 
     return {
+        fetchResultContent(remoteTaskId, signal) {
+            return fetchImpl(`${config.baseUrl}/v1/videos/${encodeURIComponent(remoteTaskId)}/content`, {
+                method: "GET",
+                headers: { Authorization: authorization },
+                redirect: "error",
+                signal,
+            });
+        },
+
         async create(input) {
             if (hasDuplicateNodeIds(input.bindings)) return { kind: "failed", error: errors.duplicateBinding() };
             if (!config.videoModels.includes(input.model)) return { kind: "failed", error: errors.model() };

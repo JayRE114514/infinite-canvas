@@ -287,20 +287,14 @@ async function boundedBody(response: Response, maximum: number): Promise<Uint8Ar
     return bytes;
 }
 
-export async function downloadArtBoxResult(
-    rawUrl: string,
+async function downloadResultResponse(
+    fetchResponse: (signal: AbortSignal) => Promise<Response>,
     config: ArtBoxResultDownloadConfig,
-    fetchImpl: typeof fetch = fetch,
 ): Promise<{ bytes: Uint8Array; contentType: string }> {
-    const url = validateResultUrl(rawUrl, config.resultAllowedHosts);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
     try {
-        const response = await fetchImpl(url.toString(), {
-            method: "GET",
-            redirect: "error",
-            signal: controller.signal,
-        });
+        const response = await fetchResponse(controller.signal);
         if (!response.ok) throw resultError("provider_result_unavailable", "生成结果暂时无法下载", true);
         const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
         if (!contentType?.startsWith("video/")) {
@@ -313,6 +307,18 @@ export async function downloadArtBoxResult(
     } finally {
         clearTimeout(timer);
     }
+}
+
+export async function downloadArtBoxResult(
+    rawUrl: string,
+    config: ArtBoxResultDownloadConfig,
+    fetchImpl: typeof fetch = fetch,
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const url = validateResultUrl(rawUrl, config.resultAllowedHosts);
+    return downloadResultResponse(
+        (signal) => fetchImpl(url.toString(), { method: "GET", redirect: "error", signal }),
+        config,
+    );
 }
 
 async function acquirePollLease(
@@ -481,12 +487,16 @@ export async function pollArtBoxVideoGeneration(
 ): Promise<ArtBoxVideoGeneration> {
     const lease = await acquirePollLease(db, tenant, generationId, dependencies.pollLeaseSeconds);
     if (!lease.row?.remoteTaskId) return lease.generation;
+    const remoteTaskId = lease.row.remoteTaskId;
 
-    const outcome = await dependencies.adapter.poll(lease.row.remoteTaskId);
+    const outcome = await dependencies.adapter.poll(remoteTaskId);
     if (outcome.kind !== "succeeded") return persistPollOutcome(db, tenant, lease.row, outcome);
 
     try {
-        const result = await downloadArtBoxResult(outcome.resultUrl, dependencies, dependencies.fetchImpl);
+        const fetchResultContent = dependencies.adapter.fetchResultContent;
+        const result = fetchResultContent
+            ? await downloadResultResponse((signal) => fetchResultContent(remoteTaskId, signal), dependencies)
+            : await downloadArtBoxResult(outcome.resultUrl, dependencies, dependencies.fetchImpl);
         const assetId = lease.row.id;
         const finalObjectKey = `assets/final/${assetId}/artbox-result`;
         const stored = await dependencies.storage.putResult({

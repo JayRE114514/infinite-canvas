@@ -173,6 +173,24 @@ describe("fixed ArtBox adapter", () => {
         });
     });
 
+    it("fetches New API content through the fixed authenticated HTTPS proxy", async () => {
+        const fetchImpl = vi.fn(async () => new Response(Uint8Array.from([1, 2, 3]), { status: 200 }));
+        const adapter = createArtBoxAdapter(config, fetchImpl);
+        const signal = new AbortController().signal;
+        const result = await adapter.fetchResultContent?.("task/with ? chars", signal);
+
+        expect(result?.status).toBe(200);
+        expect(fetchImpl).toHaveBeenCalledWith(
+            "https://artbox.test/v1/videos/task%2Fwith%20%3F%20chars/content",
+            {
+                method: "GET",
+                headers: { Authorization: "Bearer test-api-key-never-print" },
+                redirect: "error",
+                signal,
+            },
+        );
+    });
+
     it("reports New API content moderation failures clearly", async () => {
         const adapter = createArtBoxAdapter(config, async () =>
             response({

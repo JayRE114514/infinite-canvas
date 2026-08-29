@@ -46,6 +46,18 @@ describe("ArtBox result ingestion boundary", () => {
         );
     });
 
+    it("keeps authenticated Requests out of the generic result downloader", async () => {
+        const fetchImpl = vi.fn(async () => videoResponse([1, 2, 3]));
+        const request = new Request("https://results.artbox.test/v1/videos/remote-task/content", {
+            headers: { Authorization: "Bearer provider-secret" },
+        });
+
+        await expect(
+            downloadArtBoxResult(request as unknown as string, downloadConfig, fetchImpl),
+        ).rejects.toMatchObject({ code: "provider_result_rejected", retryable: false });
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
     it.each([
         "http://results.artbox.test/video.mp4",
         "https://user:pass@results.artbox.test/video.mp4",
@@ -515,6 +527,34 @@ describe("ArtBox Workspace lifecycle", () => {
             byte_size: "3",
         });
         expect(JSON.stringify(stored.rows[0])).not.toContain("token=secret");
+    }, 90_000);
+
+    it("imports a successful New API task through its authenticated HTTPS content proxy", async () => {
+        const fetchResultContent = vi.fn(async () => videoResponse([1, 2, 3]));
+        const adapter: ArtBoxAdapter = {
+            create: vi.fn(async () => ({ kind: "submitted", remoteTaskId: "remote-http-result" }) as const),
+            poll: vi.fn(
+                async () => ({ kind: "succeeded", resultUrl: "http://189.24.102.47/v/opaque" }) as const,
+            ),
+            fetchResultContent,
+        };
+        const storage = new FakeStorage();
+        const genericFetch = vi.fn(async () => videoResponse([9, 9, 9]));
+        const deps = dependencies(adapter, storage, genericFetch);
+        const queued = await createArtBoxVideoGeneration(
+            database.db,
+            { userId, workspaceId },
+            body(),
+            "authenticated-result-key",
+            deps,
+        );
+
+        const succeeded = await pollArtBoxVideoGeneration(database.db, { userId, workspaceId }, queued.id, deps);
+
+        expect(succeeded).toMatchObject({ status: "succeeded", resultAssetId: queued.id, error: null });
+        expect(fetchResultContent).toHaveBeenCalledWith("remote-http-result", expect.any(AbortSignal));
+        expect(genericFetch).not.toHaveBeenCalled();
+        expect(storage.results).toHaveLength(1);
     }, 90_000);
 
     it("keeps a completed task recoverable until its safe result host is configured", async () => {
