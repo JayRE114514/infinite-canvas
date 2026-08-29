@@ -8,11 +8,11 @@ description: 当前项目后续值得处理的事项
 本文档用来记录当前项目后续比较值得处理的事项。
 
 - 完成待测试中仍未覆盖的云画布详细人工验收。Gate 0 后端验证和原生 IndexedDB 事务/CAS 恢复已经在用户批准的 Chrome + Firefox 范围内完成；用户明确豁免 macOS Safari，因此 Safari 保持未验证而不是通过。`web` typecheck 与构建均已通过，`server` 仍有 15 个既有严格 TypeScript 报错（3 个在 `src/error-handler.ts`，12 个在测试与测试辅助代码）。
-- 后端平台建设：按照[后端平台架构](../../../architecture/backend-platform.md)和[路线图](../../../architecture/platform-roadmap.md)继续实现 PostgreSQL 积分钱包与账本、对象存储与素材生命周期、可靠 AI 任务队列和仅由项目所有者维护的 Provider Adapter；Yjs 实时协同目前只有架构设计，尚未开始实现。
+- 后端平台建设：按照[平台 PRD](../../../product/platform-prd.md)、[后端平台架构](../../../architecture/backend-platform.md)、稳定子系统契约和[路线图](../../../architecture/platform-roadmap.md)继续实现 PostgreSQL 积分钱包与账本、对象存储与素材生命周期、可靠 AI 任务队列和仅由项目所有者维护的 Provider Adapter；Yjs 实时协同目前只有架构设计，尚未开始实现。
 - 本地 Agent 接入后续：按[本地 Agent 接入规划](/zh-CN/docs/progress/local-agent-integration-plan)把 Claude Code CLI Adapter 升级为 Claude Agent SDK Adapter，并完善工具队列体验。
 - Agent Skill 后续：补充网络检索安装、Skill 资源文件管理和可控的本地记忆沉淀。
 - 完成画布媒体与“我的素材”的服务端对象存储切换；在此之前，本地媒体键仍会保留，但文件字节不能跨设备携带。
 - 增加孤儿画布媒体和过期本地草稿的分域清理与用量可见性；部分删除或跨设备删除仍可能让浏览器存储持续增长。
 - 本地草稿 GC 只在打开对应画布作用域时运行，并且只回收已同步、未引用且超过六小时的行；从未再次打开的画布草稿会继续占用空间。
 - 决定永久无法使用本地恢复时的产品行为。当前私密浏览或受限存储会让画布进入 `recovery-blocked`，同时暂停云端保存，即使服务端仍可访问。
-- 云画布完整人工验收通过后，再修正 Features 页中已过期的浏览器权威/WebDAV 画布持久化说明；用户确认前不得提前宣传。
+- 发布前禁用或移除所有允许普通用户通过 URL 或上传内容执行任意代码的入口，包括旧节点插件安装器；验收普通用户只能选择由项目所有者发布的插件和 Provider 能力。

@@ -4,4 +4,4 @@
 
 - [ADR-0001：模块化单体与 PostgreSQL 业务权威](./0001-modular-monolith-and-postgresql-authority.md)
 - [ADR-0002：原生 IndexedDB CAS 画布恢复](./0002-native-indexeddb-cas-recovery.md)
-- [ADR-0003：仅允许平台维护的 Provider Adapter](./0003-owner-maintained-provider-adapters.md)
+- [ADR-0003：所有可执行插件仅允许项目所有者维护](./0003-owner-maintained-provider-adapters.md)

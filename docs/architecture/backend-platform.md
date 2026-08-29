@@ -32,7 +32,7 @@ Fastify Worker process
 | 积分 | PostgreSQL 不可变账本 | 预冻结、结算、释放、退款均需事务和幂等键 |
 | AI 任务 | PostgreSQL 任务表与持久化队列 | 写任务、冻结积分和投递意图在同一事务内 |
 | 媒体 | PostgreSQL 元数据 + S3 字节 | 画布和任务只引用 Asset ID，不把大文件写入业务行 |
-| 上游接入 | Provider Adapter | 仅项目所有者提供并随平台发布，用户不能安装任意插件 |
+| 上游接入 | Provider Adapter | 仅项目所有者提供并随平台发布，用户不能安装任意可执行插件 |
 
 ## 模块与进程
 
@@ -80,4 +80,4 @@ API 和 Worker 可以独立扩容、发布和隔离故障，但共享：
 - 尚未实现：PostgreSQL 积分钱包与账本、对象存储 Asset 生命周期、完整 AI 任务执行链、Provider Adapter 平台、Yjs 实时协作、生产容量与故障演练。
 - 当前 Web 端部分画布媒体和“我的素材”仍主要保存在浏览器；AI API Key 仍保存在浏览器并由前端直连上游，不能把目标架构误写成已上线能力。
 
-相关决策见 `docs/adr/`，交付顺序见 [平台路线图](./platform-roadmap.md)，验证证据见文档站的 Gate 0 记录。
+产品边界见[平台 PRD](../product/platform-prd.md)，稳定子系统契约与[需求追踪表](./requirements-traceability.md)位于本目录。相关决策见 `docs/adr/`，交付顺序见[平台路线图](./platform-roadmap.md)，验证证据见文档站的 Gate 0 记录。

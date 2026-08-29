@@ -1,22 +1,22 @@
 ---
 title: 画布数据结构
-description: 画布本地存储、节点结构、媒体文件与清理机制
+description: 云端快照、本地恢复、节点结构、媒体文件与清理机制
 ---
 
 # 画布数据结构
 
-本文档说明当前画布在前端本地保存的数据结构、图片文件的存储和清理方式。
+本文档说明当前云端 Canvas 快照、本地恢复草稿、浏览器媒体文件与清理边界。
 
 ## 当前存储位置
 
-当前画布项目主要保存在浏览器本地：
+登录后的 Canvas 列表、标题、快照和 revision 通过 Workspace Canvas API 保存，并由 PostgreSQL 权威管理。浏览器中保留两个彼此独立的本地域：
 
-- 画布项目 JSON：`localForage`，数据库名 `infinite-canvas`，storeName `app_state`，key 为 `infinite-canvas:canvas_store`。
-- 我的素材 JSON：`localForage`，数据库名 `infinite-canvas`，storeName `app_state`，key 为 `infinite-canvas:asset_store`。
+- 未同步恢复草稿：独立原生 IndexedDB `infinite-canvas-recovery` 版本 1，固定包含 `drafts`、`epochs`、`markers`；它不是 Canvas 业务权威。
+- 我的素材 JSON：`localForage` 数据库 `infinite-canvas` 的 `app_state`，key 为 `infinite-canvas:asset_store`。
 - 图片 Blob：单独存到 `localForage` 实例，数据库名 `infinite-canvas`，storeName `image_files`。
 - 视频等媒体 Blob：单独存到 `localForage` 实例，数据库名 `infinite-canvas`，storeName `media_files`。
 
-画布 JSON 不直接长期保存大体积 base64 图片或视频。图片节点、视频节点、助手图片和素材媒体只保存展示 URL、`storageKey` 和元信息，真实 Blob 通过 `storageKey` 读取。
+云端快照不保存会话级 `blob:` URL 或大体积 base64。Asset 切换完成前，图片节点、视频节点、助手图片和素材媒体可保留稳定 `storageKey` 与元信息，真实 Blob 仍通过本机 `storageKey` 读取，因此其他设备可能暂时缺少媒体字节。
 
 ## 画布项目结构
 
@@ -39,7 +39,7 @@ type CanvasProject = {
 
 字段说明：
 
-- `id`：画布项目 ID，当前前端生成。
+- `id`：由服务端生成的 Canvas UUID。
 - `title`：画布名称。
 - `createdAt` / `updatedAt`：ISO 字符串。
 - `nodes`：画布节点列表。
@@ -47,7 +47,7 @@ type CanvasProject = {
 - `chatSessions`：右侧画布助手会话。
 - `activeChatId`：当前选中的助手会话 ID。
 - `backgroundMode`：画布背景模式。
-- `viewport`：视口变换，`x/y` 是屏幕平移，`k` 是缩放比例。
+- `viewport`：内存渲染投影。实际平移与缩放只持久化到恢复信封的 `localUi.viewport`，不会推进云端 revision。
 
 ## 节点结构
 

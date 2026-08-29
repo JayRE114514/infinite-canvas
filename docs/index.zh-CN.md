@@ -19,8 +19,14 @@
 - [Agent 开发流程](./matt-pocock-skills.md)
 - [画布数据结构](/zh-CN/docs/development/canvas-data-structure)
 - [领域上下文](../CONTEXT.md)
+- [平台 PRD](./product/platform-prd.md)
 - [后端平台架构](./architecture/backend-platform.md)
 - [后端平台路线图](./architecture/platform-roadmap.md)
+- [需求追踪表](./architecture/requirements-traceability.md)
+- [原生 Canvas 恢复契约](./architecture/native-canvas-recovery.md)
+- [Asset 生命周期契约](./architecture/assets.md)
+- [积分账本契约](./architecture/credits-ledger.md)
+- [AI Task 与 Provider 契约](./architecture/ai-task-provider.md)
 - [架构决策记录](./adr/README.md)
 
 ## 商务合作
@@ -43,7 +49,7 @@
 
 ## 说明
 
-- 当前画布项目和“我的素材”主要保存在浏览器本地，跨设备可自行配置 WebDAV 同步。
+- 登录后的 Canvas 快照与 revision 由服务端权威保存；原生 IndexedDB 只保存本地恢复草稿和 UI 状态，媒体字节与“我的素材”在 Asset 切换前仍保存在浏览器。
 - AI API Key 保存在浏览器本地，并由前端直接请求 OpenAI 兼容接口。
 
 ## 原理说明
