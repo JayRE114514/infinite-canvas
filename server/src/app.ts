@@ -10,6 +10,12 @@ import { checkDatabaseReady, registerDatabase } from "./infrastructure/database/
 import type { DatabaseHandle } from "./infrastructure/database/types.js";
 import { createSmtpMailer, type Mailer } from "./infrastructure/email/mailer.js";
 import { registerCanvasRoutes } from "./modules/canvases/routes.js";
+import { registerAiTaskRoutes } from "./modules/ai-tasks/routes.js";
+import type { AiTaskModule } from "./modules/ai-tasks/service.js";
+import type { TaskEventNotifier } from "./modules/ai-tasks/events.js";
+import { registerAssetRoutes } from "./modules/assets/routes.js";
+import type { AssetModule } from "./modules/assets/service.js";
+import { registerCreditRoutes } from "./modules/credits/routes.js";
 import { createAuth } from "./modules/identity/auth.js";
 import { registerAuthRoutes } from "./modules/identity/routes.js";
 import { registerPlatformAdminRoutes } from "./modules/platform-admin/routes.js";
@@ -25,6 +31,10 @@ export type BuildAppOptions = Pick<FastifyServerOptions, "logger"> & {
     database?: DatabaseHandle;
     /** 由测试注入的内存邮件发送器；省略且有 config 时使用 SMTP 实现。 */
     mailer?: Mailer;
+    /** 启用平台 AI capability 时显式注入；省略表示该进程不暴露托管 AI Task 路由。 */
+    aiTaskModule?: AiTaskModule;
+    assetModule?: AssetModule;
+    taskEventNotifier?: TaskEventNotifier;
 };
 
 /** 仅 development 放行 Vite origin，其余环境（含未设置）一律禁用跨域。 */
@@ -77,6 +87,9 @@ export async function buildApp(options: BuildAppOptions = {}) {
             await registerAuthRoutes(app, auth);
             registerWorkspaceRoutes(app, mailer);
             registerCanvasRoutes(app);
+            registerCreditRoutes(app);
+            if (options.aiTaskModule) registerAiTaskRoutes(app, options.aiTaskModule, options.taskEventNotifier);
+            if (options.assetModule) registerAssetRoutes(app, options.assetModule);
             registerPlatformAdminRoutes(app);
         }
 

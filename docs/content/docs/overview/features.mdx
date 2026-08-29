@@ -32,6 +32,8 @@ description: Major features available in the current project
 - Configure multiple channels, fetch or enter model names, and choose default text, image, and video models.
 - Support image count, aspect ratio, quality, transparent backgrounds, reasoning effort, and custom invocation scripts.
 - Support OpenAI-style video endpoints.
+- Generate images from an authenticated Workspace with platform credits through persistent AI Tasks, server-side Billing Orders and Credit Holds, an owner-maintained Provider Adapter, and S3-backed ready Assets.
+- Follow platform generation progress through replayable SSE events and load completed media only from the same-origin Asset content route; platform Provider credentials remain Worker-only.
 
 ## Canvas Agent
 
@@ -63,7 +65,7 @@ See [Third-party Prompt Sources](/docs/overview/third-party-prompt-repositories)
 
 ## Current limitations
 
-- Authenticated Canvas metadata is cloud-backed, but media bytes and My Assets remain browser-local until the server-side Asset lifecycle is complete.
-- API keys remain in browser storage and requests are sent directly to configured providers.
+- Authenticated Canvas metadata is cloud-backed, and platform-credit AI Task output uses server-side Assets; other Canvas media bytes and My Assets remain browser-local until their separate Asset cutover is complete.
+- Personal/local channel API keys remain in browser storage and those requests are sent directly to configured providers; platform-credit image Provider credentials are configured only for the Worker.
 - The legacy arbitrary-URL node-plugin installer is not part of the approved product policy and remains a release-blocking removal task.
 - Production Docker static-resource paths still require broader deployment verification.

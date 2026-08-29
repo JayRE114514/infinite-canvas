@@ -24,6 +24,7 @@ export const WORKSPACE_ADMIN_PURPOSES = [
     "workspace_suspend",
     "workspace_deactivate",
     "workspace_restore",
+    "wallet_adjust",
 ] as const;
 
 export type WorkspaceAdminPurpose = (typeof WORKSPACE_ADMIN_PURPOSES)[number];

@@ -22,6 +22,11 @@ const MODULE_PUBLIC_ENTRIES: Record<string, readonly string[]> = {
     workspaces: ["schema", "service", "authorization", "context", "routes"],
     canvases: ["schema", "service", "routes"],
     "platform-admin": ["schema", "service", "routes"],
+    credits: ["amount", "schema", "service", "routes"],
+    billing: ["schema", "service"],
+    assets: ["schema", "service", "object-store", "routes"],
+    providers: ["adapter", "registry", "test-adapter", "openai-images", "gemini-images"],
+    "ai-tasks": ["schema", "service", "routes", "queue", "worker", "events"],
 };
 
 async function collectSourceFiles(root: string): Promise<string[]> {

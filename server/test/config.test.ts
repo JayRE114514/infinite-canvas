@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { loadConfig } from "../src/config.js";
+import { loadConfig, loadWorkerAiConfig } from "../src/config.js";
 
 const baseEnv: NodeJS.ProcessEnv = {
     NODE_ENV: "test",
@@ -9,6 +9,27 @@ const baseEnv: NodeJS.ProcessEnv = {
     APP_ORIGIN: "http://localhost:3000",
     SMTP_HOST: "localhost",
     SMTP_FROM: "no-reply@example.com",
+};
+
+const platformImageEnv: NodeJS.ProcessEnv = {
+    PLATFORM_IMAGE_ENABLED: "true",
+    PLATFORM_IMAGE_CAPABILITY_ID: "image.generate",
+    PLATFORM_IMAGE_ROUTE_ID: "owner-openai-images",
+    PLATFORM_IMAGE_ADAPTER_ID: "owner-openai-images",
+    PLATFORM_IMAGE_ADAPTER_VERSION: "test-v1",
+    PLATFORM_IMAGE_EXACT_MODEL_ID: "owner-image-model",
+    PLATFORM_IMAGE_PRICE_VERSION: "test-price-v1",
+    PLATFORM_IMAGE_ESTIMATED_CREDITS: "25",
+    PLATFORM_IMAGE_FIXED_CREDITS: "25",
+    PLATFORM_IMAGE_PROVIDER_BASE_URL: "https://provider.example/v1",
+    PLATFORM_IMAGE_PROVIDER_API_KEY: "test-provider-key",
+    S3_ENDPOINT: "https://objects.example",
+    S3_REGION: "test-region",
+    S3_BUCKET: "test-bucket",
+    S3_ACCESS_KEY_ID: "test-access-key",
+    S3_SECRET_ACCESS_KEY: "test-secret-key",
+    S3_REQUEST_TIMEOUT_MS: "1000",
+    S3_MAX_ATTEMPTS: "1",
 };
 
 describe("loadConfig", () => {
@@ -131,5 +152,48 @@ describe("loadConfig", () => {
         const config = loadConfig({ ...baseEnv, SMTP_USER: "mailer", SMTP_PASSWORD: "secret" });
 
         expect(config.smtp).toMatchObject({ user: "mailer", password: "secret" });
+    });
+
+    it("requires explicit shared S3 behavior before enabling API Asset content", () => {
+        const config = loadConfig({ ...baseEnv, ...platformImageEnv });
+        expect(config.platformImage?.s3).toMatchObject({ requestTimeoutMs: 1000, maxAttempts: 1 });
+        expect(loadConfig({
+            ...baseEnv,
+            ...platformImageEnv,
+            PLATFORM_IMAGE_PROVIDER_BASE_URL: undefined,
+            PLATFORM_IMAGE_PROVIDER_API_KEY: undefined,
+        }).platformImage).toBeDefined();
+        expect(() => loadConfig({ ...baseEnv, ...platformImageEnv, S3_REQUEST_TIMEOUT_MS: undefined })).toThrow(
+            "S3_REQUEST_TIMEOUT_MS",
+        );
+    });
+
+    it("validates Worker-only values separately without leaking configured secrets", () => {
+        const workerEnv = {
+            ...platformImageEnv,
+            AI_WORKER_LEASE_DURATION_MS: "5000",
+            AI_WORKER_HEARTBEAT_INTERVAL_MS: "1000",
+            AI_PROVIDER_HTTP_TIMEOUT_MS: "2000",
+            AI_PROVIDER_SAFE_RETRY_BUDGET: "0",
+            PG_BOSS_QUEUE_CONCURRENCY: "1",
+            PG_BOSS_JOB_RETRY_COUNT: "0",
+        };
+        expect(loadWorkerAiConfig(workerEnv)).toMatchObject({
+            leaseDurationMs: 5000,
+            heartbeatIntervalMs: 1000,
+            safeRetryBudget: 0,
+            queueConcurrency: 1,
+            jobRetryCount: 0,
+        });
+        expect(() => loadWorkerAiConfig({ ...workerEnv, AI_WORKER_HEARTBEAT_INTERVAL_MS: "5000" })).toThrow(
+            "AI_WORKER_HEARTBEAT_INTERVAL_MS",
+        );
+        try {
+            loadWorkerAiConfig({ ...workerEnv, S3_MAX_ATTEMPTS: undefined });
+        } catch (error) {
+            expect(String(error)).toBe("Error: Missing required environment variable: S3_MAX_ATTEMPTS");
+            expect(String(error)).not.toContain("test-provider-key");
+            expect(String(error)).not.toContain("objects.example");
+        }
     });
 });

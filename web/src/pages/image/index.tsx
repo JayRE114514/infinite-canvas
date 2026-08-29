@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
+import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, CircleDollarSign, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Tag, Tooltip, Typography } from "antd";
 import localforage from "localforage";
@@ -16,9 +16,12 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { requestEdit, requestGeneration } from "@/services/api/image";
+import { createPlatformImageTask, getPlatformAiTask, getWorkspaceCreditBalance, readyAssetContentUrl, watchPlatformAiTask } from "@/services/api/ai-tasks";
 import { deleteStoredImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
+import { useWorkspaceStore } from "@/stores/use-workspace-store";
+import type { AiTask, CreditBalance } from "@infinite-canvas/contracts";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
 
@@ -95,6 +98,12 @@ export default function ImagePage() {
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
     const [isReferenceDragActive, setIsReferenceDragActive] = useState(false);
     const [autoRunToken, setAutoRunToken] = useState(0);
+    const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
+    const [platformTask, setPlatformTask] = useState<AiTask | null>(null);
+    const [platformBalance, setPlatformBalance] = useState<CreditBalance | null>(null);
+    const [platformRunning, setPlatformRunning] = useState(false);
+    const platformWatchRef = useRef<(() => void) | null>(null);
+    const platformOperationRef = useRef<{ workspaceId: string; prompt: string; key: string } | null>(null);
     const imageCommand = useWorkbenchAgentStore((state) => state.imageCommand);
     const clearImageCommand = useWorkbenchAgentStore((state) => state.clearImageCommand);
     const updateAgentTask = useWorkbenchAgentStore((state) => state.updateTask);
@@ -114,6 +123,46 @@ export default function ImagePage() {
     useEffect(() => {
         void refreshLogs();
     }, []);
+
+    useEffect(() => () => platformWatchRef.current?.(), []);
+
+    const refreshPlatformTask = async (workspaceId: string, taskId: string) => {
+        const [task, balance] = await Promise.all([
+            getPlatformAiTask(workspaceId, taskId),
+            getWorkspaceCreditBalance(workspaceId),
+        ]);
+        setPlatformTask(task);
+        setPlatformBalance(balance);
+        if (["succeeded", "failed", "reconciling"].includes(task.status)) {
+            setPlatformRunning(false);
+            platformWatchRef.current?.();
+            platformWatchRef.current = null;
+        }
+    };
+
+    const generateWithPlatformCredits = async () => {
+        const text = prompt.trim();
+        if (!text) return message.error("请输入图片描述");
+        if (!activeWorkspaceId) return message.error("请先选择工作空间");
+        setPlatformRunning(true);
+        try {
+            const operation = platformOperationRef.current;
+            const idempotencyKey = operation?.workspaceId === activeWorkspaceId && operation.prompt === text
+                ? operation.key
+                : crypto.randomUUID();
+            platformOperationRef.current = { workspaceId: activeWorkspaceId, prompt: text, key: idempotencyKey };
+            const created = await createPlatformImageTask(activeWorkspaceId, text, idempotencyKey);
+            platformOperationRef.current = null;
+            await refreshPlatformTask(activeWorkspaceId, created.taskId);
+            platformWatchRef.current?.();
+            platformWatchRef.current = watchPlatformAiTask(activeWorkspaceId, created.taskId, () => {
+                void refreshPlatformTask(activeWorkspaceId, created.taskId);
+            });
+        } catch (error) {
+            setPlatformRunning(false);
+            message.error(error instanceof Error ? error.message : "平台任务提交失败");
+        }
+    };
 
     const addReferences = async (files?: FileList | null) => {
         const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
@@ -483,9 +532,12 @@ export default function ImagePage() {
                             </div>
                         </div>
 
-                        <div className="mt-auto pt-6">
+                        <div className="mt-auto grid gap-2 pt-6">
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 {t("workbench.generate")}
+                            </Button>
+                            <Button size="large" block icon={<CircleDollarSign className="size-4" />} loading={platformRunning} disabled={!canGenerate || platformRunning} onClick={() => void generateWithPlatformCredits()}>
+                                平台积分生成
                             </Button>
                         </div>
                     </div>
@@ -497,6 +549,26 @@ export default function ImagePage() {
                             </div>
                             {running ? <Tag className="m-0 px-2 py-1">{t("workbench.waiting", { time: formatDuration(elapsedMs) })}</Tag> : null}
                         </div>
+                        {platformTask ? (
+                            <div className="mb-4 grid gap-3 rounded-lg border border-stone-200 bg-stone-50/60 p-3 dark:border-stone-800 dark:bg-stone-900/40 sm:grid-cols-[minmax(0,1fr)_auto]">
+                                <div className="min-w-0">
+                                    <div className="flex items-center gap-2 text-sm font-medium">
+                                        <CircleDollarSign className="size-4" />
+                                        <span>平台任务</span>
+                                        <Tag className="m-0">{platformTask.status}</Tag>
+                                    </div>
+                                    <div className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+                                        预计 {platformTask.estimatedCredits} 积分
+                                        {platformTask.actualCredits ? ` · 实际 ${platformTask.actualCredits} 积分` : ""}
+                                        {platformBalance ? ` · 可用余额 ${platformBalance.available}` : ""}
+                                    </div>
+                                    {platformTask.publicErrorCode ? <div className="mt-2 text-xs text-red-600 dark:text-red-300">{platformTask.publicErrorCode}</div> : null}
+                                </div>
+                                {platformTask.status === "succeeded" && platformTask.resultAssetId && activeWorkspaceId ? (
+                                    <Image width={80} height={80} className="rounded-md object-cover" src={readyAssetContentUrl(platformTask.resultAssetId)} alt="平台生成结果" />
+                                ) : null}
+                            </div>
+                        ) : null}
                         {results.length ? (
                             <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
                                 {results.map((result, index) =>

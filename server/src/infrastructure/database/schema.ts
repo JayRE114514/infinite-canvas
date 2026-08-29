@@ -4,3 +4,7 @@ export * from "../../modules/identity/schema.js";
 export * from "../../modules/workspaces/schema.js";
 export * from "../../modules/platform-admin/schema.js";
 export * from "../../modules/canvases/schema.js";
+export * from "../../modules/credits/schema.js";
+export * from "../../modules/billing/schema.js";
+export * from "../../modules/assets/schema.js";
+export * from "../../modules/ai-tasks/schema.js";
