@@ -7,7 +7,7 @@ description: 当前项目后续值得处理的事项
 
 本文档用来记录当前项目后续比较值得处理的事项。
 
-- 完成待测试中仍未覆盖的云画布详细人工验收。Gate 0 后端验证和原生 IndexedDB 事务/CAS 恢复已经在用户批准的 Chrome + Firefox 范围内完成；用户明确豁免 macOS Safari，因此 Safari 保持未验证而不是通过。`web` typecheck 与构建均已通过，`server` 仍有 15 个既有严格 TypeScript 报错（3 个在 `src/error-handler.ts`，12 个在测试与测试辅助代码）。
+- 完成待测试中仍未覆盖的云画布详细人工验收。Gate 0 后端验证和原生 IndexedDB 事务/CAS 恢复已经在用户批准的 Chrome + Firefox 范围内完成；用户明确豁免 macOS Safari，因此 Safari 保持未验证而不是通过。
 - 后端平台建设：按照[平台 PRD](../../../product/platform-prd.md)、[后端平台架构](../../../architecture/backend-platform.md)、稳定子系统契约和[路线图](../../../architecture/platform-roadmap.md)继续实现 PostgreSQL 积分钱包与账本、对象存储与素材生命周期、可靠 AI 任务队列和仅由项目所有者维护的 Provider Adapter；Yjs 实时协同目前只有架构设计，尚未开始实现。
 - 本地 Agent 接入后续：按[本地 Agent 接入规划](/zh-CN/docs/progress/local-agent-integration-plan)把 Claude Code CLI Adapter 升级为 Claude Agent SDK Adapter，并完善工具队列体验。
 - Agent Skill 后续：补充网络检索安装、Skill 资源文件管理和可控的本地记忆沉淀。
