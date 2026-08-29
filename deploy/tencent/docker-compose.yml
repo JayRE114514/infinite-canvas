@@ -74,6 +74,19 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-no-reply@infinite-canvas.local}
+      # Provider/COS 凭据仅按键透传给 API；未配置时不注入容器，避免半配置启动。
+      COS_SECRET_ID:
+      COS_SECRET_KEY:
+      COS_BUCKET:
+      COS_REGION:
+      COS_SIGNED_URL_TTL_SECONDS:
+      ARTBOX_BASE_URL:
+      ARTBOX_API_KEY:
+      ARTBOX_VIDEO_MODELS:
+      ARTBOX_REQUEST_TIMEOUT_MS:
+      ARTBOX_RESULT_MAX_BYTES:
+      ARTBOX_RESULT_ALLOWED_HOSTS:
+      ARTBOX_POLL_LEASE_SECONDS:
     ports:
       - "127.0.0.1:4001:4000"
     healthcheck:
