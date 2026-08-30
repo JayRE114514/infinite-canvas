@@ -29,6 +29,16 @@ const APPLICATION_TABLES = [
     "admin_operations",
     "global_audit_logs",
     "workspace_provisioning_audits",
+    "credit_accounts",
+    "credit_wallets",
+    "credit_transactions",
+    "ledger_entries",
+    "billing_orders",
+    "credit_holds",
+    "assets",
+    "ai_tasks",
+    "provider_attempts",
+    "task_events",
 ] as const;
 const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVILEGES)[number][]>> = {
     users: ["SELECT", "INSERT", "UPDATE", "DELETE"],
@@ -40,6 +50,19 @@ const API_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVI
     workspace_invitations: ["SELECT", "INSERT"],
     canvases: ["SELECT", "INSERT"],
     workspace_audit_logs: ["INSERT"],
+    credit_wallets: ["SELECT"],
+    billing_orders: ["SELECT"],
+    ai_tasks: ["SELECT", "INSERT"],
+    provider_attempts: ["SELECT", "INSERT"],
+    task_events: ["SELECT", "INSERT"],
+};
+
+const WORKER_TABLE_PRIVILEGES: Readonly<Record<string, readonly (typeof TABLE_PRIVILEGES)[number][]>> = {
+    ai_tasks: ["SELECT"],
+    billing_orders: ["SELECT"],
+    credit_holds: ["SELECT"],
+    provider_attempts: ["SELECT"],
+    task_events: ["SELECT", "INSERT"],
 };
 
 const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
@@ -47,6 +70,11 @@ const API_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> =
     workspace_invitations: ["status"],
     // document_mode/deletion_receipt_id 不在可写列表：前者只在创建时由服务端写入，后者由触发器生成。
     canvases: ["title", "snapshot_json", "revision", "updated_by", "updated_at", "deleted_at"],
+};
+
+const WORKER_BUSINESS_UPDATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+    ai_tasks: ["status", "result_asset_id", "public_error_code", "lease_epoch", "lease_worker_id", "lease_expires_at", "updated_at"],
+    provider_attempts: ["remote_task_id", "status", "failure_classification", "redacted_error", "updated_at"],
 };
 
 const API_FUNCTIONS = [
@@ -58,7 +86,32 @@ const API_FUNCTIONS = [
     "is_current_admin_operation(text,text,text)",
     "execute_workspace_admin_operation()",
     "record_workspace_provisioning(text,text,text)",
+    "execute_wallet_adjustment(bigint,text,text,text)",
+    "create_billing_order(text,uuid,text,text,jsonb,bigint)",
+    "reserve_credit_hold(text,uuid,bigint,text,text)",
+    "get_ready_asset(text,uuid)",
+    "get_ready_asset_storage(text,uuid)",
+    "logical_delete_asset(text,uuid)",
+    "resolve_visible_asset_workspace(uuid,text)",
 ] as const;
+
+const WORKER_FUNCTIONS = [
+    "capture_credit_hold(text,uuid,bigint,text,text)",
+    "compensate_credit_capture(text,uuid,bigint,text,text)",
+    "create_staging_asset(text,text)",
+    "get_ready_asset(text,uuid)",
+    "get_ready_asset_storage(text,uuid)",
+    "get_staging_asset_storage(text,uuid)",
+    "logical_delete_asset(text,uuid)",
+    "mark_asset_failed(text,uuid,text)",
+    "mark_asset_ready(text,uuid,text,bigint,text)",
+    "mark_billing_order_review(text,uuid)",
+    "release_credit_hold(text,uuid,text,text)",
+] as const;
+
+const API_FUNCTION_SET = new Set<string>(API_FUNCTIONS);
+const WORKER_FUNCTION_SET = new Set<string>(WORKER_FUNCTIONS);
+const ROLE_FUNCTIONS: readonly string[] = [...new Set([...API_FUNCTIONS, ...WORKER_FUNCTIONS])];
 
 export type DatabaseRoleInspection = {
     currentUser: string;
@@ -92,7 +145,9 @@ async function inspectTablePrivileges(pool: Pool, role: Exclude<DatabaseLoginRol
     }
 
     for (const row of privileges.rows) {
-        const expected = role === "app_api" && (API_TABLE_PRIVILEGES[row.table_name]?.includes(row.privilege) ?? false);
+        const expected =
+            (role === "app_api" && (API_TABLE_PRIVILEGES[row.table_name]?.includes(row.privilege) ?? false)) ||
+            (role === "app_worker" && (WORKER_TABLE_PRIVILEGES[row.table_name]?.includes(row.privilege) ?? false));
         if (row.allowed !== expected) {
             violations.push(`${role} ${row.privilege} privilege on public.${row.table_name} must be ${expected}`);
         }
@@ -158,6 +213,10 @@ async function inspectColumnPrivileges(
                 ((API_TABLE_PRIVILEGES[row.table_name]?.includes(row.privilege) ?? false) ||
                     (row.privilege === "UPDATE" &&
                         (API_BUSINESS_UPDATE_COLUMNS[row.table_name]?.includes(row.column_name) ?? false)))) ||
+            (role === "app_worker" &&
+                ((WORKER_TABLE_PRIVILEGES[row.table_name]?.includes(row.privilege) ?? false) ||
+                    (row.privilege === "UPDATE" &&
+                        (WORKER_BUSINESS_UPDATE_COLUMNS[row.table_name]?.includes(row.column_name) ?? false)))) ||
             (role === "app_maintenance" &&
                 row.privilege === "SELECT" &&
                 row.table_name === "workspaces" &&
@@ -173,7 +232,7 @@ async function inspectColumnPrivileges(
 
 async function inspectFunctionPrivileges(pool: Pool, role: Exclude<DatabaseLoginRole, "schema_owner">): Promise<string[]> {
     const violations: string[] = [];
-    for (const signature of API_FUNCTIONS) {
+    for (const signature of ROLE_FUNCTIONS) {
         const result = await pool.query<{ exists: boolean; allowed: boolean; public_allowed: boolean }>(
             `select to_regprocedure($1) is not null as exists,
                     coalesce(has_function_privilege($2, to_regprocedure($1), 'EXECUTE'), false) as allowed,
@@ -185,7 +244,9 @@ async function inspectFunctionPrivileges(pool: Pool, role: Exclude<DatabaseLogin
             violations.push(`required function public.${signature} is missing`);
             continue;
         }
-        const expected = role === "app_api";
+        const expected =
+            (role === "app_api" && API_FUNCTION_SET.has(signature)) ||
+            (role === "app_worker" && WORKER_FUNCTION_SET.has(signature));
         if (row.allowed !== expected) {
             violations.push(`${role} EXECUTE privilege on public.${signature} must be ${expected}`);
         }
@@ -203,7 +264,9 @@ async function inspectFunctionPrivileges(pool: Pool, role: Exclude<DatabaseLogin
          order by 1`,
         [role],
     );
-    const expected = new Set<string>(role === "app_api" ? API_FUNCTIONS : []);
+    const expected = new Set<string>(
+        role === "app_api" ? API_FUNCTIONS : role === "app_worker" ? WORKER_FUNCTIONS : [],
+    );
     for (const row of functions.rows) {
         if (row.allowed !== expected.has(row.signature)) {
             violations.push(`${role} has unexpected function privilege on public.${row.signature}`);

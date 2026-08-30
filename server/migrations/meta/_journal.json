@@ -57,6 +57,55 @@
       "when": 1787910000000,
       "tag": "0007_admin-purpose-closed-world",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788007134458,
+      "tag": "0008_credits-ledger-core",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788007506311,
+      "tag": "0009_admin-wallet-adjust",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788009809635,
+      "tag": "0010_billing-holds",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1788010408942,
+      "tag": "0011_assets",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788010898853,
+      "tag": "0012_ai-tasks",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1788011351773,
+      "tag": "0013_worker-state",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1788011650276,
+      "tag": "0014_task-events-notify",
+      "breakpoints": true
     }
   ]
 }

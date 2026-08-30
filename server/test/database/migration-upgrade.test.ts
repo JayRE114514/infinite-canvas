@@ -208,13 +208,20 @@ describe("immutable migration history", () => {
             JSON.parse(
                 await readFile(new URL(`../../migrations/meta/${tag}_snapshot.json`, import.meta.url), "utf8"),
             ) as Snapshot;
-        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7] = await Promise.all([
+        const [snapshot2, snapshot3, snapshot4, snapshot5, snapshot6, snapshot7, snapshot8, snapshot9, snapshot10, snapshot11, snapshot12, snapshot13, snapshot14] = await Promise.all([
             readSnapshot("0002"),
             readSnapshot("0003"),
             readSnapshot("0004"),
             readSnapshot("0005"),
             readSnapshot("0006"),
             readSnapshot("0007"),
+            readSnapshot("0008"),
+            readSnapshot("0009"),
+            readSnapshot("0010"),
+            readSnapshot("0011"),
+            readSnapshot("0012"),
+            readSnapshot("0013"),
+            readSnapshot("0014"),
         ]);
         expect((await readJournal()).entries).toEqual([
             { idx: 0, version: "7", when: 1787735042446, tag: "0000_auth_and_workspaces", breakpoints: true },
@@ -243,6 +250,25 @@ describe("immutable migration history", () => {
                 tag: "0007_admin-purpose-closed-world",
                 breakpoints: true,
             },
+            {
+                idx: 8,
+                version: "7",
+                when: 1788007134458,
+                tag: "0008_credits-ledger-core",
+                breakpoints: true,
+            },
+            {
+                idx: 9,
+                version: "7",
+                when: 1788007506311,
+                tag: "0009_admin-wallet-adjust",
+                breakpoints: true,
+            },
+            { idx: 10, version: "7", when: 1788009809635, tag: "0010_billing-holds", breakpoints: true },
+            { idx: 11, version: "7", when: 1788010408942, tag: "0011_assets", breakpoints: true },
+            { idx: 12, version: "7", when: 1788010898853, tag: "0012_ai-tasks", breakpoints: true },
+            { idx: 13, version: "7", when: 1788011351773, tag: "0013_worker-state", breakpoints: true },
+            { idx: 14, version: "7", when: 1788011650276, tag: "0014_task-events-notify", breakpoints: true },
         ]);
 
         expect(snapshot3.prevId).toBe(snapshot2.id);
@@ -250,6 +276,13 @@ describe("immutable migration history", () => {
         expect(snapshot5.prevId).toBe(snapshot4.id);
         expect(snapshot6.prevId).toBe(snapshot5.id);
         expect(snapshot7.prevId).toBe(snapshot6.id);
+        expect(snapshot8.prevId).toBe(snapshot7.id);
+        expect(snapshot9.prevId).toBe(snapshot8.id);
+        expect(snapshot10.prevId).toBe(snapshot9.id);
+        expect(snapshot11.prevId).toBe(snapshot10.id);
+        expect(snapshot12.prevId).toBe(snapshot11.id);
+        expect(snapshot13.prevId).toBe(snapshot12.id);
+        expect(snapshot14.prevId).toBe(snapshot13.id);
         expect(snapshot2.tables["public.workspaces"]!.checkConstraints.workspaces_deleted_at_status_coherent!.value).toBe(
             "(status = 'deactivated') = (deleted_at is not null)",
         );
@@ -308,6 +341,22 @@ describe("immutable migration history", () => {
 
         // 0007 只替换 begin_admin_operation 的用途判定，不触碰任何表结构。
         expect(normalize(snapshot7)).toEqual(normalize(snapshot6));
+
+        for (const table of ["credit_accounts", "credit_wallets", "credit_transactions", "ledger_entries"]) {
+            expect(Object.keys(snapshot8.tables[`public.${table}`]!.columns)).toContain("workspace_id");
+        }
+        expect(snapshot8.tables["public.credit_transactions"]!.uniqueConstraints).toHaveProperty(
+            "credit_transactions_workspace_operation_unique",
+        );
+        expect(Object.keys(snapshot9.tables["public.workspace_audit_logs"]!.columns)).toEqual(
+            expect.arrayContaining(["credit_amount", "credit_reason", "credit_transaction_id"]),
+        );
+        expect(snapshot9.tables["public.workspace_audit_logs"]!.foreignKeys).toHaveProperty(
+            "workspace_audit_logs_workspace_credit_transaction_fk",
+        );
+        for (const table of ["billing_orders", "credit_holds", "assets", "ai_tasks", "provider_attempts", "task_events"]) {
+            expect(Object.keys(snapshot14.tables[`public.${table}`]!.columns)).toContain("workspace_id");
+        }
     });
 });
 

@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
-import { check, customType, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { bigint, boolean, check, customType, foreignKey, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
+import { creditTransactions } from "../credits/schema.js";
 import { users } from "../identity/schema.js";
 import { workspaces } from "../workspaces/schema.js";
 
@@ -77,25 +78,41 @@ export const workspaceAuditLogs = pgTable(
             .notNull()
             .references(() => users.id, { onDelete: "restrict" }),
         action: text("action")
-            .$type<"workspace_read" | "workspace_suspend" | "workspace_deactivate" | "workspace_restore">()
+            .$type<"workspace_read" | "workspace_suspend" | "workspace_deactivate" | "workspace_restore" | "wallet_adjust">()
             .notNull(),
         fromStatus: text("from_status").$type<"active" | "suspended" | "deactivated">(),
         toStatus: text("to_status").$type<"active" | "suspended" | "deactivated">(),
         operationId: uuid("operation_id").references(() => adminOperations.id, { onDelete: "restrict" }),
+        creditAmount: bigint("credit_amount", { mode: "bigint" }),
+        creditReason: text("credit_reason"),
+        creditTransactionId: uuid("credit_transaction_id"),
+        replayed: boolean("replayed").notNull().default(false),
         transactionXid: xid8("transaction_xid").notNull(),
         createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     },
     (table) => [
         index("workspace_audit_logs_workspace_id_idx").on(table.workspaceId),
+        index("workspace_audit_logs_credit_transaction_idx").on(table.workspaceId, table.creditTransactionId),
         uniqueIndex("workspace_audit_logs_operation_unique").on(table.operationId),
+        foreignKey({
+            name: "workspace_audit_logs_workspace_credit_transaction_fk",
+            columns: [table.workspaceId, table.creditTransactionId],
+            foreignColumns: [creditTransactions.workspaceId, creditTransactions.id],
+        }).onDelete("restrict"),
         check(
             "workspace_audit_logs_action_allowed",
-            sql.raw("action in ('workspace_read', 'workspace_suspend', 'workspace_deactivate', 'workspace_restore')"),
+            sql.raw("action in ('workspace_read', 'workspace_suspend', 'workspace_deactivate', 'workspace_restore', 'wallet_adjust')"),
         ),
         check(
             "workspace_audit_logs_status_allowed",
             sql.raw(
                 "(from_status is null or from_status in ('active', 'suspended', 'deactivated')) and (to_status is null or to_status in ('active', 'suspended', 'deactivated'))",
+            ),
+        ),
+        check(
+            "workspace_audit_logs_credit_fields_coherent",
+            sql.raw(
+                "(action = 'wallet_adjust' and from_status is null and to_status is null and credit_amount > 0 and btrim(credit_reason) <> '' and credit_transaction_id is not null) or (action <> 'wallet_adjust' and credit_amount is null and credit_reason is null and credit_transaction_id is null)",
             ),
         ),
     ],

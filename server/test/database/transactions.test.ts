@@ -253,7 +253,6 @@ describe("admin operation binding", () => {
     // 闭世界门槛：曾经登记在白名单里、但缺少窄口执行函数 / 审计 CHECK / 审计 RLS 的用途
     // 必须在 begin 阶段就被拒绝，不能只依赖 TypeScript 类型收窄。
     it.each([
-        "wallet_adjust",
         "wallet_status_write",
         "billing_confirm_charge",
         "billing_confirm_no_charge",

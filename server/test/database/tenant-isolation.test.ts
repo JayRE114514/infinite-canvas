@@ -578,7 +578,7 @@ describe("explicit grant matrix", () => {
         expect(result.rows.length).toBeGreaterThan(0);
         expect(result.rows.every((row) => row.roles.length === 1)).toBe(true);
         expect(new Set(result.rows.flatMap((row) => row.roles))).toEqual(
-            new Set(["app_api", "app_maintenance", "schema_owner"]),
+            new Set(["app_api", "app_worker", "app_maintenance", "schema_owner"]),
         );
         expect(result.rows.map((row) => row.polname)).not.toEqual(
             expect.arrayContaining([
